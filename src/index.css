@@ -1,0 +1,207 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  
+  --color-primary: #4F46E5;
+  --color-secondary: #10B981;
+  --color-accent: #F59E0B;
+  --color-danger: #EF4444;
+  --color-bg-main: #F0F4F8;
+  --color-card-bg: #FFFFFF;
+  --color-text-main: #1E293B;
+  --color-text-muted: #64748B;
+}
+
+@layer base {
+  body {
+    @apply font-sans bg-bg-main text-text-main antialiased;
+  }
+
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  a[href],
+  summary,
+  select:not(:disabled),
+  label[for],
+  input[type="file"],
+  input[type="checkbox"],
+  input[type="radio"] {
+    cursor: pointer;
+  }
+
+  button:disabled,
+  select:disabled,
+  input:disabled,
+  textarea:disabled {
+    cursor: not-allowed;
+  }
+}
+
+@layer components {
+  .glass {
+    @apply bg-white/80 backdrop-blur-md border border-white/20;
+  }
+
+  .card-shadow {
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+  }
+
+  .vibrant-shadow {
+    box-shadow: 0 10px 25px rgba(79, 70, 229, 0.2);
+  }
+
+  .nav-item-active {
+    @apply bg-[#EEF2FF] text-primary;
+  }
+
+  .filter-pill {
+    @apply px-4 py-2 bg-white border border-[#E2E8F0] rounded-[20px] text-[13px] font-medium cursor-pointer transition-all;
+  }
+
+  .filter-pill-active {
+    @apply bg-primary text-white border-primary;
+  }
+
+  .app-modal-overlay {
+    @apply fixed inset-0 z-[22000] overflow-y-auto bg-slate-950/40 p-3 backdrop-blur-sm sm:p-4;
+  }
+
+  .app-modal-viewport {
+    @apply flex min-h-full items-start justify-center py-3 sm:items-center sm:py-6;
+  }
+
+  .app-modal-panel {
+    @apply relative flex w-full flex-col overflow-hidden rounded-[28px] bg-white ring-1 ring-slate-100;
+    max-height: min(90vh, 960px);
+    box-shadow: 0 30px 80px rgba(15, 23, 42, 0.18);
+    overscroll-behavior: contain;
+  }
+
+  .app-modal-body {
+    @apply min-h-0 flex-1 overflow-y-auto;
+    scrollbar-gutter: stable both-edges;
+    overscroll-behavior: contain;
+  }
+
+  .app-modal-body-padded {
+    @apply px-4 py-4 sm:px-6 sm:py-5 lg:px-7 lg:py-6;
+  }
+
+  .app-modal-footer {
+    @apply flex flex-wrap items-center justify-end gap-3 border-t border-slate-100 px-4 py-4 sm:px-6 lg:px-7;
+    background: linear-gradient(180deg, rgba(255,255,255,0.92) 0%, #ffffff 100%);
+    box-shadow: 0 -14px 30px rgba(15, 23, 42, 0.06);
+    backdrop-filter: blur(8px);
+  }
+
+  .app-modal-section {
+    @apply rounded-[24px] border border-slate-200 bg-slate-50/70 p-4 sm:p-5;
+  }
+
+  .app-modal-section-title {
+    @apply text-sm font-bold text-slate-900;
+  }
+
+  .app-modal-section-description {
+    @apply hidden;
+  }
+
+  .app-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: #cbd5e1 transparent;
+  }
+
+  .app-scrollbar::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  .app-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .app-scrollbar::-webkit-scrollbar-thumb {
+    background: #cbd5e1;
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+
+  .app-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: #94a3b8;
+    background-clip: padding-box;
+  }
+
+  /* Lesson management cards: keep action controls stable across browser zoom levels. */
+  .lesson-management-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+    gap: 1rem;
+    align-items: stretch;
+  }
+
+  .lesson-compact-card {
+    container-type: inline-size;
+    min-width: 0;
+  }
+
+  .lesson-compact-actions {
+    overflow: visible;
+  }
+
+  .lesson-action-grid {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(0, 1fr);
+    align-items: stretch;
+    gap: 0.3rem;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .lesson-action-button,
+  .lesson-action-menu-trigger {
+    display: inline-flex;
+    height: 2.25rem;
+    min-width: 0;
+    width: 100%;
+    align-items: center;
+    justify-content: center;
+    gap: 0.25rem;
+    border-radius: 0.5rem;
+    padding-inline: 0.375rem;
+    font-size: 0.6875rem;
+    line-height: 1;
+    font-weight: 700;
+    white-space: nowrap;
+    transition: background-color 150ms ease, color 150ms ease, opacity 150ms ease;
+  }
+
+  .lesson-action-label {
+    min-width: 0;
+    white-space: nowrap;
+  }
+
+  .lesson-action-menu {
+    min-width: 0;
+  }
+
+  @container (max-width: 292px) {
+    .lesson-action-grid {
+      gap: 0.25rem;
+    }
+
+    .lesson-action-button,
+    .lesson-action-menu-trigger {
+      padding-inline: 0.25rem;
+    }
+
+    .lesson-action-label {
+      display: none;
+    }
+  }
+
+}
