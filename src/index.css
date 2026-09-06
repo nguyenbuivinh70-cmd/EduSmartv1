@@ -143,12 +143,24 @@
     align-items: stretch;
   }
 
-  /* Student lesson library: compact full-width rows for fast scanning and less vertical scrolling. */
+  /* Student lesson library: responsive topic-aware cards similar to the upgraded lesson manager. */
   .student-learning-grid {
     display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    gap: 0.75rem;
-    align-items: stretch;
+    grid-template-columns: repeat(1, minmax(0, 1fr));
+    gap: 1.1rem;
+    align-items: start;
+  }
+
+  @media (min-width: 640px) {
+    .student-learning-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+
+  @media (min-width: 1024px) {
+    .student-learning-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  }
+
+  @media (min-width: 1280px) {
+    .student-learning-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   }
 
   .lesson-compact-card {
@@ -520,4 +532,25 @@
 
 .lesson-library-page-arrow {
   font-size: 1rem;
+}
+
+/* V6.74.0: mobile-first lesson viewer controls and iOS safe-area handling. */
+.lesson-viewer-header {
+  padding-top: max(0.625rem, env(safe-area-inset-top));
+}
+
+@media (max-width: 1279px) {
+  .lesson-viewer-main-mobile {
+    padding-bottom: calc(5.5rem + env(safe-area-inset-bottom));
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .lesson-mobile-nav {
+    padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+  }
+
+  .lesson-mobile-drawer {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
 }

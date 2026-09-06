@@ -1,4 +1,4 @@
-import { deleteDoc, deleteField, doc, getDoc, getDocs, collection, limit, onSnapshot, orderBy, query, runTransaction, serverTimestamp, setDoc, updateDoc, where, writeBatch } from 'firebase/firestore';
+import { deleteDoc, deleteField, doc, getDoc, getDocs, collection, limit, onSnapshot, orderBy, query, runTransaction, serverTimestamp, setDoc, Timestamp, updateDoc, where, writeBatch } from 'firebase/firestore';
 import type { CollectionReference, DocumentData, DocumentReference, QueryDocumentSnapshot } from 'firebase/firestore';
 import type {
   Account,
@@ -21,6 +21,7 @@ import {
 } from './firebase';
 import { resolveLessonSaveState } from '../utils/lessonWorkflow';
 import { buildLessonTitle, normalizeLessonName, normalizeLessonNumber, resolveLessonIdentity } from '../utils/lessonCatalog';
+import { getLessonScheduleAccess } from '../utils/lessonAccess';
 
 const MAX_LESSON_DOCUMENT_BYTES = 750 * 1024;
 const IDENTITY_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -37,6 +38,13 @@ let bootstrapPromise: { uid: string; value: Promise<Record<string, any[]>> } | n
 function clean(value: unknown) { return value == null ? '' : String(value).trim(); }
 function cleanStringList(value: unknown) {
   return Array.isArray(value) ? value.map(clean).filter(Boolean) : [];
+}
+
+function lessonScheduleTimestamp(value: unknown) {
+  const raw = clean(value);
+  if (!raw) return null;
+  const parsed = new Date(raw);
+  return Number.isNaN(parsed.getTime()) ? null : Timestamp.fromDate(parsed);
 }
 
 function getCoLearningParticipants(session: any) {
@@ -285,8 +293,14 @@ export async function getFirebaseLesson(lessonId: string): Promise<LessonContent
   if (!metadataSnap.exists()) return null;
   const data = metadataSnap.data() as any;
   const lesson = row(data, metadataSnap.id);
-  if (me.role === 'student' && lesson.is_locked === true) {
-    throw new Error('Bài học hiện đang được giáo viên khóa. Em hãy chờ giáo viên mở bài rồi thử lại.');
+  if (me.role === 'student') {
+    if (lesson.is_locked === true) {
+      throw new Error('Bài học hiện đang được giáo viên khóa. Em hãy chờ giáo viên mở bài rồi thử lại.');
+    }
+    const scheduleAccess = getLessonScheduleAccess(lesson);
+    if (scheduleAccess.blocked) {
+      throw new Error(`${scheduleAccess.message} Em chưa thể tải nội dung bài học lúc này.`);
+    }
   }
   const contentSnap = await getDoc(lessonContentRef(lessonId));
   const contentData = contentSnap.exists() ? contentSnap.data() as any : null;
@@ -424,6 +438,8 @@ export async function saveFirebaseLesson(payload: LessonComposerValues, updating
       source_file_size: sourceFileSize,
       source_file_retained: false,
       audienceKeys: audienceKeys(normalizedPayload.khoi, normalizedPayload.lop_id),
+      access_start_at: lessonScheduleTimestamp(normalizedPayload.thoi_gian_bat_dau),
+      access_end_at: lessonScheduleTimestamp(normalizedPayload.thoi_gian_ket_thuc),
       contentPath: `lessons/${lessonId}/content/main`,
       created_at: existingData ? clean(existingData.created_at) : now,
       updated_at: now,

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { AlertTriangle, BookOpen, Bot, CheckCircle2, ChevronRight, Clock, EyeOff, HelpCircle, Lightbulb, ListChecks, LockKeyhole, Menu, MessageCircleMore, MessageSquareText, PlayCircle, Reply, RotateCcw, Send, ShieldCheck, Sparkles, Target, TimerReset, X } from 'lucide-react';
+import { AlertTriangle, BookOpen, Bot, CheckCircle2, ChevronLeft, ChevronRight, Clock, EyeOff, HelpCircle, Lightbulb, ListChecks, LockKeyhole, Menu, MessageCircleMore, MessageSquareText, PlayCircle, Reply, RotateCcw, Send, ShieldCheck, Sparkles, Target, TimerReset, X } from 'lucide-react';
 import { AIConfig, Lesson, LessonComment, LessonContent, LessonContentBlock, LessonProgressRecord, LessonQuestionAnswerState, LessonStageKey, LessonSectionV2, QuizQuestion, SectionLearningProgress } from '../types';
 import InteractiveQuestionCard from './InteractiveQuestionCard';
 import YoutubeEmbedBlock from './YoutubeEmbedBlock';
@@ -829,6 +829,19 @@ export default function LessonViewer({
   };
 
   const currentSection = sections.find((section) => section.section_id === activeStep) || null;
+  const lessonNavigationSteps = useMemo(() => ['intro', ...sections.map((section) => section.section_id), 'final_quiz', 'comments', 'result'], [sections]);
+  const activeNavigationIndex = Math.max(0, lessonNavigationSteps.indexOf(activeStep));
+  const previousNavigationStep = activeNavigationIndex > 0 ? lessonNavigationSteps[activeNavigationIndex - 1] : null;
+  const nextNavigationStep = activeNavigationIndex < lessonNavigationSteps.length - 1 ? lessonNavigationSteps[activeNavigationIndex + 1] : null;
+  const activeStepLabel = activeStep === 'intro'
+    ? 'Tổng quan'
+    : activeStep === 'final_quiz'
+      ? 'Kiểm tra cuối bài'
+      : activeStep === 'comments'
+        ? 'Bình luận/Câu hỏi'
+        : activeStep === 'result'
+          ? 'Kết quả'
+          : currentSection?.title || 'Nội dung bài học';
   const canModerateComments = currentUserRole === 'admin' || currentUserRole === 'teacher';
   const visibleComments = useMemo(() => comments.filter((comment) => canModerateComments || comment.trang_thai !== 'hidden'), [comments, canModerateComments]);
   const topLevelComments = useMemo(() => visibleComments.filter((comment) => !comment.parent_id), [visibleComments]);
@@ -1014,7 +1027,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
       );
     }
     return (
-      <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-4 text-sm leading-7 text-amber-900">
+      <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-3 text-xs leading-6 text-amber-900 sm:mt-4 sm:rounded-2xl sm:px-4 sm:py-4 sm:text-sm sm:leading-7">
         <p className="flex items-center gap-2 font-black"><Target className="h-4 w-4" /> Cần làm gì để hoàn thành mục này?</p>
         <div className="mt-3 grid gap-3 md:grid-cols-2">
           <div className="rounded-xl bg-white/70 px-3 py-2">
@@ -1034,8 +1047,8 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
 
   const renderIntro = () => (
     <div className="space-y-5">
-      <section className="overflow-hidden rounded-[30px] bg-white shadow-sm ring-1 ring-slate-100">
-        <div className="bg-gradient-to-br from-indigo-50 via-white to-fuchsia-50 p-6">
+      <section className="overflow-hidden rounded-[22px] bg-white shadow-sm ring-1 ring-slate-100 sm:rounded-[30px]">
+        <div className="bg-gradient-to-br from-indigo-50 via-white to-fuchsia-50 p-4 sm:p-6">
           <p className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1 text-xs font-bold text-indigo-700 shadow-sm"><BookOpen className="h-4 w-4" /> Bắt đầu bài học</p>
           <h3 className="mt-4 text-2xl font-black text-slate-900">{lessonTitle}</h3>
           {lessonSummary && <p className="mt-3 whitespace-pre-line text-sm leading-7 text-slate-700">{lessonSummary}</p>}
@@ -1057,13 +1070,13 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
           <YoutubeEmbedBlock url={content.intro_video_embed_url || content.intro_video_url} title={`Video bài học: ${lessonTitle}`} />
         </section>
       ) : null}
-      <section className="rounded-[28px] bg-white p-6 shadow-sm ring-1 ring-slate-100">
+      <section className="rounded-[22px] bg-white p-4 shadow-sm ring-1 ring-slate-100 sm:rounded-[28px] sm:p-6">
         <h4 className="flex items-center gap-2 font-black text-slate-900"><Target className="h-5 w-5 text-indigo-500" /> Mục tiêu bài học</h4>
         <ul className="mt-4 grid gap-3 text-sm leading-7 text-slate-700 md:grid-cols-2">
           {objectives.length ? objectives.map((item, index) => <li key={index} className="rounded-2xl bg-slate-50 px-4 py-3">• {cleanText(item)}</li>) : <li className="text-slate-500">Chưa có mục tiêu.</li>}
         </ul>
       </section>
-      <section className="rounded-[28px] bg-white p-6 shadow-sm ring-1 ring-slate-100">
+      <section className="rounded-[22px] bg-white p-4 shadow-sm ring-1 ring-slate-100 sm:rounded-[28px] sm:p-6">
         <h4 className="flex items-center gap-2 font-black text-slate-900"><Clock className="h-5 w-5 text-amber-500" /> Tiến trình nội dung</h4>
         <div className="mt-4 grid gap-3 md:grid-cols-2">
           {sections.map((section) => {
@@ -1088,8 +1101,8 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
     const sectionPercent = Math.round((timePercent + interactionPercent) / 2);
     return (
       <div className="space-y-5">
-        <section className="overflow-hidden rounded-[30px] bg-white shadow-sm ring-1 ring-slate-100">
-          <div className="bg-gradient-to-br from-white via-indigo-50/70 to-fuchsia-50/70 p-6">
+        <section className="overflow-hidden rounded-[22px] bg-white shadow-sm ring-1 ring-slate-100 sm:rounded-[30px]">
+          <div className="bg-gradient-to-br from-white via-indigo-50/70 to-fuchsia-50/70 p-4 sm:p-6">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <p className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1 text-xs font-bold text-indigo-700 shadow-sm"><Sparkles className="h-4 w-4" /> Mục học {index + 1}</p>
               <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-bold ${isComplete ? 'bg-emerald-100 text-emerald-700' : needsWork ? 'bg-rose-100 text-rose-700' : 'bg-amber-100 text-amber-700'}`}>
@@ -1097,17 +1110,17 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                 {isComplete ? 'Đã hoàn thành' : needsWork ? 'Chưa hoàn thành' : 'Đang học'}
               </span>
             </div>
-            <h3 className="mt-4 text-2xl font-black text-slate-900">{section.title}</h3>
-            <p className="mt-3 text-xs font-semibold uppercase tracking-[0.15em] text-slate-500">Thời gian học: {sp.timeSpentSeconds}/{sp.requiredSeconds} giây • Tương tác: {sp.interactionCount}/{section.interactive_questions?.length || 0} câu</p>
+            <h3 className="mt-3 text-xl font-black leading-tight text-slate-900 sm:mt-4 sm:text-2xl">{section.title}</h3>
+            <p className="mt-2 text-[10px] font-semibold uppercase leading-5 tracking-[0.11em] text-slate-500 sm:mt-3 sm:text-xs sm:tracking-[0.15em]">Thời gian học: {sp.timeSpentSeconds}/{sp.requiredSeconds} giây • Tương tác: {sp.interactionCount}/{section.interactive_questions?.length || 0} câu</p>
             <div className="mt-3 overflow-hidden rounded-full bg-white/80 shadow-inner"><div className={`h-2.5 rounded-full transition-all ${isComplete ? 'bg-emerald-500' : needsWork ? 'bg-rose-500' : 'bg-amber-400'}`} style={{ width: `${sectionPercent}%` }} /></div>
             {renderSectionCompletionGuide(section, sp, timePercent, interactionPercent)}
-            <div className="mt-4 flex flex-wrap gap-2">
-              <button type="button" onClick={() => handleQuickAskCurrentSection('summary')} className="rounded-full bg-white px-3 py-2 text-xs font-bold text-indigo-700 shadow-sm ring-1 ring-indigo-100 hover:bg-indigo-50">Tóm tắt phần này</button>
-              <button type="button" onClick={() => handleQuickAskCurrentSection('explain')} className="rounded-full bg-white px-3 py-2 text-xs font-bold text-fuchsia-700 shadow-sm ring-1 ring-fuchsia-100 hover:bg-fuchsia-50">Giải thích dễ hiểu</button>
-              <button type="button" onClick={() => handleQuickAskCurrentSection('example')} className="rounded-full bg-white px-3 py-2 text-xs font-bold text-amber-700 shadow-sm ring-1 ring-amber-100 hover:bg-amber-50">Cho ví dụ thêm</button>
+            <div className="mt-3 flex gap-2 overflow-x-auto pb-1 sm:mt-4 sm:flex-wrap sm:overflow-visible sm:pb-0">
+              <button type="button" onClick={() => handleQuickAskCurrentSection('summary')} className="shrink-0 rounded-full bg-white px-3 py-2 text-xs font-bold text-indigo-700 shadow-sm ring-1 ring-indigo-100 hover:bg-indigo-50">Tóm tắt phần này</button>
+              <button type="button" onClick={() => handleQuickAskCurrentSection('explain')} className="shrink-0 rounded-full bg-white px-3 py-2 text-xs font-bold text-fuchsia-700 shadow-sm ring-1 ring-fuchsia-100 hover:bg-fuchsia-50">Giải thích dễ hiểu</button>
+              <button type="button" onClick={() => handleQuickAskCurrentSection('example')} className="shrink-0 rounded-full bg-white px-3 py-2 text-xs font-bold text-amber-700 shadow-sm ring-1 ring-amber-100 hover:bg-amber-50">Cho ví dụ thêm</button>
             </div>
           </div>
-          <div className="space-y-5 p-5 lg:p-6">
+          <div className="space-y-4 p-3 sm:p-5 lg:p-6">
             {blocks.length ? (
               <div className="grid gap-4">
                 {blocks.map((block, blockIndex) => {
@@ -1119,22 +1132,22 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                   return (
                     <article
                       key={`${section.section_id}-block-${blockIndex}`}
-                      className={`group relative w-full max-w-none overflow-hidden rounded-[30px] border px-5 py-5 text-sm leading-8 shadow-sm transition hover:-translate-y-0.5 hover:shadow-xl ${style.card}`}
+                      className={`group relative w-full max-w-none overflow-hidden rounded-[22px] border px-3 py-4 text-sm leading-7 shadow-sm transition hover:-translate-y-0.5 hover:shadow-xl sm:rounded-[30px] sm:px-5 sm:py-5 sm:leading-8 ${style.card}`}
                     >
                       <div className={`absolute inset-x-0 top-0 h-1.5 bg-gradient-to-r ${style.accent}`} />
-                      <div className="flex gap-4">
-                        <div className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-3xl text-xl shadow-sm ring-1 ring-white/80 transition group-hover:scale-105 ${style.icon}`}>{categoryIcon(category, block.type)}</div>
+                      <div className="flex gap-3 sm:gap-4">
+                        <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl text-lg shadow-sm ring-1 ring-white/80 transition group-hover:scale-105 sm:h-12 sm:w-12 sm:rounded-3xl sm:text-xl ${style.icon}`}>{categoryIcon(category, block.type)}</div>
                         <div className="min-w-0 flex-1">
                           <div className="mb-3 flex flex-wrap items-center gap-2">
                             <span className={`rounded-full px-3 py-1 text-[11px] font-black uppercase tracking-[0.14em] ring-1 ${style.chip}`}>{label}</span>
                           </div>
-                          <h5 className="mb-3 text-lg font-black leading-snug text-slate-950">{title}</h5>
-                          <div className="text-[15px] leading-8 text-slate-700">{renderLearningText(block.text)}</div>
-                          <div className="mt-4 flex flex-wrap gap-2 border-t border-white/70 pt-3">
-                            <button type="button" onClick={() => handleAskContentBlock(section, block, blockIndex, 'summary')} className="rounded-full bg-white/80 px-3 py-1.5 text-[11px] font-bold text-indigo-700 shadow-sm ring-1 ring-indigo-100 hover:bg-white">Tóm tắt ý này</button>
-                            <button type="button" onClick={() => handleAskContentBlock(section, block, blockIndex, 'explain')} className="rounded-full bg-white/80 px-3 py-1.5 text-[11px] font-bold text-fuchsia-700 shadow-sm ring-1 ring-fuchsia-100 hover:bg-white">Giải thích</button>
-                            <button type="button" onClick={() => handleAskContentBlock(section, block, blockIndex, 'example')} className="rounded-full bg-white/80 px-3 py-1.5 text-[11px] font-bold text-amber-700 shadow-sm ring-1 ring-amber-100 hover:bg-white">Ví dụ</button>
-                            <button type="button" onClick={() => handleAskContentBlock(section, block, blockIndex, 'question')} className="rounded-full bg-white/80 px-3 py-1.5 text-[11px] font-bold text-emerald-700 shadow-sm ring-1 ring-emerald-100 hover:bg-white">Tự kiểm tra</button>
+                          <h5 className="mb-2 text-base font-black leading-snug text-slate-950 sm:mb-3 sm:text-lg">{title}</h5>
+                          <div className="text-sm leading-7 text-slate-700 sm:text-[15px] sm:leading-8">{renderLearningText(block.text)}</div>
+                          <div className="mt-3 flex gap-2 overflow-x-auto border-t border-white/70 pt-3 sm:mt-4 sm:flex-wrap sm:overflow-visible">
+                            <button type="button" onClick={() => handleAskContentBlock(section, block, blockIndex, 'summary')} className="shrink-0 rounded-full bg-white/80 px-3 py-1.5 text-[11px] font-bold text-indigo-700 shadow-sm ring-1 ring-indigo-100 hover:bg-white">Tóm tắt ý này</button>
+                            <button type="button" onClick={() => handleAskContentBlock(section, block, blockIndex, 'explain')} className="shrink-0 rounded-full bg-white/80 px-3 py-1.5 text-[11px] font-bold text-fuchsia-700 shadow-sm ring-1 ring-fuchsia-100 hover:bg-white">Giải thích</button>
+                            <button type="button" onClick={() => handleAskContentBlock(section, block, blockIndex, 'example')} className="shrink-0 rounded-full bg-white/80 px-3 py-1.5 text-[11px] font-bold text-amber-700 shadow-sm ring-1 ring-amber-100 hover:bg-white">Ví dụ</button>
+                            <button type="button" onClick={() => handleAskContentBlock(section, block, blockIndex, 'question')} className="shrink-0 rounded-full bg-white/80 px-3 py-1.5 text-[11px] font-bold text-emerald-700 shadow-sm ring-1 ring-emerald-100 hover:bg-white">Tự kiểm tra</button>
                           </div>
                         </div>
                       </div>
@@ -1158,7 +1171,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
             ) : null}
           </div>
         </section>
-        <section className={`rounded-[28px] p-6 shadow-sm ring-1 ${isComplete ? 'bg-white ring-emerald-100' : 'bg-white ring-rose-100'}`}>
+        <section className={`rounded-[22px] p-4 shadow-sm ring-1 sm:rounded-[28px] sm:p-6 ${isComplete ? 'bg-white ring-emerald-100' : 'bg-white ring-rose-100'}`}>
           <h4 className="mb-4 flex items-center gap-2 font-black text-slate-900"><CheckCircle2 className="h-5 w-5 text-indigo-500" /> Câu hỏi tương tác</h4>
           {!isComplete ? <div className="mb-4 rounded-2xl bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-700">Hãy đọc đủ thời gian và hoàn thành câu hỏi để mục này chuyển sang dấu check xanh.</div> : null}
           <div className="space-y-4">
@@ -1191,7 +1204,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
 
     if (!examStarted) {
       return (
-        <section className="rounded-[28px] bg-white p-6 shadow-sm ring-1 ring-slate-100">
+        <section className="rounded-[22px] bg-white p-4 shadow-sm ring-1 ring-slate-100 sm:rounded-[28px] sm:p-6">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div>
               <p className="inline-flex items-center gap-2 rounded-full bg-rose-50 px-3 py-1 text-xs font-black text-rose-700 ring-1 ring-rose-100"><ShieldCheck className="h-4 w-4" /> Chế độ kiểm tra bảo mật</p>
@@ -1576,33 +1589,36 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
       <div className="notranslate fixed inset-0 z-[12000] flex items-center justify-center p-1 sm:p-2" translate="no">
         <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose} className="absolute inset-0 bg-slate-950/55 backdrop-blur-sm" />
         <motion.div initial={{ opacity: 0, scale: 0.97, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.97, y: 16 }} className="notranslate relative z-10 flex h-[100dvh] w-screen max-w-none flex-col overflow-hidden rounded-none bg-white shadow-[0_40px_100px_rgba(15,23,42,0.32)] sm:h-[calc(100dvh-16px)] sm:w-[calc(100vw-16px)] sm:rounded-[22px]" translate="no">
-          <div className="bg-gradient-to-r from-indigo-600 via-violet-600 to-fuchsia-600 px-4 py-3 text-white lg:px-6">
-            <div className="flex min-h-[58px] items-center justify-between gap-3">
+          <div className="lesson-viewer-header bg-gradient-to-r from-indigo-600 via-violet-600 to-fuchsia-600 px-3 py-2.5 text-white sm:px-4 sm:py-3 lg:px-6">
+            <div className="flex min-h-[52px] items-center justify-between gap-2 sm:min-h-[58px] sm:gap-3">
               <div className="min-w-0 flex-1">
                 <div className="flex min-w-0 items-center gap-2">
                   <PlayCircle className="hidden h-4 w-4 shrink-0 text-white/85 sm:block" />
-                  <h2 className="truncate text-base font-black uppercase tracking-tight sm:text-lg lg:text-xl">
-                    {`${cleanText(lesson.mon_hoc || '')}${lesson.khoi ? ` ${cleanText(String(lesson.khoi)).replace(/^Khối\s*/i, '')}` : ''} - ${cleanText(lesson.tieu_de || lessonTitle)}`}
-                  </h2>
+                  <div className="min-w-0">
+                    <p className="truncate text-[10px] font-bold uppercase tracking-[0.12em] text-white/65 sm:hidden">{cleanText(lesson.mon_hoc || '')} • Khối {cleanText(String(lesson.khoi || '-')).replace(/^Khối\s*/i, '')}</p>
+                    <h2 className="truncate text-[15px] font-black tracking-tight sm:text-lg lg:text-xl">
+                      {cleanText(lesson.tieu_de || lessonTitle)}
+                    </h2>
+                  </div>
                 </div>
               </div>
-              <div className="flex shrink-0 items-center gap-2 sm:gap-3">
+              <div className="flex shrink-0 items-center gap-1.5 sm:gap-3">
                 {!(activeStep === 'final_quiz' && examStarted) ? (
-                  <div className={`flex items-center gap-2 rounded-2xl px-3 py-2 text-xs font-black shadow-lg ring-1 sm:px-4 ${lessonRemainingSeconds <= 300 ? 'bg-amber-400 text-white ring-white/30' : 'bg-white/20 text-white ring-white/20'}`}>
+                  <div className={`flex min-h-10 items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-black shadow-lg ring-1 sm:gap-2 sm:rounded-2xl sm:px-4 sm:py-2 ${lessonRemainingSeconds <= 300 ? 'bg-amber-400 text-white ring-white/30' : 'bg-white/20 text-white ring-white/20'}`}>
                     <TimerReset className="h-4 w-4 sm:h-5 sm:w-5" />
                     <span className="leading-tight">
                       <span className="hidden text-[9px] uppercase tracking-[0.14em] text-white/75 sm:block">Thời gian học</span>
-                      <span className="text-base tabular-nums sm:text-lg">{formatSeconds(lessonRemainingSeconds)}</span>
+                      <span className="text-sm tabular-nums sm:text-lg">{formatSeconds(lessonRemainingSeconds)}</span>
                     </span>
                   </div>
                 ) : null}
-                <button onClick={() => setMobileMenuOpen((v) => !v)} className="rounded-full bg-white/15 p-2 hover:bg-white/20 xl:hidden" title="Mở cấu trúc bài học"><Menu className="h-5 w-5" /></button>
-                <button onClick={onClose} className="rounded-full bg-white/15 p-2 hover:bg-white/20" title="Đóng bài học"><X className="h-5 w-5" /></button>
+                {!(activeStep === 'final_quiz' && examStarted) ? <button onClick={() => setMobileMenuOpen(true)} className="flex h-10 w-10 items-center justify-center rounded-xl bg-white/15 hover:bg-white/20 xl:hidden" title="Mở cấu trúc bài học" aria-label="Mở cấu trúc bài học"><Menu className="h-5 w-5" /></button> : null}
+                <button onClick={onClose} className="flex h-10 w-10 items-center justify-center rounded-xl bg-white/15 hover:bg-white/20" title="Đóng bài học" aria-label="Đóng bài học"><X className="h-5 w-5" /></button>
               </div>
             </div>
           </div>
           <div className="grid flex-1 grid-cols-1 overflow-hidden xl:grid-cols-[300px_minmax(0,1fr)]">
-            <aside className={`${mobileMenuOpen ? 'block' : 'hidden'} overflow-y-auto border-r border-slate-100 bg-slate-50/70 p-4 xl:block`}>
+            <aside className="hidden overflow-y-auto border-r border-slate-100 bg-slate-50/70 p-4 xl:block">
               <div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-slate-100">
                 <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">Cấu trúc bài học</p>
                 <div className="mt-4 space-y-2">
@@ -1624,11 +1640,67 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                 </div>
               </div>
             </aside>
-            <main className={`overflow-y-auto bg-slate-50/70 p-4 transition-all lg:p-5 ${lessonChatOpen && activeStep !== 'final_quiz' ? 'xl:pr-[600px]' : ''}`}>{renderActiveContent()}</main>
+            <main className={`lesson-viewer-main-mobile overflow-y-auto bg-slate-50/70 p-3 transition-all sm:p-4 lg:p-5 ${lessonChatOpen && activeStep !== 'final_quiz' ? 'xl:pr-[600px]' : ''}`}>{renderActiveContent()}</main>
           </div>
 
+          <AnimatePresence>
+            {mobileMenuOpen ? (
+              <>
+                <motion.button
+                  type="button"
+                  initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+                  onClick={() => setMobileMenuOpen(false)}
+                  className="absolute inset-0 z-40 bg-slate-950/40 backdrop-blur-[2px] xl:hidden"
+                  aria-label="Đóng cấu trúc bài học"
+                />
+                <motion.aside
+                  initial={{ y: '100%' }} animate={{ y: 0 }} exit={{ y: '100%' }}
+                  transition={{ type: 'spring', damping: 30, stiffness: 330 }}
+                  className="lesson-mobile-drawer absolute inset-x-0 bottom-0 z-50 flex max-h-[82dvh] flex-col overflow-hidden rounded-t-[28px] bg-white shadow-[0_-18px_55px_rgba(15,23,42,0.25)] xl:hidden"
+                >
+                  <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
+                    <div className="min-w-0">
+                      <p className="text-[10px] font-black uppercase tracking-[0.16em] text-indigo-600">Cấu trúc bài học</p>
+                      <p className="mt-0.5 truncate text-sm font-black text-slate-900">{activeStepLabel}</p>
+                    </div>
+                    <button type="button" onClick={() => setMobileMenuOpen(false)} className="flex h-10 w-10 items-center justify-center rounded-xl bg-slate-100 text-slate-600" aria-label="Đóng menu"><X className="h-5 w-5" /></button>
+                  </div>
+                  <div className="overflow-y-auto px-3 py-3">
+                    <div className="space-y-2">
+                      <button onClick={() => selectStep('intro')} className={`flex min-h-12 w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold transition ${activeStep === 'intro' ? 'bg-indigo-600 text-white' : 'bg-slate-50 text-slate-700'}`}>Tổng quan <ChevronRight className="ml-auto h-4 w-4" /></button>
+                      {sections.map((section, index) => {
+                        const sp = computedSectionProgress[section.section_id] || createSectionProgress(section);
+                        const active = activeStep === section.section_id;
+                        return (
+                          <button key={section.section_id || index} onClick={() => selectStep(section.section_id)} className={`flex min-h-12 w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold transition ${statusClasses(sp.status, active)}`}>
+                            <span className="shrink-0">{sp.status === 'completed' ? '✓' : sp.status === 'need_interaction' ? '!' : sp.status === 'viewing' ? '…' : '○'}</span>
+                            <span className="line-clamp-2 flex-1">{section.title}</span>
+                            <span className="ml-auto shrink-0 text-xs opacity-80">{sp.status === 'completed' ? 'xong' : `${sp.interactionCount}/${section.interactive_questions?.length || 0}`}</span>
+                          </button>
+                        );
+                      })}
+                      <button onClick={() => selectStep('final_quiz')} className={`flex min-h-12 w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold ${activeStep === 'final_quiz' ? 'bg-emerald-600 text-white' : 'bg-emerald-50 text-emerald-700'}`}>Kiểm tra cuối bài<span className="ml-auto text-xs opacity-70">{finalQuiz.length} câu</span></button>
+                      <button onClick={() => selectStep('comments')} className={`flex min-h-12 w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold ${activeStep === 'comments' ? 'bg-fuchsia-600 text-white' : 'bg-fuchsia-50 text-fuchsia-700'}`}><MessageSquareText className="h-4 w-4" /> Bình luận/Câu hỏi<span className="ml-auto text-xs opacity-80">{topLevelComments.length}</span></button>
+                      <button onClick={() => selectStep('result')} className={`flex min-h-12 w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold ${activeStep === 'result' ? 'bg-amber-500 text-white' : 'bg-amber-50 text-amber-700'}`}>Kết quả<span className="ml-auto text-xs opacity-70">{score.toFixed(1)}/10</span></button>
+                    </div>
+                  </div>
+                </motion.aside>
+              </>
+            ) : null}
+          </AnimatePresence>
+
+          {!(activeStep === 'final_quiz' && examStarted) ? (
+            <div className="lesson-mobile-nav absolute inset-x-0 bottom-0 z-30 border-t border-slate-200/80 bg-white/95 px-3 pt-2 shadow-[0_-10px_30px_rgba(15,23,42,0.08)] backdrop-blur xl:hidden">
+              <div className="grid grid-cols-[1fr_1.2fr_1fr] gap-2">
+                <button type="button" disabled={!previousNavigationStep} onClick={() => previousNavigationStep && selectStep(previousNavigationStep)} className="flex min-h-11 items-center justify-center gap-1 rounded-xl bg-slate-100 px-2 text-xs font-black text-slate-700 disabled:opacity-35"><ChevronLeft className="h-4 w-4" /> Trước</button>
+                <button type="button" onClick={() => setMobileMenuOpen(true)} className="flex min-h-11 min-w-0 items-center justify-center gap-1.5 rounded-xl bg-indigo-50 px-2 text-xs font-black text-indigo-700 ring-1 ring-indigo-100"><Menu className="h-4 w-4" /><span className="truncate">{activeStepLabel}</span></button>
+                <button type="button" disabled={!nextNavigationStep} onClick={() => nextNavigationStep && selectStep(nextNavigationStep)} className="flex min-h-11 items-center justify-center gap-1 rounded-xl bg-indigo-600 px-2 text-xs font-black text-white disabled:opacity-35">Sau <ChevronRight className="h-4 w-4" /></button>
+              </div>
+            </div>
+          ) : null}
+
           {activeStep !== 'final_quiz' ? (
-          <div className="pointer-events-none absolute bottom-5 right-5 z-30 flex flex-col items-end gap-3">
+          <div className="pointer-events-none absolute bottom-[84px] left-3 z-30 flex flex-col items-start gap-2 sm:bottom-5 sm:left-auto sm:right-5 sm:items-end sm:gap-3">
             <AnimatePresence>
               {lessonChatOpen && (
                 <motion.div
@@ -1655,11 +1727,11 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
             <button
               type="button"
               onClick={() => setLessonChatOpen((prev) => !prev)}
-              className="pointer-events-auto inline-flex items-center gap-3 rounded-full bg-gradient-to-r from-fuchsia-600 via-pink-600 to-violet-600 px-4 py-3 text-sm font-bold text-white shadow-[0_18px_45px_rgba(192,38,211,0.38)] transition hover:-translate-y-0.5 hover:shadow-[0_22px_55px_rgba(192,38,211,0.45)]"
+              className="pointer-events-auto inline-flex h-12 min-w-12 items-center justify-center gap-3 rounded-full bg-gradient-to-r from-fuchsia-600 via-pink-600 to-violet-600 px-3 text-sm font-bold text-white sm:h-auto sm:min-w-0 sm:px-4 sm:py-3 shadow-[0_18px_45px_rgba(192,38,211,0.38)] transition hover:-translate-y-0.5 hover:shadow-[0_22px_55px_rgba(192,38,211,0.45)]"
             >
               {lessonChatOpen ? <X className="h-5 w-5" /> : <MessageCircleMore className="h-5 w-5" />}
-              <span>{lessonChatOpen ? 'Đóng trợ lý AI' : 'Hỏi trợ lý AI'}</span>
-              {!lessonChatOpen && <span className="flex h-8 w-8 items-center justify-center rounded-full bg-white/20"><Bot className="h-4 w-4" /></span>}
+              <span className="hidden sm:inline">{lessonChatOpen ? 'Đóng trợ lý AI' : 'Hỏi trợ lý AI'}</span>
+              {!lessonChatOpen && <span className="hidden h-8 w-8 items-center justify-center rounded-full bg-white/20 sm:flex"><Bot className="h-4 w-4" /></span>}
             </button>
           </div>
           ) : null}

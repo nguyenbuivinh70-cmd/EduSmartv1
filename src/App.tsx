@@ -66,6 +66,7 @@ import {
 } from './types';
 import { AI_MODELS, DEFAULT_ACTIVE_GRADES, DEFAULT_VIDEO_POPUP_CONFIG, VIDEO_POPUP_VIEW_STORAGE_KEY, sortGrades } from './constants';
 import { compareStructuredLessons, resolveLessonIdentity } from './utils/lessonCatalog';
+import { getLessonScheduleAccess } from './utils/lessonAccess';
 import {
   createAccountApi,
   createClassApi,
@@ -98,7 +99,6 @@ import {
   listReviewPracticesApi,
   listPendingSharesApi,
   listLessonCommentsApi,
-  listProfileClassesApi,
   listSchoolYearsApi,
   logoutApi,
   moveClassStudentsApi,
@@ -1748,41 +1748,42 @@ useEffect(() => {
 
   const openProfileModal = async () => {
     if (!user) return;
-    if (user.vai_tro === 'student') {
-      const res = await listProfileClassesApi(user.token);
-      if (res.ok) {
-        setProfileClasses(res.data?.items || []);
-      } else {
-        setProfileClasses(classes);
-      }
-    } else {
-      setProfileClasses(classes);
-    }
+    // Học sinh chỉ được xem khối/lớp hiện tại; không cần tải danh sách lớp để chỉnh sửa.
+    // Các vai trò khác vẫn dùng danh mục lớp hiện có khi mở hồ sơ.
+    setProfileClasses(classes);
     setIsProfileModalOpen(true);
   };
 
   const handleProfileSubmit = async (payload: { ho_ten: string; khoi?: string; lop_id?: string; mat_khau?: string }) => {
     if (!user) return;
+    const isStudentProfile = user.vai_tro === 'student';
+    const safePayload = isStudentProfile
+      ? { ho_ten: payload.ho_ten, mat_khau: payload.mat_khau }
+      : payload;
     setIsSubmitting(true);
     let updatedUser: User;
     try {
       updatedUser = await withLoading('Đang cập nhật hồ sơ cá nhân...', async () => {
         if (user.auth_provider === 'firebase') {
-          if (payload.mat_khau) await updateOwnFirebasePassword(payload.mat_khau);
-          await updateOwnFirebaseMemberProfile({
-            displayName: payload.ho_ten,
-            grade: payload.khoi,
-            classId: payload.lop_id,
-          });
+          if (safePayload.mat_khau) await updateOwnFirebasePassword(safePayload.mat_khau);
+          await updateOwnFirebaseMemberProfile(isStudentProfile
+            ? { displayName: safePayload.ho_ten }
+            : {
+                displayName: safePayload.ho_ten,
+                grade: payload.khoi,
+                classId: payload.lop_id,
+              });
           clearFirebaseIdentityCache();
           return {
             ...user,
-            ho_ten: payload.ho_ten,
-            khoi: payload.khoi || '',
-            lop_id: payload.lop_id || '',
+            ho_ten: safePayload.ho_ten,
+            ...(isStudentProfile ? {} : {
+              khoi: payload.khoi || '',
+              lop_id: payload.lop_id || '',
+            }),
           };
         }
-        const res = await updateProfileApi(user.token, payload as Record<string, unknown>);
+        const res = await updateProfileApi(user.token, safePayload as Record<string, unknown>);
         if (!res.ok || !res.data) throw new Error(res.message || 'Không cập nhật được hồ sơ cá nhân.');
         return { ...user, ...res.data, token: user.token };
       });
@@ -2177,9 +2178,16 @@ useEffect(() => {
 
   const openLessonDirect = async (lesson: Lesson, coSession: CoLearningSession | null = null) => {
     if (!user) return;
-    if (user.vai_tro === 'student' && lesson.is_locked === true) {
-      showToast(`Bài “${lesson.tieu_de}” đang được giáo viên khóa. Em hãy chờ giáo viên mở bài.`, 'error');
-      return;
+    if (user.vai_tro === 'student') {
+      if (lesson.is_locked === true) {
+        showToast(`Bài “${lesson.tieu_de}” đang được giáo viên khóa. Em hãy chờ giáo viên mở bài.`, 'error');
+        return;
+      }
+      const scheduleAccess = getLessonScheduleAccess(lesson);
+      if (scheduleAccess.blocked) {
+        showToast(`${scheduleAccess.message} Em chưa thể mở bài “${lesson.tieu_de}” lúc này.`, 'error');
+        return;
+      }
     }
     const res = await withLoading('Đang mở bài học...', () => getLessonContentApi(user.token, lesson.lesson_id));
     if (!res.ok) {
@@ -2223,6 +2231,11 @@ useEffect(() => {
     if (user.vai_tro === 'student') {
       if (lesson.is_locked === true) {
         showToast(`Bài “${lesson.tieu_de}” đang được giáo viên khóa. Em chưa thể vào học lúc này.`, 'error');
+        return;
+      }
+      const scheduleAccess = getLessonScheduleAccess(lesson);
+      if (scheduleAccess.blocked) {
+        showToast(`${scheduleAccess.message} Em chưa thể vào học lúc này.`, 'error');
         return;
       }
       const currentProgress = currentStudentProgressByLesson[lesson.lesson_id];
@@ -2294,6 +2307,13 @@ useEffect(() => {
     if (user.vai_tro === 'student' && lesson.is_locked === true) {
       showToast(`Bài “${lesson.tieu_de}” đang được giáo viên khóa. Em chưa thể vào Đấu trường lúc này.`, 'error');
       return;
+    }
+    if (user.vai_tro === 'student') {
+      const scheduleAccess = getLessonScheduleAccess(lesson);
+      if (scheduleAccess.blocked) {
+        showToast(`${scheduleAccess.message} Em chưa thể dùng bài này trong Đấu trường lúc này.`, 'error');
+        return;
+      }
     }
     if (user.vai_tro === 'student' && lesson.arena_ready === false) {
       showToast(`Bài “${lesson.tieu_de}” chưa có câu hỏi luyện tập để thi đấu.`, 'error');
@@ -3533,14 +3553,18 @@ useEffect(() => {
     const studentAverageScore = validStudentScores.length
       ? validStudentScores.reduce((sum, score) => sum + Number(score), 0) / validStudentScores.length
       : undefined;
-    const availableStudentLessons = isStudent ? visibleLessonsForCurrentUser.filter((lesson) => lesson.is_locked !== true) : [];
+    const availableStudentLessons = isStudent
+      ? visibleLessonsForCurrentUser.filter((lesson) => lesson.is_locked !== true && !getLessonScheduleAccess(lesson).blocked)
+      : [];
     const inProgressStudentCount = studentProgressItems.filter((item) => item.status === 'in_progress').length;
     const completedStudentCount = studentProgressItems.filter((item) => item.status === 'completed').length;
     const primaryLesson = isStudent
-      ? featuredLearningLessons.find((lesson) => lesson.is_locked !== true && currentStudentProgressByLesson[lesson.lesson_id]?.status === 'in_progress')
-        || featuredLearningLessons.find((lesson) => lesson.is_locked !== true)
+      ? featuredLearningLessons.find((lesson) => lesson.is_locked !== true && !getLessonScheduleAccess(lesson).blocked && currentStudentProgressByLesson[lesson.lesson_id]?.status === 'in_progress')
+        || featuredLearningLessons.find((lesson) => lesson.is_locked !== true && !getLessonScheduleAccess(lesson).blocked)
         || featuredLearningLessons[0]
       : featuredLearningLessons[0];
+    const primaryLessonScheduleAccess = isStudent && primaryLesson ? getLessonScheduleAccess(primaryLesson) : null;
+    const primaryLessonBlocked = Boolean(primaryLesson && (primaryLesson.is_locked === true || primaryLessonScheduleAccess?.blocked));
 
     if (isStudent) {
       return (
@@ -3571,11 +3595,19 @@ useEffect(() => {
                     <span className="truncate text-xs font-semibold text-white/75">{primaryLesson.mon_hoc} • Khối {primaryLesson.khoi}</span>
                     <button
                       type="button"
-                      onClick={() => primaryLesson.is_locked !== true && void openLesson(primaryLesson)}
-                      disabled={primaryLesson.is_locked === true}
+                      onClick={() => !primaryLessonBlocked && void openLesson(primaryLesson)}
+                      disabled={primaryLessonBlocked}
                       className="shrink-0 rounded-xl bg-white px-3.5 py-2 text-xs font-black text-indigo-700 shadow-sm transition hover:bg-indigo-50 disabled:cursor-not-allowed disabled:bg-white/20 disabled:text-white/65"
                     >
-                      {primaryLesson.is_locked === true ? 'Đang khóa' : currentStudentProgressByLesson[primaryLesson.lesson_id]?.status === 'in_progress' ? 'Tiếp tục học' : 'Mở bài'}
+                      {primaryLesson.is_locked === true
+                        ? 'Đang khóa'
+                        : primaryLessonScheduleAccess?.reason === 'before_start'
+                          ? 'Chưa đến giờ'
+                          : primaryLessonScheduleAccess?.reason === 'after_end'
+                            ? 'Đã hết giờ'
+                            : currentStudentProgressByLesson[primaryLesson.lesson_id]?.status === 'in_progress'
+                              ? 'Tiếp tục học'
+                              : 'Mở bài'}
                     </button>
                   </div>
                 </div>

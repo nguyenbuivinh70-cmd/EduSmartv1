@@ -1,16 +1,18 @@
-# EduSmart V6.73.2
+# EduSmart V6.74.0
 
-## Clean Lesson & Arena Cards
+## Mobile Lesson Viewer UX
 
-V6.73.2 tinh gọn giao diện **Quản lý bài học** và **Quản lý Đấu trường tri thức** bằng cách bỏ các thông tin bị lặp lại trên cùng một card.
+V6.74.0 nâng cấp mạnh giao diện **màn hình học bài trên điện thoại** để thao tác nhanh, ít che nội dung và phù hợp với iPhone/Android.
 
 ### Nâng cấp chính
-- Cover bài học/Đấu trường **không còn lặp lại Bài số + tên/chủ đề** ở góc trên trái.
-- Phần nội dung card chỉ giữ **một tiêu đề chính** dạng `Bài N: Tên bài`.
-- Bỏ dòng chủ đề màu xanh nằm dưới tiêu đề khi nó trùng với tên bài.
-- Cover vẫn giữ **trạng thái Đang mở / Đã khóa** và dòng **Môn học • Khối • Lớp** để nhận diện nhanh.
-- Card Đấu trường vẫn giữ nhãn **Đấu trường tri thức**, ngày cập nhật, số câu hỏi và trạng thái sẵn sàng.
-- Giữ nguyên toàn bộ thao tác **Mở/Xem, ..., Sửa, Theo dõi, Khóa/Mở khóa, Xóa** theo quyền.
+- **Cấu trúc bài học** trên mobile chuyển từ khối chiếm chỗ trong luồng nội dung sang **bottom-sheet drawer** mở/đóng theo nhu cầu.
+- Bổ sung thanh điều hướng cố định phía dưới: **Trước / Mục hiện tại / Sau**.
+- Header mobile gọn hơn, giữ tiêu đề bài, đồng hồ, menu và đóng bài với vùng chạm lớn.
+- Trợ lý AI trên mobile thu gọn thành nút nổi nhỏ và chuyển sang bên trái để tránh che nội dung/nút Netlify.
+- Tối ưu khoảng cách, cỡ chữ, card nội dung, nút hỏi AI và phần hướng dẫn hoàn thành mục học trên màn hình hẹp.
+- Bổ sung hỗ trợ `safe-area` cho iPhone có notch/home indicator.
+- Khi đang làm **kiểm tra cuối bài**, menu điều hướng mobile bị ẩn để tránh thoát khỏi bài kiểm tra.
+- Giữ nguyên toàn bộ logic tiến độ, điểm, câu hỏi, comment, AI và kiểm soát lịch học từ V6.73.5.
 
 ### Backend
-Không thay đổi schema trong V6.73.2. Tiếp tục sử dụng Firestore Rules V6.71.2, Code.gs V6.71.2 và DATA V4 V6.68.0.
+Không thay đổi backend/schema trong V6.74.0. Tiếp tục sử dụng Firestore Rules V6.73.5, Code.gs V6.71.2 và DATA V4 V6.68.0.

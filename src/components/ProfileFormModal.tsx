@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Save, User as UserIcon, X, Key, MapPin, Milestone } from 'lucide-react';
+import { Save, User as UserIcon, X, Key, MapPin, Milestone, Lock } from 'lucide-react';
 import type { CatalogClass, User } from '../types';
 import { DEFAULT_ACTIVE_GRADES, sortGrades } from '../constants';
 
@@ -30,6 +30,7 @@ export default function ProfileFormModal({
   const [lopId, setLopId] = useState('');
   const [matKhau, setMatKhau] = useState('');
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const isStudent = user?.vai_tro === 'student';
   const gradeOptions = useMemo(() => {
     const fromProps = Array.isArray(availableGrades) ? availableGrades : [];
     const fromClasses = classes.map((item) => String(item.khoi || '').trim().replace(/\.0+$/, '')).filter(Boolean);
@@ -64,8 +65,7 @@ export default function ProfileFormModal({
 
     onSubmit({
       ho_ten: hoTen.trim(),
-      khoi: khoi || undefined,
-      lop_id: lopId || undefined,
+      ...(isStudent ? {} : { khoi: khoi || undefined, lop_id: lopId || undefined }),
       mat_khau: matKhau || undefined,
     });
   };
@@ -111,7 +111,7 @@ export default function ProfileFormModal({
                 <section className="app-modal-section">
                   <div className="mb-4">
                     <p className="app-modal-section-title">Thông tin cá nhân</p>
-                    <p className="app-modal-section-description">Các thông tin này sẽ hiển thị trên hồ sơ và dùng để gắn đúng dữ liệu lớp học của người dùng.</p>
+                    <p className="app-modal-section-description">{isStudent ? 'Học sinh có thể cập nhật họ tên và mật khẩu. Khối, lớp học do nhà trường quản lý và chỉ hiển thị để đối chiếu.' : 'Các thông tin này sẽ hiển thị trên hồ sơ và dùng để gắn đúng dữ liệu lớp học của người dùng.'}</p>
                   </div>
                   <div>
                     <label className="mb-2 block text-sm font-semibold text-slate-700">Họ tên công dân</label>
@@ -137,16 +137,23 @@ export default function ProfileFormModal({
                         <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-4 text-slate-400">
                           <Milestone className="h-4 w-4" />
                         </div>
-                        <select
-                          value={khoi}
-                          onChange={(e) => setKhoi(e.target.value)}
-                          className={`${fieldClassName} appearance-none`}
-                        >
-                          <option value="">Chọn khối...</option>
-                          {gradeOptions.map((k) => (
-                            <option key={k} value={k}>Khối {k}</option>
-                          ))}
-                        </select>
+                        {isStudent ? (
+                          <div className="flex min-h-[50px] items-center rounded-2xl border border-slate-200 bg-slate-50 py-3 pl-11 pr-10 font-semibold text-slate-700">
+                            Khối {user.khoi || '-'}
+                          </div>
+                        ) : (
+                          <select
+                            value={khoi}
+                            onChange={(e) => setKhoi(e.target.value)}
+                            className={`${fieldClassName} appearance-none`}
+                          >
+                            <option value="">Chọn khối...</option>
+                            {gradeOptions.map((k) => (
+                              <option key={k} value={k}>Khối {k}</option>
+                            ))}
+                          </select>
+                        )}
+                        {isStudent ? <Lock className="pointer-events-none absolute right-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" /> : null}
                       </div>
                     </div>
 
@@ -156,19 +163,32 @@ export default function ProfileFormModal({
                         <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-4 text-slate-400">
                           <MapPin className="h-4 w-4" />
                         </div>
-                        <select
-                          value={lopId}
-                          onChange={(e) => setLopId(e.target.value)}
-                          className={`${fieldClassName} appearance-none`}
-                        >
-                          <option value="">Chọn lớp...</option>
-                          {classes.filter(c => !khoi || c.khoi === khoi).map((c) => (
-                            <option key={c.lop_id} value={c.lop_id}>{c.ten_lop}</option>
-                          ))}
-                        </select>
+                        {isStudent ? (
+                          <div className="flex min-h-[50px] items-center rounded-2xl border border-slate-200 bg-slate-50 py-3 pl-11 pr-10 font-semibold text-slate-700">
+                            {classes.find((c) => c.lop_id === user.lop_id)?.ten_lop || user.lop_id || '-'}
+                          </div>
+                        ) : (
+                          <select
+                            value={lopId}
+                            onChange={(e) => setLopId(e.target.value)}
+                            className={`${fieldClassName} appearance-none`}
+                          >
+                            <option value="">Chọn lớp...</option>
+                            {classes.filter(c => !khoi || c.khoi === khoi).map((c) => (
+                              <option key={c.lop_id} value={c.lop_id}>{c.ten_lop}</option>
+                            ))}
+                          </select>
+                        )}
+                        {isStudent ? <Lock className="pointer-events-none absolute right-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" /> : null}
                       </div>
                     </div>
                   </div>
+                  {isStudent ? (
+                    <div className="mt-3 flex items-start gap-2 rounded-2xl border border-indigo-100 bg-indigo-50/70 px-3.5 py-3 text-xs leading-5 text-indigo-700">
+                      <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                      <span>Khối và lớp học do nhà trường quản lý. Học sinh không thể tự thay đổi hai thông tin này.</span>
+                    </div>
+                  ) : null}
                 </section>
 
                 <section className="app-modal-section">
