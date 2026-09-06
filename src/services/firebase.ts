@@ -233,8 +233,8 @@ export function firebaseErrorMessage(error: unknown) {
     'auth/user-disabled': 'Tài khoản Firebase đã bị vô hiệu hóa.',
     'auth/too-many-requests': 'Đăng nhập sai quá nhiều lần. Vui lòng thử lại sau.',
     'auth/network-request-failed': 'Không kết nối được Firebase. Vui lòng kiểm tra Internet.',
-    'permission-denied': 'Firestore từ chối truy cập dữ liệu. Hãy Publish firestore.rules đi kèm bản V6.67.0 và kiểm tra hồ sơ thành viên có status=active, schoolId=hthtv1.',
-    'firestore/permission-denied': 'Firestore từ chối truy cập dữ liệu. Hãy Publish firestore.rules đi kèm bản V6.67.0 và kiểm tra hồ sơ thành viên có status=active, schoolId=hthtv1.',
+    'permission-denied': 'Firestore từ chối truy cập dữ liệu. Hãy Publish firestore.rules đi kèm bản V6.68.0 và kiểm tra hồ sơ thành viên có status=active, schoolId=hthtv1.',
+    'firestore/permission-denied': 'Firestore từ chối truy cập dữ liệu. Hãy Publish firestore.rules đi kèm bản V6.68.0 và kiểm tra hồ sơ thành viên có status=active, schoolId=hthtv1.',
   };
   if (messages[code]) return messages[code];
   if (code.includes('api-key-not-valid') || (error instanceof Error && error.message.includes('api-key-not-valid'))) {
@@ -274,8 +274,8 @@ export async function loadValidatedCurrentFirebaseMember() {
   }
 
   const member = normalizeMember(memberSnapshot.data(), uid, signedInEmail);
-  if (member.authUid !== uid) throw new Error('Hồ sơ thành viên thiếu/sai authUid. Hãy Publish firestore.rules V6.67.0 rồi đăng nhập lại.');
-  if (member.schoolId !== FIREBASE_SCHOOL_ID) throw new Error(`Hồ sơ thành viên thiếu/sai schoolId (cần ${FIREBASE_SCHOOL_ID}). Hãy Publish firestore.rules V6.67.0 rồi đăng nhập lại.`);
+  if (member.authUid !== uid) throw new Error('Hồ sơ thành viên thiếu/sai authUid. Hãy Publish firestore.rules V6.68.0 rồi đăng nhập lại.');
+  if (member.schoolId !== FIREBASE_SCHOOL_ID) throw new Error(`Hồ sơ thành viên thiếu/sai schoolId (cần ${FIREBASE_SCHOOL_ID}). Hãy Publish firestore.rules V6.68.0 rồi đăng nhập lại.`);
   if (member.status !== 'active') throw new Error('Tài khoản thành viên đang bị khóa hoặc chưa kích hoạt.');
   if (!member.userId) throw new Error('Hồ sơ thành viên chưa có trường userId.');
   return { uid, ...member };
@@ -335,7 +335,7 @@ export async function signInAndLoadMember(email: string, password: string): Prom
     }
 
     // Một số hồ sơ được tạo ở các bản cũ có thể thiếu schoolId/authUid.
-    // Rules V6.67.0 cho phép chính chủ bổ sung đúng hai trường nhận dạng này,
+    // Rules V6.68.0 cho phép chính chủ bổ sung đúng hai trường nhận dạng này,
     // giúp tránh tình trạng đăng nhập được nhưng mọi collection phía sau đều bị
     // permission-denied. Việc sửa là best-effort để không phá phiên đăng nhập.
     const rawMember = memberSnapshot.data();
@@ -353,8 +353,8 @@ export async function signInAndLoadMember(email: string, password: string): Prom
     }
 
     const member = normalizeMember(memberSnapshot.data(), uid, signedInEmail);
-    if (member.authUid !== uid) throw new Error('Hồ sơ thành viên thiếu/sai authUid. Hãy Publish firestore.rules V6.67.0 rồi đăng nhập lại.');
-    if (member.schoolId !== FIREBASE_SCHOOL_ID) throw new Error(`Hồ sơ thành viên thiếu/sai schoolId (cần ${FIREBASE_SCHOOL_ID}). Hãy Publish firestore.rules V6.67.0 rồi đăng nhập lại.`);
+    if (member.authUid !== uid) throw new Error('Hồ sơ thành viên thiếu/sai authUid. Hãy Publish firestore.rules V6.68.0 rồi đăng nhập lại.');
+    if (member.schoolId !== FIREBASE_SCHOOL_ID) throw new Error(`Hồ sơ thành viên thiếu/sai schoolId (cần ${FIREBASE_SCHOOL_ID}). Hãy Publish firestore.rules V6.68.0 rồi đăng nhập lại.`);
     if (member.status !== 'active') throw new Error('Tài khoản thành viên đang bị khóa hoặc chưa kích hoạt.');
     if (!member.userId) throw new Error('Hồ sơ thành viên chưa có trường userId.');
 
@@ -435,7 +435,7 @@ export async function verifyOrActivateFirebaseClassmateInIsolation(
       } catch (rosterError) {
         const rosterCode = rosterError instanceof FirebaseError ? rosterError.code : '';
         if (rosterCode === 'permission-denied' || rosterCode === 'firestore/permission-denied') {
-          throw new Error('Chưa thể kiểm tra bạn cùng lớp. Hãy triển khai Firestore Rules V6.67.0 rồi thử lại.');
+          throw new Error('Chưa thể kiểm tra bạn cùng lớp. Hãy triển khai Firestore Rules V6.68.0 rồi thử lại.');
         }
         throw rosterError;
       }
@@ -518,7 +518,7 @@ export async function verifyOrActivateFirebaseClassmateInIsolation(
 
     const member = normalizeMember(memberSnapshot.data(), uid, signedInEmail);
     if (member.authUid !== uid || member.schoolId !== FIREBASE_SCHOOL_ID) {
-      throw new Error('Hồ sơ Firebase của bạn học cùng thiếu/sai authUid hoặc schoolId. Hãy Publish Firestore Rules V6.67.0.');
+      throw new Error('Hồ sơ Firebase của bạn học cùng thiếu/sai authUid hoặc schoolId. Hãy Publish Firestore Rules V6.68.0.');
     }
     if (member.role !== 'student') throw new Error('Tài khoản được nhập không phải tài khoản học sinh.');
     if (member.status !== 'active') throw new Error('Tài khoản bạn học cùng đang bị khóa hoặc chưa kích hoạt.');

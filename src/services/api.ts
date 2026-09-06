@@ -406,6 +406,8 @@ function normalizeLessonRow(raw: any): LessonRow {
     lesson_number: Number.isSafeInteger(rawLessonNumber) && rawLessonNumber > 0 ? rawLessonNumber : undefined,
     lesson_name: toCleanString(raw?.lesson_name),
     lesson_key: toCleanString(raw?.lesson_key),
+    arena_question_count: Number.isFinite(Number(raw?.arena_question_count)) ? Math.max(0, Number(raw.arena_question_count)) : undefined,
+    arena_ready: raw?.arena_ready === true ? true : raw?.arena_ready === false ? false : undefined,
     lop_id: normalizeClassId(raw?.lop_id),
     khoi: normalizeGrade(raw?.khoi),
     mon_id: toCleanString(raw?.mon_id),
@@ -1874,10 +1876,22 @@ export async function setLessonLockApi(_token: string, lesson_id: string, locked
 }
 
 export async function deleteLessonApi(token: string, lesson_id: string) {
-  if (await deleteFirebaseLesson(lesson_id).catch(() => false)) {
-    return { ok: true, message: 'Đã xóa bài học trên Firebase.', data: { lesson_id, deleted: true } };
+  try {
+    const deleted = await deleteFirebaseLesson(lesson_id);
+    if (!deleted) return { ok: false, message: 'Không tìm thấy bài học trên Firebase.' };
+
+    // Firestore là nguồn vận hành chính. Chạy cleanup legacy Google Sheet/Drive
+    // theo kiểu best-effort để không giữ popup/UI chờ Apps Script phản hồi.
+    void apiRequest('deleteLesson', { lesson_id }, token).catch(() => undefined);
+
+    return {
+      ok: true,
+      message: 'Đã xóa bài học và dữ liệu liên quan trên Firebase.',
+      data: deleted,
+    };
+  } catch (error) {
+    return { ok: false, message: firebaseErrorMessage(error), error };
   }
-  return { ok: false, message: 'Không tìm thấy bài học trên Firebase.' };
 }
 
 export async function submitLessonReviewApi(token: string, lesson_id: string) {

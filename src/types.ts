@@ -145,6 +145,8 @@ export interface LessonRow {
   lesson_number?: number;
   lesson_name?: string;
   lesson_key?: string;
+  arena_question_count?: number;
+  arena_ready?: boolean;
   lop_id?: string;
   khoi: string;
   mon_id: string;
@@ -176,6 +178,8 @@ export interface Lesson {
   lesson_number?: number;
   lesson_name?: string;
   lesson_key?: string;
+  arena_question_count?: number;
+  arena_ready?: boolean;
   mo_ta: string;
   mon_id: string;
   mon_hoc: string;

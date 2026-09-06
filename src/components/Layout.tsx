@@ -76,7 +76,7 @@ export default function Layout({ user, onLogout, children, activeMenu, setActive
   const adminLike = hasAdminPermission(user);
 
   const studentMenu = [
-    { id: 'learning', label: 'Học tập', icon: <BookOpen className="h-5 w-5" /> },
+    { id: 'learning', label: 'Bài học', icon: <BookOpen className="h-5 w-5" /> },
     { id: 'arena', label: 'Đấu trường tri thức', icon: <Trophy className="h-5 w-5" /> },
     { id: 'ai_config', label: 'Cấu hình AI', icon: <Settings className="h-5 w-5" /> },
     { id: 'profile', label: 'Hồ sơ cá nhân', icon: <UserIcon className="h-5 w-5" /> },

@@ -1,45 +1,16 @@
-# EduSmart V6.67.0
+# EduSmart V6.73.2
 
-**Structured Lesson Catalog & Class-Scoped Learning Analytics**
+## Clean Lesson & Arena Cards
 
-Bản nâng cấp từ EduSmart V6.66.2, tập trung vào hai nhóm chức năng:
+V6.73.2 tinh gọn giao diện **Quản lý bài học** và **Quản lý Đấu trường tri thức** bằng cách bỏ các thông tin bị lặp lại trên cùng một card.
 
-- Quản lý bài học theo cấu trúc **Môn học → Khối → Bài số → Tên bài**.
-- Theo dõi học tập theo **lớp / khối / bài**, không trộn học sinh và bài của nhiều khối/lớp trong cùng bảng điểm.
+### Nâng cấp chính
+- Cover bài học/Đấu trường **không còn lặp lại Bài số + tên/chủ đề** ở góc trên trái.
+- Phần nội dung card chỉ giữ **một tiêu đề chính** dạng `Bài N: Tên bài`.
+- Bỏ dòng chủ đề màu xanh nằm dưới tiêu đề khi nó trùng với tên bài.
+- Cover vẫn giữ **trạng thái Đang mở / Đã khóa** và dòng **Môn học • Khối • Lớp** để nhận diện nhanh.
+- Card Đấu trường vẫn giữ nhãn **Đấu trường tri thức**, ngày cập nhật, số câu hỏi và trạng thái sẵn sàng.
+- Giữ nguyên toàn bộ thao tác **Mở/Xem, ..., Sửa, Theo dõi, Khóa/Mở khóa, Xóa** theo quyền.
 
-## Điểm mới chính
-
-- Mặc định ưu tiên môn **Tin học** khi tạo bài mới nếu môn này đang hoạt động và áp dụng cho khối đã chọn.
-- Bổ sung `lesson_number`, `lesson_name`, `lesson_key`; tiêu đề được sinh theo mẫu `Bài N: Tên bài`.
-- Kiểm tra trùng số bài theo **năm học + học kỳ + môn + khối + phạm vi lớp**.
-- Firestore `lessonNumberRegistry` dùng transaction để chống tạo trùng đồng thời.
-- Bài cũ dạng `Bài 1: ...` vẫn được nhận diện/sắp xếp mà không phải xóa dữ liệu cũ.
-- Theo dõi học tập có 3 chế độ: **Theo lớp**, **Theo khối**, **Theo bài theo khối/lớp**.
-- Bảng theo lớp chỉ hiển thị một lớp cụ thể; cột bài dùng số bài thực thay vì chỉ số mảng.
-- Khi chuyển lớp/kết chuyển năm học, `learningProgress` và `coLearningSessions` được giữ như snapshot lịch sử, không ghi đè lớp/khối/năm học đã phát sinh.
-
-## Chạy mã nguồn
-
-Yêu cầu Node.js.
-
-```bash
-npm install
-npm run dev
-```
-
-Kiểm tra TypeScript/build khi môi trường đã cài đủ dependencies:
-
-```bash
-npm run lint
-npm run build
-```
-
-## Triển khai đồng bộ
-
-Frontend V6.67.0 phải được dùng cùng:
-
-- Firestore Rules V6.67.0.
-- Apps Script `code_v6.67.0.gs`.
-- Google Sheet `DATA_V4_V6.67.0.xlsx` nếu hệ thống vẫn dùng phần legacy/fallback Google Sheet.
-
-Khi cập nhật production, không tạo/chỉnh bài học trong khoảng thời gian đang thay Firestore Rules và frontend để tránh lệch phiên bản tạm thời.
+### Backend
+Không thay đổi schema trong V6.73.2. Tiếp tục sử dụng Firestore Rules V6.71.2, Code.gs V6.71.2 và DATA V4 V6.68.0.

@@ -11,6 +11,8 @@ import {
   GraduationCap,
   Download,
   LayoutDashboard,
+  LayoutGrid,
+  List,
   Lock,
   MoreHorizontal,
   Pencil,
@@ -181,6 +183,8 @@ function mapLessonRow(
     lesson_number: identity.lessonNumber,
     lesson_name: identity.lessonName,
     lesson_key: row.lesson_key || '',
+    arena_question_count: row.arena_question_count,
+    arena_ready: row.arena_ready,
     mo_ta: row.tom_tat || 'Bài học được tạo từ học liệu tải lên.',
     mon_id: row.mon_id,
     mon_hoc: subjectName,
@@ -714,21 +718,18 @@ function requiredDataDomains(menu: string, currentUser: User, isAdmin: boolean):
 
 function DataModuleSkeleton({ message }: { message: string }) {
   return (
-    <div className="space-y-6" aria-live="polite" aria-busy="true">
-      <div className="rounded-[28px] border border-indigo-100 bg-white p-6 shadow-sm">
-        <div className="flex items-center gap-3 text-sm font-semibold text-indigo-700">
-          <RefreshCw className="h-5 w-5 animate-spin" />
-          {message}
-        </div>
-        <p className="mt-2 text-sm text-slate-500">Bạn vẫn có thể chuyển màn hình; dữ liệu chỉ được tải khi chức năng cần sử dụng.</p>
+    <div className="space-y-4" aria-live="polite" aria-busy="true">
+      <div className="inline-flex max-w-full items-center gap-2 rounded-full border border-indigo-100 bg-white px-3.5 py-2 text-xs font-bold text-indigo-700 shadow-sm">
+        <RefreshCw className="h-4 w-4 shrink-0 animate-spin" />
+        <span className="truncate">{message}</span>
       </div>
-      <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
         {[0, 1, 2].map((item) => (
-          <div key={item} className="animate-pulse rounded-[28px] bg-white p-6 shadow-sm ring-1 ring-slate-100">
-            <div className="h-5 w-2/5 rounded-full bg-slate-100" />
-            <div className="mt-5 h-10 rounded-2xl bg-slate-100" />
-            <div className="mt-3 h-4 w-4/5 rounded-full bg-slate-100" />
-            <div className="mt-3 h-4 w-3/5 rounded-full bg-slate-100" />
+          <div key={item} className="animate-pulse rounded-[24px] bg-white p-5 shadow-sm ring-1 ring-slate-100">
+            <div className="h-4 w-2/5 rounded-full bg-slate-100" />
+            <div className="mt-4 h-8 rounded-xl bg-slate-100" />
+            <div className="mt-3 h-3.5 w-4/5 rounded-full bg-slate-100" />
+            <div className="mt-2.5 h-3.5 w-3/5 rounded-full bg-slate-100" />
           </div>
         ))}
       </div>
@@ -782,6 +783,8 @@ export default function App() {
   const [lessonScopeFilter, setLessonScopeFilter] = useState('Tất cả');
   const [lessonAccessFilter, setLessonAccessFilter] = useState('Tất cả');
   const [lessonLockUpdatingId, setLessonLockUpdatingId] = useState('');
+  const [lessonLibraryView, setLessonLibraryView] = useState<'grid' | 'list'>('grid');
+  const [lessonLibraryPage, setLessonLibraryPage] = useState(1);
 
   const [accountQuery, setAccountQuery] = useState('');
   const [accountRoleFilter, setAccountRoleFilter] = useState('Tất cả');
@@ -803,6 +806,10 @@ export default function App() {
   const [subjectStatusFilter, setSubjectStatusFilter] = useState('Tất cả');
 
   const currentUserIsAdmin = hasAdminPermission(user);
+
+  useEffect(() => {
+    setLessonLibraryPage(1);
+  }, [lessonSearch, lessonSubjectFilter, lessonGradeFilter, lessonStatusFilter, lessonScopeFilter, lessonAccessFilter, lessonLibraryView, activeMenu]);
 
 const gradeFilterOptions = useMemo(() => {
   if (user?.khoi && !currentUserIsAdmin) return [String(user.khoi)];
@@ -1065,7 +1072,13 @@ useEffect(() => {
   useEffect(() => {
     if (!user) return;
     if (user.vai_tro === 'student') {
+      // Học sinh chỉ dùng các bộ lọc phù hợp với thư viện cá nhân.
+      // Reset các filter quản trị đang bị ẩn để chúng không âm thầm làm mất bài.
       setLessonGradeFilter(user.khoi || 'Tất cả');
+      setLessonSubjectFilter('Tất cả');
+      setLessonStatusFilter('Tất cả');
+      setLessonScopeFilter('Tất cả');
+      setLessonAccessFilter('Tất cả');
       setLessonSearch('');
     }
   }, [user?.user_id]);
@@ -1073,7 +1086,7 @@ useEffect(() => {
   const showToast = (message: string, type: ToastType) => setToast({ message, type });
 
   // Khi học sinh đang ở trong bài, theo dõi metadata bài học theo thời gian thực.
-  // Nếu giáo viên khóa bài, viewer đóng ngay và Rules V6.67.0 đồng thời chặn đọc content.
+  // Nếu giáo viên khóa bài, viewer đóng ngay và Rules V6.68.0 đồng thời chặn đọc content.
   useEffect(() => {
     if (!user || user.vai_tro !== 'student' || !isLessonViewerOpen || !selectedLesson?.lesson_id) return;
     return subscribeFirebaseLessonAccess(
@@ -1101,6 +1114,39 @@ useEffect(() => {
       },
     );
   }, [user?.user_id, user?.vai_tro, isLessonViewerOpen, selectedLesson?.lesson_id]);
+
+  // Đấu trường dùng cùng trạng thái is_locked với Bài học. Nếu giáo viên khóa bài
+  // trong lúc học sinh đang chọn/chơi, đóng ngay phiên đấu trường và trở về danh sách.
+  useEffect(() => {
+    if (!user || user.vai_tro !== 'student' || activeMenu !== 'arena' || !arenaLesson?.lesson_id) return;
+    return subscribeFirebaseLessonAccess(
+      arenaLesson.lesson_id,
+      (latest) => {
+        if (!latest) {
+          setArenaLesson(null);
+          setArenaLessonContent(null);
+          setToast({ message: 'Bài học không còn tồn tại hoặc em không còn quyền truy cập Đấu trường.', type: 'error' });
+          return;
+        }
+        setLessonRows((current) => current.map((item) => item.lesson_id === latest.lesson_id ? { ...item, ...latest } : item));
+        setArenaLesson((current) => current?.lesson_id === latest.lesson_id ? {
+          ...current,
+          is_locked: latest.is_locked,
+          locked_at: latest.locked_at,
+          locked_by_uid: latest.locked_by_uid,
+          locked_by_name: latest.locked_by_name,
+        } : current);
+        if (latest.is_locked === true) {
+          setArenaLesson(null);
+          setArenaLessonContent(null);
+          setToast({ message: 'Giáo viên vừa khóa bài học này. Em đã được đưa về danh sách Đấu trường tri thức.', type: 'error' });
+        }
+      },
+      () => {
+        // Firestore Rules vẫn là lớp bảo vệ cuối cùng nếu listener tạm mất kết nối.
+      },
+    );
+  }, [user?.user_id, user?.vai_tro, activeMenu, arenaLesson?.lesson_id]);
 
   const startLoading = (message = 'Đang tải...') => {
     setLoadingMessage(message);
@@ -1326,7 +1372,8 @@ useEffect(() => {
 
   const loadAppData = async () => {
     if (!user) return;
-    setIsRefreshingData(true);
+    // Mỗi tầng tải tự quản lý trạng thái của chính nó. Không bật cờ refresh tổng
+    // trước cold-load để tránh hiển thị đồng thời skeleton và badge đồng bộ nền.
     await loadCoreData(true);
     await loadMenuData(activeMenu, true);
   };
@@ -2244,6 +2291,14 @@ useEffect(() => {
 
   const handleArenaSelectLesson = async (lesson: Lesson) => {
     if (!user) return;
+    if (user.vai_tro === 'student' && lesson.is_locked === true) {
+      showToast(`Bài “${lesson.tieu_de}” đang được giáo viên khóa. Em chưa thể vào Đấu trường lúc này.`, 'error');
+      return;
+    }
+    if (user.vai_tro === 'student' && lesson.arena_ready === false) {
+      showToast(`Bài “${lesson.tieu_de}” chưa có câu hỏi luyện tập để thi đấu.`, 'error');
+      return;
+    }
     const res = await withLoading('Đang chuẩn bị đấu trường tri thức...', () => getLessonContentApi(user.token, lesson.lesson_id));
     if (!res.ok) {
       if (!handleSessionError(res.message)) showToast(res.message, 'error');
@@ -2429,22 +2484,68 @@ useEffect(() => {
     setConfirmDialog({
       isOpen: true,
       title: 'Xóa bài học',
-      description: `Bạn có chắc muốn xóa bài học “${lesson.tieu_de}”? Hệ thống sẽ xóa luôn các bản ghi tiến trình học tập gắn với bài học này.`,
+      description: `Bạn có chắc muốn xóa bài học “${lesson.tieu_de}”? Hệ thống sẽ xóa bài học, nội dung, tiến trình, bình luận, phiên học cùng, nhật ký xử lý kết quả, prompt trình chiếu và các bài ôn tập được tạo từ bài này.`,
       confirmLabel: 'Xóa bài học',
       cancelLabel: 'Hủy',
       variant: 'danger',
       onConfirm: async () => {
         if (!user) return;
-        setIsSubmitting(true);
-        const res = await withLoading('Đang xóa bài học...', () => deleteLessonApi(user.token, lesson.lesson_id));
-        setIsSubmitting(false);
-        if (!res.ok) {
-          if (!handleSessionError(res.message)) showToast(res.message, 'error');
-          return;
-        }
+        const lessonId = lesson.lesson_id;
+
+        // V6.71.2: đóng hộp thoại ngay khi người dùng xác nhận. Firestore có thể
+        // cập nhật snapshot cục bộ trước khi server ACK; nếu giữ modal chờ Promise
+        // sẽ tạo cảm giác popup bị treo dù card đã biến mất khỏi danh sách.
         setConfirmDialog(DEFAULT_CONFIRM);
-        await loadAppData();
-        showToast('Đã xóa bài học', 'success');
+        setIsSubmitting(false);
+
+        // Cập nhật UI lạc quan. Nếu xóa thất bại, loadAppData() bên dưới sẽ phục hồi
+        // lại dữ liệu thật từ Firestore.
+        setLessonRows((current) => current.filter((item) => item.lesson_id !== lessonId));
+        setProgressRecords((current) => current.filter((item) => item.lesson_id !== lessonId));
+        setLessonComments((current) => current.filter((item) => item.lesson_id !== lessonId));
+        setReviewPractices((current) => current.filter((review) => {
+          const raw = review.lesson_ids;
+          const ids = Array.isArray(raw) ? raw : String(raw || '').split(',');
+          return !ids.map((id) => String(id || '').trim()).includes(lessonId);
+        }));
+        setSelectedLesson((current) => current?.lesson_id === lessonId ? null : current);
+        setSelectedLessonContent((current) => selectedLesson?.lesson_id === lessonId ? null : current);
+        setArenaLesson((current) => current?.lesson_id === lessonId ? null : current);
+        setArenaLessonContent((current) => arenaLesson?.lesson_id === lessonId ? null : current);
+
+        showToast('Đang xóa bài học và toàn bộ dữ liệu liên quan...', 'info');
+        try {
+          const res = await deleteLessonApi(user.token, lessonId);
+          if (!res.ok) {
+            await loadAppData();
+            if (!handleSessionError(res.message)) showToast(res.message || 'Không xóa được bài học.', 'error');
+            return;
+          }
+
+          const counts = (res.data as any)?.deleted_counts || {};
+          const relatedDeleted = [
+            counts.learningProgress,
+            counts.learningResultActions,
+            counts.lessonComments,
+            counts.coLearningSessions,
+            counts.slidesPrompts,
+            counts.reviewPractices,
+            counts.reviewAttempts,
+          ].reduce((sum: number, value: unknown) => sum + Math.max(0, Number(value || 0)), 0);
+
+          // Đồng bộ lại các danh sách liên quan sau cascade, nhưng không khóa giao diện
+          // bằng popup xác nhận trong thời gian chờ network/server ACK.
+          await loadAppData();
+          showToast(
+            relatedDeleted > 0
+              ? `Đã xóa bài học và ${relatedDeleted} bản ghi dữ liệu liên quan.`
+              : 'Đã xóa bài học và hoàn tất dọn dữ liệu liên quan.',
+            'success',
+          );
+        } catch (error) {
+          await loadAppData().catch(() => undefined);
+          showToast(error instanceof Error ? error.message : 'Không xóa được bài học.', 'error');
+        }
       },
     });
   };
@@ -2460,7 +2561,9 @@ useEffect(() => {
       return;
     }
     setLessonRows((current) => current.map((item) => item.lesson_id === lesson.lesson_id ? { ...item, ...res.data } : item));
-    showToast(nextLocked ? `Đã khóa “${lesson.tieu_de}” đối với học sinh.` : `Đã mở khóa “${lesson.tieu_de}” cho học sinh.`, 'success');
+    setArenaLesson((current) => current?.lesson_id === lesson.lesson_id ? { ...current, ...res.data } : current);
+    setSelectedLesson((current) => current?.lesson_id === lesson.lesson_id ? { ...current, ...res.data } : current);
+    showToast(nextLocked ? `Đã khóa “${lesson.tieu_de}” đối với Học tập và Đấu trường tri thức.` : `Đã mở khóa “${lesson.tieu_de}” cho Học tập và Đấu trường tri thức.`, 'success');
   };
 
   const handleSubmitReview = async (lesson: Lesson) => {
@@ -2968,88 +3071,186 @@ useEffect(() => {
     { label: 'Bản ghi đã quét', value: (systemDiagnostics?.summary.scanned_accounts || 0) + (systemDiagnostics?.summary.scanned_classes || 0) + (systemDiagnostics?.summary.scanned_subjects || 0) + (systemDiagnostics?.summary.scanned_lessons || 0) + (systemDiagnostics?.summary.scanned_progress || 0) + (systemDiagnostics?.summary.scanned_shares || 0), className: 'bg-slate-100 text-slate-700' },
   ];
 
-  const renderLessonFilters = (extraAction?: ReactNode, titleOverride?: string, descriptionOverride?: string) => (
-    <DataToolbar
-      compact
-      dense={activeMenu === 'lessons' || activeMenu === 'my_lessons'}
-      title={titleOverride || (activeMenu === 'approvals' ? 'Bài giáo viên chờ duyệt' : activeMenu === 'learning' ? 'Không gian học tập' : activeMenu === 'arena' ? 'Đấu trường tri thức' : activeMenu === 'my_lessons' ? 'Bài học của tôi' : 'Quản lý bài học')}
-      description={descriptionOverride || (
-        activeMenu === 'approvals'
-          ? 'Admin duyệt học liệu do giáo viên gửi chia sẻ trước khi đưa vào kho dùng chung.'
-          : activeMenu === 'my_lessons'
-            ? 'Tự tạo, chỉnh sửa và gửi duyệt bài học do bạn biên soạn.'
-            : activeMenu === 'arena'
-              ? 'Chọn bài học phù hợp rồi bước vào các trò chơi ôn tập theo dạng gameshow.'
-              : activeMenu === 'lessons'
-                ? 'Quản lý, chia sẻ và kiểm soát quyền học của các bài học.'
-                : 'Tìm kiếm, lọc và mở nhanh bài học theo môn, khối và trạng thái dùng chung.'
-      )}
-      searchValue={lessonSearch}
-      onSearchChange={setLessonSearch}
-      searchPlaceholder={activeMenu === 'lessons' || activeMenu === 'my_lessons' ? "Tìm theo tên bài, môn học..." : "Tìm theo tên bài, mô tả, môn học..."}
-      filters={[
-        {
-          key: 'subject',
-          label: 'Môn học',
-          value: lessonSubjectFilter,
-          onChange: setLessonSubjectFilter,
-          options: [{ value: 'Tất cả', label: 'Tất cả môn học' }, ...availableSubjects.map((subject) => ({ value: subject, label: subject }))],
-        },
-        {
-          key: 'grade',
-          label: 'Khối',
-          value: lessonGradeFilter,
-          onChange: setLessonGradeFilter,
-          options: [{ value: 'Tất cả', label: 'Tất cả khối' }, ...(gradeFilterOptions.map((grade) => ({ value: grade, label: `Khối ${grade}` })))],
-        },
-        {
-          key: 'status',
-          label: 'Trạng thái',
-          value: lessonStatusFilter,
-          onChange: setLessonStatusFilter,
-          options: [
-            { value: 'Tất cả', label: 'Tất cả trạng thái' },
-            { value: 'ready_private', label: 'Riêng tư' },
-            { value: 'draft', label: 'Bản nháp' },
-            { value: 'approved_shared', label: 'Dùng chung' },
-            { value: 'pending_review', label: 'Chờ duyệt' },
-            { value: 'rejected', label: 'Bị từ chối' },
-          ],
-        },
-        {
-          key: 'scope',
-          label: 'Phạm vi',
-          value: lessonScopeFilter,
-          onChange: setLessonScopeFilter,
-          options: [
-            { value: 'Tất cả', label: 'Tất cả phạm vi' },
-            { value: 'private', label: 'Riêng tư' },
-            { value: 'shared', label: 'Dùng chung' },
-          ],
-        },
-        {
-          key: 'access',
-          label: 'Quyền học',
-          value: lessonAccessFilter,
-          onChange: setLessonAccessFilter,
-          options: [
-            { value: 'Tất cả', label: 'Tất cả quyền học' },
-            { value: 'unlocked', label: 'Đang mở' },
-            { value: 'locked', label: 'Đã khóa' },
-          ],
-        },
-      ]}
-      action={extraAction}
-      stats={
-        <div className="flex flex-wrap gap-2 text-[11px] font-bold">
-          <span className="rounded-full bg-indigo-50 px-2.5 py-1 text-indigo-700">{activeMenu === 'approvals' ? filteredPendingLessonCards.length : filteredLessons.length} bài phù hợp</span>
-          <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-emerald-700">{lessons.filter((item) => item.trang_thai === 'approved_shared').length} dùng chung</span>
-          <span className="rounded-full bg-amber-50 px-2.5 py-1 text-amber-700">{activeMenu === 'approvals' ? pendingShares.length : lessons.filter((item) => item.trang_thai === 'pending_review').length} chờ duyệt</span>
-          <span className="rounded-full bg-rose-50 px-2.5 py-1 text-rose-700">{lessons.filter((item) => item.is_locked === true).length} đang khóa</span>
-        </div>
-      }
-    />
-  );
+  const renderLessonFilters = (extraAction?: ReactNode, titleOverride?: string, descriptionOverride?: string, statsOverride?: ReactNode) => {
+    const isStudentLearning = user.vai_tro === 'student' && activeMenu === 'learning';
+    const subjectFilter = {
+      key: 'subject',
+      label: 'Môn học',
+      value: lessonSubjectFilter,
+      onChange: setLessonSubjectFilter,
+      options: [{ value: 'Tất cả', label: 'Tất cả môn học' }, ...availableSubjects.map((subject) => ({ value: subject, label: subject }))],
+    };
+    const accessFilter = {
+      key: 'access',
+      label: 'Quyền học',
+      value: lessonAccessFilter,
+      onChange: setLessonAccessFilter,
+      options: [
+        { value: 'Tất cả', label: 'Tất cả bài học' },
+        { value: 'unlocked', label: 'Có thể học' },
+        { value: 'locked', label: 'Đang khóa' },
+      ],
+    };
+    const toolbarFilters = isStudentLearning
+      ? [subjectFilter, accessFilter]
+      : [
+          subjectFilter,
+          {
+            key: 'grade',
+            label: 'Khối',
+            value: lessonGradeFilter,
+            onChange: setLessonGradeFilter,
+            options: [{ value: 'Tất cả', label: 'Tất cả khối' }, ...(gradeFilterOptions.map((grade) => ({ value: grade, label: `Khối ${grade}` })))],
+          },
+          {
+            key: 'status',
+            label: 'Trạng thái',
+            value: lessonStatusFilter,
+            onChange: setLessonStatusFilter,
+            options: [
+              { value: 'Tất cả', label: 'Tất cả trạng thái' },
+              { value: 'ready_private', label: 'Riêng tư' },
+              { value: 'draft', label: 'Bản nháp' },
+              { value: 'approved_shared', label: 'Dùng chung' },
+              { value: 'pending_review', label: 'Chờ duyệt' },
+              { value: 'rejected', label: 'Bị từ chối' },
+            ],
+          },
+          {
+            key: 'scope',
+            label: 'Phạm vi',
+            value: lessonScopeFilter,
+            onChange: setLessonScopeFilter,
+            options: [
+              { value: 'Tất cả', label: 'Tất cả phạm vi' },
+              { value: 'private', label: 'Riêng tư' },
+              { value: 'shared', label: 'Dùng chung' },
+            ],
+          },
+          {
+            key: 'access',
+            label: 'Quyền học',
+            value: lessonAccessFilter,
+            onChange: setLessonAccessFilter,
+            options: [
+              { value: 'Tất cả', label: 'Tất cả quyền học' },
+              { value: 'unlocked', label: 'Đang mở' },
+              { value: 'locked', label: 'Đã khóa' },
+            ],
+          },
+        ];
+
+    const defaultStats = (
+      <div className="flex flex-wrap gap-1.5 text-[10px] font-bold sm:text-[11px]">
+        <span className="rounded-full bg-indigo-50 px-2.5 py-1 text-indigo-700">{activeMenu === 'approvals' ? filteredPendingLessonCards.length : filteredLessons.length} bài phù hợp</span>
+        <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-emerald-700">{lessons.filter((item) => item.trang_thai === 'approved_shared').length} dùng chung</span>
+        <span className="rounded-full bg-amber-50 px-2.5 py-1 text-amber-700">{activeMenu === 'approvals' ? pendingShares.length : lessons.filter((item) => item.trang_thai === 'pending_review').length} chờ duyệt</span>
+        <span className="rounded-full bg-rose-50 px-2.5 py-1 text-rose-700">{lessons.filter((item) => item.is_locked === true).length} đang khóa</span>
+      </div>
+    );
+
+    return (
+      <DataToolbar
+        compact
+        dense={activeMenu === 'lessons' || activeMenu === 'my_lessons' || activeMenu === 'arena' || isStudentLearning}
+        icon={activeMenu === 'arena' ? <Trophy className="h-[18px] w-[18px]" /> : <BookOpenCheck className="h-[18px] w-[18px]" />}
+        title={titleOverride || (activeMenu === 'approvals' ? 'Bài giáo viên chờ duyệt' : isStudentLearning ? 'Thư viện bài học của em' : activeMenu === 'learning' ? 'Không gian học tập' : activeMenu === 'arena' ? 'Đấu trường tri thức' : activeMenu === 'my_lessons' ? 'Bài học của tôi' : 'Quản lý bài học')}
+        description={descriptionOverride || (
+          activeMenu === 'approvals'
+            ? 'Admin duyệt học liệu do giáo viên gửi chia sẻ trước khi đưa vào kho dùng chung.'
+            : activeMenu === 'my_lessons'
+              ? 'Tự tạo, chỉnh sửa và gửi duyệt bài học do bạn biên soạn.'
+              : activeMenu === 'arena'
+                ? 'Chọn bài học phù hợp rồi bước vào các trò chơi ôn tập theo dạng gameshow.'
+                : activeMenu === 'lessons'
+                  ? 'Quản lý, chia sẻ và kiểm soát quyền học của các bài học.'
+                  : isStudentLearning
+                    ? 'Tìm nhanh bài theo môn học và trạng thái, sau đó tiếp tục đúng tiến độ của em.'
+                    : 'Tìm kiếm, lọc và mở nhanh bài học theo môn, khối và trạng thái dùng chung.'
+        )}
+        searchValue={lessonSearch}
+        onSearchChange={setLessonSearch}
+        searchPlaceholder={activeMenu === 'lessons' || activeMenu === 'my_lessons' ? "Tìm theo tên bài, môn học..." : "Tìm theo tên bài, mô tả, môn học..."}
+        filters={toolbarFilters}
+        action={extraAction}
+        stats={statsOverride !== undefined ? statsOverride : (isStudentLearning ? false : defaultStats)}
+      />
+    );
+  };
+
+  const renderLessonTileActions = (lesson: Lesson) => {
+    const canModify = currentUserIsAdmin || (user.vai_tro === 'teacher' && lesson.nguoi_tao_id === user.user_id);
+    const canSubmitReview = user.vai_tro === 'teacher' && !currentUserIsAdmin && lesson.nguoi_tao_id === user.user_id && ['ready_private', 'rejected'].includes(lesson.trang_thai);
+    const stopTileAction = (event: MouseEvent<HTMLElement>) => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    const openTileAnalytics = (event: MouseEvent<HTMLElement>) => {
+      stopTileAction(event);
+      setAnalyticsQuery('');
+      setAnalyticsLessonFilter(lesson.lesson_id);
+      setAnalyticsGradeFilter(lesson.khoi || 'Tất cả');
+      setAnalyticsSubjectFilter('Tất cả');
+      setAnalyticsClassFilter(lesson.lop_id || 'Tất cả');
+      setAnalyticsSemesterFilter(String(lesson.hoc_ky || 'HK1').toUpperCase() === 'HK2' ? 'HK2' : 'HK1');
+      setAnalyticsStatusFilter('Tất cả');
+      setActiveMenu('analytics');
+    };
+
+    return (
+      <div className="lesson-library-action-row">
+        <button
+          type="button"
+          onClick={(event) => { stopTileAction(event); openLesson(lesson); }}
+          className="lesson-library-open-button"
+        >
+          <Eye className="h-3.5 w-3.5" /> Mở
+        </button>
+
+        {(canModify || canSubmitReview || currentUserIsAdmin || user.vai_tro === 'teacher') ? (
+          <details className="lesson-library-menu relative">
+            <summary
+              onClick={(event) => event.stopPropagation()}
+              className="lesson-library-menu-trigger list-none [&::-webkit-details-marker]:hidden"
+              title="Thao tác bài học"
+              aria-label="Thao tác bài học"
+            >
+              <MoreHorizontal className="h-4 w-4" />
+            </summary>
+            <div className="absolute bottom-full right-0 z-50 mb-2 w-48 overflow-hidden rounded-2xl border border-slate-200 bg-white p-1.5 text-left shadow-[0_18px_40px_rgba(15,23,42,0.16)]">
+              {canModify ? (
+                <button onClick={(event) => { stopTileAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); void openComposerForEdit(lesson); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold text-indigo-700 hover:bg-indigo-50">
+                  <Pencil className="h-3.5 w-3.5" /> Sửa bài học
+                </button>
+              ) : null}
+              {(currentUserIsAdmin || user.vai_tro === 'teacher') ? (
+                <button onClick={(event) => { event.currentTarget.closest('details')?.removeAttribute('open'); openTileAnalytics(event); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-50">
+                  <Trophy className="h-3.5 w-3.5" /> Theo dõi kết quả
+                </button>
+              ) : null}
+              {canModify ? (
+                <button onClick={(event) => { stopTileAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); void handleToggleLessonLock(lesson); }} disabled={Boolean(lessonLockUpdatingId)} className={`flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold disabled:cursor-wait disabled:opacity-60 ${lesson.is_locked ? 'text-emerald-700 hover:bg-emerald-50' : 'text-amber-700 hover:bg-amber-50'}`}>
+                  {lessonLockUpdatingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : lesson.is_locked ? <Unlock className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5" />}
+                  {lesson.is_locked ? 'Mở khóa bài học' : 'Khóa bài học'}
+                </button>
+              ) : null}
+              {canSubmitReview ? (
+                <button onClick={(event) => { stopTileAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); void handleSubmitReview(lesson); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold text-amber-700 hover:bg-amber-50">
+                  <UploadCloud className="h-3.5 w-3.5" /> Gửi admin duyệt
+                </button>
+              ) : null}
+              {canModify ? <div className="my-1 border-t border-slate-100" /> : null}
+              {canModify ? (
+                <button onClick={(event) => { stopTileAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); askDeleteLesson(lesson); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold text-rose-700 hover:bg-rose-50">
+                  <Trash2 className="h-3.5 w-3.5" /> Xóa bài học
+                </button>
+              ) : null}
+            </div>
+          </details>
+        ) : null}
+      </div>
+    );
+  };
 
   const renderLessonActionBar = (lesson: Lesson, compact = false) => {
     const canModify = currentUserIsAdmin || (user.vai_tro === 'teacher' && lesson.nguoi_tao_id === user.user_id);
@@ -3114,15 +3315,24 @@ useEffect(() => {
           )}
           {(canModify || canSubmitReview) && (
             <details className="lesson-action-menu group/menu relative">
-              <summary onClick={stopCardAction} className="lesson-action-menu-trigger cursor-pointer list-none bg-white text-slate-500 ring-1 ring-slate-200 transition hover:bg-slate-100 hover:text-slate-800 [&::-webkit-details-marker]:hidden" aria-label="Thao tác khác" title="Thao tác khác">
+              <summary
+                onClick={(event) => {
+                  // Không gọi preventDefault ở <summary>: preventDefault sẽ chặn hành vi
+                  // native mở/đóng <details>, khiến nút ba chấm trông như không hoạt động.
+                  event.stopPropagation();
+                }}
+                className="lesson-action-menu-trigger cursor-pointer list-none bg-white text-slate-500 ring-1 ring-slate-200 transition hover:bg-slate-100 hover:text-slate-800 [&::-webkit-details-marker]:hidden"
+                aria-label="Thao tác khác"
+                title="Thao tác khác"
+              >
                 <MoreHorizontal className="h-4 w-4" />
               </summary>
               <div className="absolute bottom-full right-0 z-40 mb-2 w-44 overflow-hidden rounded-xl border border-slate-200 bg-white p-1.5 shadow-xl">
                 {canSubmitReview && (
-                  <button onClick={(event) => { stopCardAction(event); void handleSubmitReview(lesson); }} className="flex w-full items-center rounded-lg px-3 py-2 text-left text-xs font-semibold text-amber-700 transition hover:bg-amber-50">Gửi admin duyệt</button>
+                  <button onClick={(event) => { stopCardAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); void handleSubmitReview(lesson); }} className="flex w-full items-center rounded-lg px-3 py-2 text-left text-xs font-semibold text-amber-700 transition hover:bg-amber-50">Gửi admin duyệt</button>
                 )}
                 {canModify && (
-                  <button onClick={(event) => { stopCardAction(event); askDeleteLesson(lesson); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-semibold text-rose-700 transition hover:bg-rose-50">
+                  <button onClick={(event) => { stopCardAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); askDeleteLesson(lesson); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-semibold text-rose-700 transition hover:bg-rose-50">
                     <Trash2 className="h-3.5 w-3.5" /> Xóa bài học
                   </button>
                 )}
@@ -3219,32 +3429,96 @@ useEffect(() => {
     );
   };
 
-  const renderLessonGrid = (title: string, description: string, items: Lesson[], extraAction?: ReactNode) => (
-    <div className="space-y-4">
-      {renderLessonFilters(extraAction, title, description)}
-
-      {renderReviewPracticeSection()}
-
-      {items.length > 0 ? (
-        <div className="lesson-management-grid">
-          {items.map((lesson, index) => (
-            <LessonCard key={lesson.lesson_id} lesson={lesson} onClick={() => openLesson(lesson)} variant="compact" highlight={index === 0 && activeMenu === 'learning'} actions={renderLessonActionBar(lesson, true)} progress={user?.vai_tro === 'student' ? currentStudentProgressByLesson[lesson.lesson_id] || null : null} />
-          ))}
+  const renderLessonGrid = (title: string, description: string, items: Lesson[], extraAction?: ReactNode) => {
+    const supportsLibraryView = activeMenu === 'lessons' || activeMenu === 'my_lessons';
+    const libraryPageSize = 8;
+    const libraryPageCount = Math.max(1, Math.ceil(items.length / libraryPageSize));
+    const safeLibraryPage = Math.min(Math.max(1, lessonLibraryPage), libraryPageCount);
+    const libraryPageItems = items.slice((safeLibraryPage - 1) * libraryPageSize, safeLibraryPage * libraryPageSize);
+    const toolbarAction = supportsLibraryView ? (
+      <div className="flex flex-wrap items-center justify-end gap-2.5">
+        <div className="inline-flex rounded-xl bg-slate-100 p-1 ring-1 ring-slate-200" aria-label="Chế độ hiển thị bài học">
+          <button
+            type="button"
+            onClick={() => setLessonLibraryView('grid')}
+            className={`inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-[11px] font-bold transition ${lessonLibraryView === 'grid' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}
+            title="Xem dạng thư viện 4 cột"
+          >
+            <LayoutGrid className="h-3.5 w-3.5" /><span className="hidden 2xl:inline">Thư viện</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setLessonLibraryView('list')}
+            className={`inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-[11px] font-bold transition ${lessonLibraryView === 'list' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}
+            title="Xem dạng danh sách"
+          >
+            <List className="h-3.5 w-3.5" /><span className="hidden 2xl:inline">Danh sách</span>
+          </button>
         </div>
-      ) : (
-        <div className="flex flex-col items-center justify-center rounded-[28px] bg-white py-20 text-center shadow-sm ring-1 ring-slate-100">
-          <div className="mb-4 flex h-20 w-20 items-center justify-center rounded-full bg-slate-100 text-slate-400">
-            <BookOpen className="h-10 w-10" />
+        {extraAction}
+      </div>
+    ) : extraAction;
+
+    return (
+      <div className="space-y-4">
+        {renderLessonFilters(toolbarAction, title, description)}
+
+        {renderReviewPracticeSection()}
+
+        {items.length > 0 ? (
+          supportsLibraryView && lessonLibraryView === 'grid' ? (
+            <div className="space-y-5">
+              <div className="lesson-library-grid">
+                {libraryPageItems.map((lesson, index) => (
+                  <LessonCard
+                    key={lesson.lesson_id}
+                    lesson={lesson}
+                    onClick={() => openLesson(lesson)}
+                    variant="library"
+                    highlight={index === 0 && activeMenu === 'learning'}
+                    actions={renderLessonTileActions(lesson)}
+                  />
+                ))}
+              </div>
+              {libraryPageCount > 1 ? (
+                <nav className="lesson-library-pagination" aria-label="Phân trang bài học">
+                  <button type="button" onClick={() => setLessonLibraryPage(Math.max(1, safeLibraryPage - 1))} disabled={safeLibraryPage === 1} className="lesson-library-page-button lesson-library-page-arrow" aria-label="Trang trước">‹</button>
+                  {Array.from({ length: libraryPageCount }, (_, pageIndex) => pageIndex + 1).map((page) => (
+                    <button
+                      key={page}
+                      type="button"
+                      onClick={() => setLessonLibraryPage(page)}
+                      className={`lesson-library-page-button ${page === safeLibraryPage ? 'is-active' : ''}`}
+                      aria-current={page === safeLibraryPage ? 'page' : undefined}
+                    >
+                      {page}
+                    </button>
+                  ))}
+                  <button type="button" onClick={() => setLessonLibraryPage(Math.min(libraryPageCount, safeLibraryPage + 1))} disabled={safeLibraryPage === libraryPageCount} className="lesson-library-page-button lesson-library-page-arrow" aria-label="Trang sau">›</button>
+                </nav>
+              ) : null}
+            </div>
+          ) : (
+            <div className="lesson-management-grid">
+              {items.map((lesson, index) => (
+                <LessonCard key={lesson.lesson_id} lesson={lesson} onClick={() => openLesson(lesson)} variant="compact" highlight={index === 0 && activeMenu === 'learning'} actions={renderLessonActionBar(lesson, true)} progress={user?.vai_tro === 'student' ? currentStudentProgressByLesson[lesson.lesson_id] || null : null} />
+              ))}
+            </div>
+          )
+        ) : (
+          <div className="flex flex-col items-center justify-center rounded-[28px] bg-white py-20 text-center shadow-sm ring-1 ring-slate-100">
+            <div className="mb-4 flex h-20 w-20 items-center justify-center rounded-full bg-slate-100 text-slate-400">
+              <BookOpen className="h-10 w-10" />
+            </div>
+            <h3 className="text-lg font-bold text-slate-900">Không tìm thấy bài học nào</h3>
+            <p className="text-slate-500">Hãy thử thay đổi bộ lọc hoặc tạo bài học mới.</p>
           </div>
-          <h3 className="text-lg font-bold text-slate-900">Không tìm thấy bài học nào</h3>
-          <p className="text-slate-500">Hãy thử thay đổi bộ lọc hoặc tạo bài học mới.</p>
-        </div>
-      )}
-    </div>
-  );
+        )}
+      </div>
+    );
+  };
 
   const renderLearningHub = () => {
-    const primaryLesson = featuredLearningLessons[0];
     const isStudent = user.vai_tro === 'student';
     const lessonOptions = lessonSourcePool.map((lesson) => ({ value: lesson.lesson_id, label: lesson.tieu_de }));
     const studentProgressItems = isStudent
@@ -3259,6 +3533,102 @@ useEffect(() => {
     const studentAverageScore = validStudentScores.length
       ? validStudentScores.reduce((sum, score) => sum + Number(score), 0) / validStudentScores.length
       : undefined;
+    const availableStudentLessons = isStudent ? visibleLessonsForCurrentUser.filter((lesson) => lesson.is_locked !== true) : [];
+    const inProgressStudentCount = studentProgressItems.filter((item) => item.status === 'in_progress').length;
+    const completedStudentCount = studentProgressItems.filter((item) => item.status === 'completed').length;
+    const primaryLesson = isStudent
+      ? featuredLearningLessons.find((lesson) => lesson.is_locked !== true && currentStudentProgressByLesson[lesson.lesson_id]?.status === 'in_progress')
+        || featuredLearningLessons.find((lesson) => lesson.is_locked !== true)
+        || featuredLearningLessons[0]
+      : featuredLearningLessons[0];
+
+    if (isStudent) {
+      return (
+        <div className="space-y-4">
+          <section className="overflow-hidden rounded-[26px] bg-gradient-to-r from-indigo-600 via-violet-600 to-fuchsia-600 px-5 py-5 text-white shadow-[0_16px_38px_rgba(79,70,229,0.22)] sm:px-6">
+            <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_auto] xl:items-center">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="inline-flex items-center gap-2 rounded-full bg-white/15 px-3 py-1 text-[11px] font-bold">
+                    <Sparkles className="h-3.5 w-3.5" /> Học theo 4 chặng • AI đồng hành
+                  </span>
+                  <span className="rounded-full bg-white/10 px-3 py-1 text-[11px] font-semibold text-white/85">Khối {user.khoi || '-'}</span>
+                  {user.lop_id ? <span className="rounded-full bg-white/10 px-3 py-1 text-[11px] font-semibold text-white/85">{user.lop_id}</span> : null}
+                </div>
+                <h1 className="mt-3 text-2xl font-black tracking-tight sm:text-[30px]">Bài học của em</h1>
+                <p className="mt-1.5 max-w-3xl text-sm leading-6 text-white/85">
+                  Chọn bài, tiếp tục đúng tiến độ và xem kết quả ngay trên từng bài học.
+                </p>
+              </div>
+
+              {primaryLesson ? (
+                <div className="min-w-0 rounded-[20px] bg-white/12 p-3.5 ring-1 ring-white/15 backdrop-blur-sm xl:w-[360px]">
+                  <p className="text-[10px] font-black uppercase tracking-[0.14em] text-white/70">
+                    {currentStudentProgressByLesson[primaryLesson.lesson_id]?.status === 'in_progress' ? 'Tiếp tục đang học' : 'Bài học đề xuất'}
+                  </p>
+                  <p className="mt-1 truncate text-sm font-black text-white">{primaryLesson.tieu_de}</p>
+                  <div className="mt-3 flex items-center justify-between gap-3">
+                    <span className="truncate text-xs font-semibold text-white/75">{primaryLesson.mon_hoc} • Khối {primaryLesson.khoi}</span>
+                    <button
+                      type="button"
+                      onClick={() => primaryLesson.is_locked !== true && void openLesson(primaryLesson)}
+                      disabled={primaryLesson.is_locked === true}
+                      className="shrink-0 rounded-xl bg-white px-3.5 py-2 text-xs font-black text-indigo-700 shadow-sm transition hover:bg-indigo-50 disabled:cursor-not-allowed disabled:bg-white/20 disabled:text-white/65"
+                    >
+                      {primaryLesson.is_locked === true ? 'Đang khóa' : currentStudentProgressByLesson[primaryLesson.lesson_id]?.status === 'in_progress' ? 'Tiếp tục học' : 'Mở bài'}
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="mt-4 grid grid-cols-2 gap-2 lg:grid-cols-4">
+              {[
+                { label: 'Có thể học', value: availableStudentLessons.length },
+                { label: 'Đang học', value: inProgressStudentCount },
+                { label: 'Hoàn thành', value: completedStudentCount },
+                { label: 'Điểm trung bình', value: studentAverageScore === undefined ? '-' : studentAverageScore.toFixed(1).replace('.0', '') },
+              ].map((item) => (
+                <div key={item.label} className="rounded-2xl bg-white/10 px-3.5 py-3 ring-1 ring-white/10">
+                  <p className="text-[10px] font-black uppercase tracking-[0.12em] text-white/65">{item.label}</p>
+                  <p className="mt-1 text-xl font-black text-white">{item.value}</p>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          {renderLessonFilters(
+            undefined,
+            'Thư viện bài học của em',
+            'Tìm nhanh theo môn học hoặc trạng thái. Các bài bị khóa vẫn hiển thị để em biết lịch học.',
+            false,
+          )}
+
+          {renderReviewPracticeSection()}
+
+          {filteredLessons.length > 0 ? (
+            <div className="student-learning-grid">
+              {filteredLessons.map((lesson, index) => (
+                <LessonCard
+                  key={lesson.lesson_id}
+                  lesson={lesson}
+                  onClick={() => openLesson(lesson)}
+                  variant="student"
+                  highlight={index === 0 && lesson.is_locked !== true}
+                  progress={currentStudentProgressByLesson[lesson.lesson_id] || null}
+                />
+              ))}
+            </div>
+          ) : (
+            <div className="rounded-[24px] bg-white py-14 text-center shadow-sm ring-1 ring-slate-100">
+              <BookOpen className="mx-auto h-10 w-10 text-slate-300" />
+              <h3 className="mt-4 text-lg font-bold text-slate-900">Chưa có bài học phù hợp</h3>
+              <p className="mt-1 text-sm text-slate-500">Hãy thử thay đổi từ khóa, môn học hoặc trạng thái bài.</p>
+            </div>
+          )}
+        </div>
+      );
+    }
 
     return (
       <div className="space-y-6">
@@ -3267,37 +3637,28 @@ useEffect(() => {
             <div>
               <p className="mb-3 inline-flex items-center gap-2 rounded-full bg-white/15 px-3 py-1 text-xs font-semibold">
                 <Sparkles className="h-4 w-4" />
-                {isStudent ? 'Học tập theo tiến trình • có trợ lý AI đồng hành' : 'Theo dõi kết quả học tập • nắm bắt tiến độ toàn lớp'}
+                Theo dõi kết quả học tập • nắm bắt tiến độ toàn lớp
               </p>
-              <h1 className="text-3xl font-bold lg:text-4xl">{isStudent ? 'Học từ bài học đến vận dụng thực tế' : 'Theo dõi học sinh theo bài và theo tiến độ'}</h1>
+              <h1 className="text-3xl font-bold lg:text-4xl">Theo dõi học sinh theo bài và theo tiến độ</h1>
               <p className="mt-3 max-w-3xl text-sm leading-7 text-white/90">
-                {isStudent
-                  ? 'Chọn bài học, học theo 4 chặng: khởi động, hình thành kiến thức, luyện tập, vận dụng. Khi gặp khó, mở trợ lý AI để được giải thích đúng phần em đang học.'
-                  : 'Xem học sinh đã học đến đâu, đã hoàn thành bao nhiêu bước và kết quả luyện tập ở từng bài để kịp thời hỗ trợ.'}
+                Xem học sinh đã học đến đâu, đã hoàn thành bao nhiêu bước và kết quả luyện tập ở từng bài để kịp thời hỗ trợ.
               </p>
               {primaryLesson && (
                 <div className="mt-5 flex flex-wrap items-center gap-3">
                   <button onClick={() => void openLesson(primaryLesson)} className="rounded-2xl bg-white px-5 py-3 text-sm font-bold text-indigo-700 shadow-lg shadow-indigo-950/10">
-                    {isStudent ? `Tiếp tục với “${primaryLesson.tieu_de}”` : `Xem bài “${primaryLesson.tieu_de}”`}
+                    Xem bài “{primaryLesson.tieu_de}”
                   </button>
                   <span className="text-sm text-white/85">{primaryLesson.mon_hoc} • Khối {primaryLesson.khoi}</span>
                 </div>
               )}
             </div>
             <div className="grid gap-3 rounded-[28px] bg-white/12 p-5 backdrop-blur-md">
-              {(isStudent
-                ? [
-                    { label: 'Khởi động', text: 'Tình huống, câu hỏi gợi mở' },
-                    { label: 'Kiến thức', text: 'Trình bày trọng tâm theo mục' },
-                    { label: 'Luyện tập', text: 'Trắc nghiệm + giải thích đáp án' },
-                    { label: 'Vận dụng', text: 'Nhiệm vụ thực tiễn, sản phẩm' },
-                  ]
-                : [
-                    { label: 'Tỉ lệ hoàn thành', text: 'Xem từng bài đã học đến đâu' },
-                    { label: 'Bước học gần nhất', text: 'Biết học sinh đang dừng ở bước nào' },
-                    { label: 'Luyện tập', text: 'Theo dõi số câu đúng và % đạt' },
-                    { label: 'Hỗ trợ kịp thời', text: 'Phát hiện học sinh đang học dở' },
-                  ]).map((item) => (
+              {[
+                { label: 'Tỉ lệ hoàn thành', text: 'Xem từng bài đã học đến đâu' },
+                { label: 'Bước học gần nhất', text: 'Biết học sinh đang dừng ở bước nào' },
+                { label: 'Luyện tập', text: 'Theo dõi số câu đúng và % đạt' },
+                { label: 'Hỗ trợ kịp thời', text: 'Phát hiện học sinh đang học dở' },
+              ].map((item) => (
                 <div key={item.label} className="rounded-2xl bg-white/10 px-4 py-3">
                   <p className="text-sm font-semibold">{item.label}</p>
                   <p className="text-xs text-white/80">{item.text}</p>
@@ -3307,67 +3668,48 @@ useEffect(() => {
           </div>
         </div>
 
-        {isStudent && (
-          <section className="rounded-[28px] bg-white p-5 shadow-sm ring-1 ring-slate-100">
-            <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
-              <div><p className="text-xs font-black uppercase tracking-[0.16em] text-indigo-600">Kết quả của em</p><h2 className="mt-1 text-xl font-black text-slate-900">Theo dõi việc học ngay trên từng bài</h2></div>
-              <p className="text-sm text-slate-500">Điểm chính thức hiển thị theo thang 10.</p>
-            </div>
-            <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-              <div className="rounded-2xl bg-sky-50 p-4"><p className="text-xs font-bold uppercase tracking-wider text-sky-600">Bài có thể học</p><p className="mt-2 text-2xl font-black text-slate-900">{visibleLessonsForCurrentUser.length}</p></div>
-              <div className="rounded-2xl bg-amber-50 p-4"><p className="text-xs font-bold uppercase tracking-wider text-amber-600">Đang học</p><p className="mt-2 text-2xl font-black text-slate-900">{studentProgressItems.filter((item) => item.status === 'in_progress').length}</p></div>
-              <div className="rounded-2xl bg-emerald-50 p-4"><p className="text-xs font-bold uppercase tracking-wider text-emerald-600">Đã có điểm</p><p className="mt-2 text-2xl font-black text-slate-900">{validStudentScores.length}</p></div>
-              <div className="rounded-2xl bg-indigo-50 p-4"><p className="text-xs font-bold uppercase tracking-wider text-indigo-600">Điểm trung bình</p><p className="mt-2 text-2xl font-black text-indigo-700">{studentAverageScore === undefined ? '-' : studentAverageScore.toFixed(1).replace('.0', '')}</p></div>
-            </div>
-          </section>
-        )}
-
-        {(currentUserIsAdmin || user.vai_tro === 'teacher') ? (
-          <LearningAnalyticsPanel
-            rows={analyticsRows}
-            schoolYears={schoolYears}
-            availableGrades={gradeFilterOptions}
-            onRefresh={loadAppData}
-            filters={{
-              query: analyticsQuery,
-              onQueryChange: setAnalyticsQuery,
-              grade: analyticsGradeFilter,
-              onGradeChange: setAnalyticsGradeFilter,
-              lessonId: analyticsLessonFilter,
-              onLessonIdChange: setAnalyticsLessonFilter,
-              status: analyticsStatusFilter,
-              onStatusChange: setAnalyticsStatusFilter,
-              semester: analyticsSemesterFilter,
-              onSemesterChange: setAnalyticsSemesterFilter,
-              classId: analyticsClassFilter,
-              onClassIdChange: setAnalyticsClassFilter,
-              subjectId: analyticsSubjectFilter,
-              onSubjectIdChange: setAnalyticsSubjectFilter,
-              schoolYear: analyticsSchoolYearFilter,
-              onSchoolYearChange: setAnalyticsSchoolYearFilter,
-              availableLessons: lessonOptions,
-            }}
-            students={accounts.filter((item) => item.vai_tro === 'student')}
-            lessons={lessonSourcePool}
-            classes={classes}
-            subjects={subjects}
-            comments={lessonComments}
-            isCommentsLoading={isLessonCommentsLoading}
-            onAddComment={handleAddLessonAnalyticsComment}
-            onUpdateComment={handleUpdateLessonAnalyticsComment}
-            onModerateResult={handleModerateLearningResult}
-          />
-        ) : null}
+        <LearningAnalyticsPanel
+          rows={analyticsRows}
+          schoolYears={schoolYears}
+          availableGrades={gradeFilterOptions}
+          onRefresh={loadAppData}
+          filters={{
+            query: analyticsQuery,
+            onQueryChange: setAnalyticsQuery,
+            grade: analyticsGradeFilter,
+            onGradeChange: setAnalyticsGradeFilter,
+            lessonId: analyticsLessonFilter,
+            onLessonIdChange: setAnalyticsLessonFilter,
+            status: analyticsStatusFilter,
+            onStatusChange: setAnalyticsStatusFilter,
+            semester: analyticsSemesterFilter,
+            onSemesterChange: setAnalyticsSemesterFilter,
+            classId: analyticsClassFilter,
+            onClassIdChange: setAnalyticsClassFilter,
+            subjectId: analyticsSubjectFilter,
+            onSubjectIdChange: setAnalyticsSubjectFilter,
+            schoolYear: analyticsSchoolYearFilter,
+            onSchoolYearChange: setAnalyticsSchoolYearFilter,
+            availableLessons: lessonOptions,
+          }}
+          students={accounts.filter((item) => item.vai_tro === 'student')}
+          lessons={lessonSourcePool}
+          classes={classes}
+          subjects={subjects}
+          comments={lessonComments}
+          isCommentsLoading={isLessonCommentsLoading}
+          onAddComment={handleAddLessonAnalyticsComment}
+          onUpdateComment={handleUpdateLessonAnalyticsComment}
+          onModerateResult={handleModerateLearningResult}
+        />
 
         {renderLessonFilters(
-          user.vai_tro !== 'student' ? (
-            <div className="flex flex-wrap gap-3">
-              <button onClick={openReviewPracticeCreator} className="inline-flex items-center gap-2 rounded-xl bg-amber-600 px-3.5 py-2.5 text-xs font-bold text-white shadow-md shadow-amber-600/15"><BookOpenCheck className="h-4 w-4" /> Tạo bài ôn tập</button>
-              <button onClick={openComposerForCreate} className="inline-flex items-center gap-2 rounded-2xl bg-indigo-600 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-indigo-600/20">
-                <Plus className="h-4 w-4" /> Tạo bài học mới
-              </button>
-            </div>
-          ) : null,
+          <div className="flex flex-wrap gap-3">
+            <button onClick={openReviewPracticeCreator} className="inline-flex items-center gap-2 rounded-xl bg-amber-600 px-3.5 py-2.5 text-xs font-bold text-white shadow-md shadow-amber-600/15"><BookOpenCheck className="h-4 w-4" /> Tạo bài ôn tập</button>
+            <button onClick={openComposerForCreate} className="inline-flex items-center gap-2 rounded-2xl bg-indigo-600 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-indigo-600/20">
+              <Plus className="h-4 w-4" /> Tạo bài học mới
+            </button>
+          </div>,
         )}
 
         {renderReviewPracticeSection()}
@@ -3375,7 +3717,7 @@ useEffect(() => {
         {filteredLessons.length > 0 ? (
           <div className="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
             {filteredLessons.map((lesson, index) => (
-              <LessonCard key={lesson.lesson_id} lesson={lesson} onClick={() => openLesson(lesson)} highlight={index === 0} actions={renderLessonActionBar(lesson)} progress={isStudent ? currentStudentProgressByLesson[lesson.lesson_id] || null : null} />
+              <LessonCard key={lesson.lesson_id} lesson={lesson} onClick={() => openLesson(lesson)} highlight={index === 0} actions={renderLessonActionBar(lesson)} />
             ))}
           </div>
         ) : (
@@ -3437,30 +3779,62 @@ useEffect(() => {
     />
   );
 
-  const renderArenaHub = () => (
-    <div className="space-y-6">
-      {!arenaLesson
-        ? renderLessonFilters(
-            <div className="inline-flex items-center gap-2 rounded-2xl bg-amber-50 px-4 py-3 text-sm font-semibold text-amber-700">
-              <Trophy className="h-4 w-4" /> Chọn bài học rồi vào đấu trường
-            </div>,
-          )
-        : null}
-      <KnowledgeArena
-        lessons={filteredLessons}
-        selectedLesson={arenaLesson}
-        selectedContent={arenaLessonContent}
-        analyticsRows={analyticsRows}
-        students={accounts.filter((item) => item.vai_tro === 'student')}
-        canViewStats={currentUserIsAdmin || user?.vai_tro === 'teacher'}
-        onSelectLesson={(lesson) => void handleArenaSelectLesson(lesson)}
-        onClearSelection={() => {
-          setArenaLesson(null);
-          setArenaLessonContent(null);
-        }}
-      />
-    </div>
-  );
+  const renderArenaHub = () => {
+    const canManageArena = currentUserIsAdmin || user?.vai_tro === 'teacher';
+    const arenaReadyCount = filteredLessons.filter((lesson) => lesson.arena_ready === true || Number(lesson.arena_question_count || 0) > 0).length;
+    const arenaLockedCount = filteredLessons.filter((lesson) => lesson.is_locked === true).length;
+    const arenaOpenCount = Math.max(0, filteredLessons.length - arenaLockedCount);
+    const arenaNotReadyCount = filteredLessons.filter((lesson) => {
+      const count = Number(lesson.arena_question_count);
+      const known = lesson.arena_ready !== undefined || Number.isFinite(count);
+      return known && !(lesson.arena_ready === true || count > 0);
+    }).length;
+    const arenaStats = (
+      <div className="flex flex-wrap gap-1.5 text-[10px] font-bold sm:text-[11px]">
+        <span className="rounded-full bg-indigo-50 px-2.5 py-1 text-indigo-700">{filteredLessons.length} bài phù hợp</span>
+        <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-emerald-700">{arenaOpenCount} đang mở</span>
+        <span className="rounded-full bg-amber-50 px-2.5 py-1 text-amber-700">{arenaLockedCount} đang khóa</span>
+        <span className="rounded-full bg-fuchsia-50 px-2.5 py-1 text-fuchsia-700">{arenaReadyCount} sẵn sàng</span>
+        {canManageArena ? <span className="rounded-full bg-rose-50 px-2.5 py-1 text-rose-700">{arenaNotReadyCount} thiếu câu hỏi</span> : null}
+      </div>
+    );
+
+    return (
+      <div className="space-y-4">
+        {!arenaLesson
+          ? renderLessonFilters(
+              canManageArena ? (
+                <div className="inline-flex items-center gap-2 rounded-xl bg-amber-50 px-3 py-2 text-xs font-bold text-amber-700 ring-1 ring-amber-100">
+                  <Lock className="h-3.5 w-3.5" /> Khóa/Mở đồng bộ với Bài học
+                </div>
+              ) : null,
+              canManageArena ? 'Quản lý Đấu trường tri thức' : 'Đấu trường tri thức',
+              canManageArena
+                ? 'Quản lý bài thi đấu, trạng thái khóa và mức sẵn sàng ngay trên một thanh điều khiển gọn.'
+                : 'Chọn bài học phù hợp rồi bắt đầu một trong ba trò chơi ôn luyện.',
+              arenaStats,
+            )
+          : null}
+        <KnowledgeArena
+          lessons={filteredLessons}
+          selectedLesson={arenaLesson}
+          selectedContent={arenaLessonContent}
+          analyticsRows={analyticsRows}
+          students={accounts.filter((item) => item.vai_tro === 'student')}
+          canViewStats={canManageArena}
+          canManageLesson={(lesson) => Boolean(currentUserIsAdmin || (user?.vai_tro === 'teacher' && lesson.nguoi_tao_id === user.user_id))}
+          lockUpdatingId={lessonLockUpdatingId}
+          onToggleLessonLock={(lesson) => void handleToggleLessonLock(lesson)}
+          onEditLesson={(lesson) => void openComposerForEdit(lesson)}
+          onSelectLesson={(lesson) => void handleArenaSelectLesson(lesson)}
+          onClearSelection={() => {
+            setArenaLesson(null);
+            setArenaLessonContent(null);
+          }}
+        />
+      </div>
+    );
+  };
 
   const renderApprovals = () => (
     <div className="space-y-6">
@@ -4415,14 +4789,15 @@ useEffect(() => {
       </Suspense>
 
       <AnimatePresence>
-        {isRefreshingData && !isLoading && (
+        {isRefreshingData && !isLoading && !isCoreDataLoading && !isMenuDataLoading && (
           <motion.div
-            initial={{ opacity: 0, y: -10 }}
+            initial={{ opacity: 0, y: -8 }}
             animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -10 }}
-            className="fixed right-5 top-5 z-[120] inline-flex items-center gap-2 rounded-full border border-indigo-100 bg-white/95 px-4 py-2 text-sm font-semibold text-indigo-700 shadow-lg backdrop-blur"
+            exit={{ opacity: 0, y: -8 }}
+            className="fixed right-5 top-5 z-[120] inline-flex items-center gap-2 rounded-full border border-indigo-100 bg-white/95 px-3.5 py-2 text-xs font-bold text-indigo-700 shadow-lg backdrop-blur"
+            aria-live="polite"
           >
-            <RefreshCw className="h-4 w-4 animate-spin" /> Đang cập nhật dữ liệu nền
+            <RefreshCw className="h-4 w-4 animate-spin" /> Đang đồng bộ dữ liệu
           </motion.div>
         )}
       </AnimatePresence>

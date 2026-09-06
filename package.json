@@ -1,7 +1,7 @@
 {
   "name": "react-example",
   "private": true,
-  "version": "6.67.0",
+  "version": "6.73.2",
   "type": "module",
   "scripts": {
     "dev": "vite --port=3000 --host=0.0.0.0",
@@ -31,5 +31,5 @@
     "typescript": "~5.8.2",
     "vite": "^6.2.0"
   },
-  "description": "EduSmart V6.67.0 - Structured Lesson Catalog and Class-Scoped Learning Analytics"
+  "description": "EduSmart V6.73.2 - Clean Lesson & Arena Cards"
 }

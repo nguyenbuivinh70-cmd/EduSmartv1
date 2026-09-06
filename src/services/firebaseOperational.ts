@@ -159,7 +159,7 @@ async function identity() {
   const task = (async () => {
     // Luôn xác thực dữ liệu member thật (kể cả phiên được khôi phục từ localStorage).
     // Hàm này đồng thời tự sửa schoolId/authUid bị thiếu ở hồ sơ legacy khi Rules
-    // V6.67.0 đã được Publish, tránh đăng nhập được nhưng collection phía sau bị chặn.
+    // V6.68.0 đã được Publish, tránh đăng nhập được nhưng collection phía sau bị chặn.
     const value = await loadValidatedCurrentFirebaseMember();
     identityCache = { uid: current.uid, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS, value };
     return value;
@@ -229,6 +229,8 @@ function row(data: any, lessonId: string): LessonRow {
     lesson_id: lessonId,
     tieu_de: identity.title || clean(data.tieu_de),
     lesson_number: identity.lessonNumber, lesson_name: identity.lessonName, lesson_key: clean(data.lesson_key),
+    arena_question_count: Number.isFinite(Number(data.arena_question_count)) ? Math.max(0, Number(data.arena_question_count)) : undefined,
+    arena_ready: data.arena_ready === true ? true : data.arena_ready === false ? false : undefined,
     lop_id: clean(data.lop_id), khoi: clean(data.khoi), mon_id: clean(data.mon_id),
     nguoi_tao_id: clean(data.nguoi_tao_id), pham_vi: data.pham_vi === 'shared' ? 'shared' : 'private',
     trang_thai: clean(data.trang_thai), source_file_id: clean(data.source_file_id), json_file_id: clean(data.json_file_id),
@@ -363,6 +365,8 @@ export async function saveFirebaseLesson(payload: LessonComposerValues, updating
       }
     : payload.lesson_json;
   assertSafeDocument(lessonJson, 'Nội dung bài học');
+  const arenaQuestionCount = lessonJson ? (Array.isArray(lessonJson?.luyen_tap?.trac_nghiem) ? lessonJson.luyen_tap.trac_nghiem.length : 0) : undefined;
+  const arenaReady = arenaQuestionCount === undefined ? undefined : arenaQuestionCount > 0;
 
   return runTransaction(firestoreDb, async (transaction) => {
     const existing = await transaction.get(target);
@@ -398,6 +402,8 @@ export async function saveFirebaseLesson(payload: LessonComposerValues, updating
       lesson_number: lessonNumber,
       lesson_name: lessonName,
       lesson_key: registryKey,
+      arena_question_count: arenaQuestionCount === undefined ? existingData?.arena_question_count : arenaQuestionCount,
+      arena_ready: arenaReady === undefined ? existingData?.arena_ready : arenaReady,
       schoolId: FIREBASE_SCHOOL_ID,
       schemaVersion: 2,
       storageProvider: 'firestore_spark_v2',
@@ -470,24 +476,163 @@ export async function saveFirebaseLesson(payload: LessonComposerValues, updating
   });
 }
 
-export async function deleteFirebaseLesson(lessonId: string) {
-  const target = doc(lessons(), clean(lessonId));
-  return runTransaction(firestoreDb, async (transaction) => {
-    const snap = await transaction.get(target);
-    if (!snap.exists()) return false;
-    const data = snap.data() as any;
-    const registryKey = clean(data.lesson_key) || lessonRegistryKey(data);
-    const registryRef = registryKey ? doc(school(), 'lessonNumberRegistry', registryKey) : null;
-    const registrySnap = registryRef ? await transaction.get(registryRef) : null;
-    if (registryRef && registrySnap?.exists()) {
-      const cleaned = removeLessonFromRegistry(registrySnap.data(), clean(lessonId));
-      if (registryHasAnyLesson(cleaned)) transaction.set(registryRef, { ...cleaned, updated_at: new Date().toISOString(), updatedAt: serverTimestamp() }, { merge: true });
-      else transaction.delete(registryRef);
-    }
-    transaction.delete(lessonContentRef(clean(lessonId)));
-    transaction.delete(target);
-    return true;
+type LessonCascadeDeleteSummary = {
+  lesson_id: string;
+  deleted: boolean;
+  deleted_counts: {
+    lesson: number;
+    content: number;
+    registry: number;
+    learningProgress: number;
+    learningResultActions: number;
+    lessonComments: number;
+    coLearningSessions: number;
+    slidesPrompts: number;
+    reviewPractices: number;
+    reviewAttempts: number;
+    reviewContents: number;
+  };
+};
+
+function reviewReferencesLesson(data: any, lessonId: string) {
+  const raw = data?.lesson_ids;
+  const ids = Array.isArray(raw)
+    ? raw.map(clean).filter(Boolean)
+    : clean(raw).split(',').map(item => item.trim()).filter(Boolean);
+  return ids.includes(clean(lessonId));
+}
+
+async function commitDeleteRefs(refs: DocumentReference<DocumentData>[]) {
+  const unique = Array.from(new Map(refs.map(ref => [ref.path, ref])).values());
+  for (let offset = 0; offset < unique.length; offset += 350) {
+    const batch = writeBatch(firestoreDb);
+    unique.slice(offset, offset + 350).forEach(ref => batch.delete(ref));
+    await batch.commit();
+  }
+  return unique.length;
+}
+
+/**
+ * V6.71.2: xóa bài học theo thứ tự an toàn.
+ * Dữ liệu phụ được xóa trước khi xóa metadata bài học để Firestore Rules vẫn
+ * có thể xác minh quyền sở hữu của giáo viên. Lesson document luôn bị xóa cuối.
+ */
+export async function deleteFirebaseLesson(lessonId: string): Promise<LessonCascadeDeleteSummary | false> {
+  const me = await identity();
+  const normalizedLessonId = clean(lessonId);
+  if (!normalizedLessonId) return false;
+
+  const target = doc(lessons(), normalizedLessonId);
+  const lessonSnap = await getDoc(target);
+  const lessonExists = lessonSnap.exists();
+  const lessonData = lessonExists ? lessonSnap.data() as any : null;
+  const isAdminUser = me.role === 'admin' || me.adminPermission === true;
+
+  // Giáo viên chỉ có thể cascade khi bài học vẫn tồn tại và thuộc quyền sở hữu.
+  if (!lessonExists && !isAdminUser) return false;
+
+  const deletedCounts: LessonCascadeDeleteSummary['deleted_counts'] = {
+    lesson: 0,
+    content: 0,
+    registry: 0,
+    learningProgress: 0,
+    learningResultActions: 0,
+    lessonComments: 0,
+    coLearningSessions: 0,
+    slidesPrompts: 0,
+    reviewPractices: 0,
+    reviewAttempts: 0,
+    reviewContents: 0,
+  };
+
+  // Thu thập các dependency trực tiếp. Các truy vấn chỉ dùng một field để
+  // không phát sinh composite index mới.
+  const [progressSnap, resultActionSnap, commentSnap, coLearningSnap] = await Promise.all([
+    getDocs(query(namedCollection('learningProgress'), where('lesson_id', '==', normalizedLessonId))),
+    getDocs(query(namedCollection('learningResultActions'), where('lesson_id', '==', normalizedLessonId))),
+    getDocs(query(namedCollection('lessonComments'), where('lesson_id', '==', normalizedLessonId))),
+    getDocs(query(namedCollection('coLearningSessions'), where('lesson_id', '==', normalizedLessonId))),
+  ]);
+
+  const promptSnap = isAdminUser
+    ? await getDocs(query(namedCollection('slidesPrompts'), where('lesson_id', '==', normalizedLessonId)))
+    : await getDocs(query(namedCollection('slidesPrompts'), where('ownerUid', '==', me.uid)));
+  const promptDocs = promptSnap.docs.filter(item => clean(item.data().lesson_id) === normalizedLessonId);
+
+  // Bài ôn tập là dữ liệu dẫn xuất từ câu hỏi của bài học. Nếu còn tham chiếu
+  // đến bài bị xóa, xóa cả bài ôn tập + nội dung + lượt làm để không để dữ liệu
+  // dẫn xuất mồ côi. Giáo viên chỉ xóa bài ôn tập do chính mình tạo; admin xóa hết.
+  const allReviewSnap = await getDocs(namedCollection('reviewPractices'));
+  const relatedReviews = allReviewSnap.docs.filter(item => {
+    if (!reviewReferencesLesson(item.data(), normalizedLessonId)) return false;
+    return isAdminUser || clean(item.data().ownerUid) === clean(me.uid);
   });
+  const relatedReviewIds = relatedReviews.map(item => item.id);
+  const attemptSnaps = await Promise.all(relatedReviewIds.map(reviewId =>
+    getDocs(query(namedCollection('reviewAttempts'), where('review_id', '==', reviewId))),
+  ));
+
+  const dependencyRefs: DocumentReference<DocumentData>[] = [];
+  progressSnap.docs.forEach(item => dependencyRefs.push(item.ref));
+  resultActionSnap.docs.forEach(item => dependencyRefs.push(item.ref));
+  commentSnap.docs.forEach(item => dependencyRefs.push(item.ref));
+  coLearningSnap.docs.forEach(item => dependencyRefs.push(item.ref));
+  promptDocs.forEach(item => dependencyRefs.push(item.ref));
+  attemptSnaps.forEach(snap => snap.docs.forEach(item => dependencyRefs.push(item.ref)));
+  relatedReviews.forEach(item => {
+    dependencyRefs.push(reviewContentRef(item.id));
+    dependencyRefs.push(item.ref);
+  });
+
+  deletedCounts.learningProgress = progressSnap.size;
+  deletedCounts.learningResultActions = resultActionSnap.size;
+  deletedCounts.lessonComments = commentSnap.size;
+  deletedCounts.coLearningSessions = coLearningSnap.size;
+  deletedCounts.slidesPrompts = promptDocs.length;
+  deletedCounts.reviewAttempts = attemptSnaps.reduce((sum, snap) => sum + snap.size, 0);
+  deletedCounts.reviewPractices = relatedReviews.length;
+  deletedCounts.reviewContents = relatedReviews.length;
+
+  if (dependencyRefs.length) await commitDeleteRefs(dependencyRefs);
+
+  // Thu hồi mọi registry tham chiếu tới bài. Quét fallback giúp dọn được cả
+  // registry mồ côi nếu metadata bài đã bị xóa cục bộ ở lần thao tác trước.
+  const registryCollection = namedCollection('lessonNumberRegistry');
+  const registrySnap = await getDocs(registryCollection);
+  const registryItems = registrySnap.docs.filter(item => {
+    const data = item.data();
+    return clean(data.allLessonId) === normalizedLessonId
+      || Object.values(registryClassMap(data)).some(value => clean(value) === normalizedLessonId);
+  });
+  for (const item of registryItems) {
+    const cleaned = removeLessonFromRegistry(item.data(), normalizedLessonId);
+    if (registryHasAnyLesson(cleaned)) {
+      await setDoc(item.ref, { ...cleaned, updated_at: new Date().toISOString(), updatedAt: serverTimestamp() }, { merge: true });
+    } else {
+      await deleteDoc(item.ref);
+    }
+  }
+  deletedCounts.registry = registryItems.length;
+
+  // Content + lesson metadata xóa cuối để Rules còn kiểm tra owner cho dependency.
+  if (lessonExists) {
+    const finalBatch = writeBatch(firestoreDb);
+    finalBatch.delete(lessonContentRef(normalizedLessonId));
+    finalBatch.delete(target);
+    await finalBatch.commit();
+    deletedCounts.content = 1;
+    deletedCounts.lesson = 1;
+  } else if (isAdminUser) {
+    // Admin có thể chạy lại thao tác để dọn content mồ côi từ lần xóa cũ.
+    await deleteDoc(lessonContentRef(normalizedLessonId)).catch(() => undefined);
+    deletedCounts.content = 1;
+  }
+
+  return {
+    lesson_id: normalizedLessonId,
+    deleted: lessonExists || dependencyRefs.length > 0 || registryItems.length > 0,
+    deleted_counts: deletedCounts,
+  };
 }
 
 export async function submitFirebaseLessonReview(lessonId: string) {
@@ -1285,7 +1430,7 @@ export async function listFirebaseClassmates() {
   if (!classId) throw new Error('Tài khoản học sinh chưa được xếp lớp.');
   if (!grade) throw new Error('Tài khoản học sinh chưa có thông tin khối.');
 
-  // V6.67.0: studentRoster là nguồn danh sách lớp đầy đủ. `members` được đọc
+  // V6.68.0: studentRoster là nguồn danh sách lớp đầy đủ. `members` được đọc
   // song song chỉ để bổ sung UID/trạng thái kích hoạt và bao phủ hồ sơ legacy.
   const [rosterSnap, memberSnap] = await Promise.all([
     getDocs(query(
@@ -1363,7 +1508,7 @@ export async function findFirebaseReusableCoLearningSession(lessonId: string): P
       limit(12),
     ));
   } catch {
-    // Tương thích trong thời gian chỉ mục V6.67.0 đang được Firebase xây dựng.
+    // Tương thích trong thời gian chỉ mục V6.68.0 đang được Firebase xây dựng.
     snap = await getDocs(query(
       sessions,
       where('participant_uids', 'array-contains', me.uid),
@@ -1708,7 +1853,7 @@ export async function moveFirebaseStudents(sourceClassId: string, targetClassId:
     return clean(data.role) === 'student' && clean(data.classId) === sourceClassId;
   });
 
-  // V6.67.0: learningProgress và coLearningSessions là snapshot lịch sử.
+  // V6.68.0: learningProgress và coLearningSessions là snapshot lịch sử.
   // Không ghi đè lop_id/khoi/nam_hoc khi chuyển lớp hoặc kết chuyển năm học.
   // Nếu còn dữ liệu lịch sử/bài học/học sinh ở lớp nguồn thì giữ lại danh mục lớp
   // để báo cáo các năm trước vẫn tra được đúng tên lớp.

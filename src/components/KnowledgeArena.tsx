@@ -4,9 +4,15 @@ import {
   Award,
   BookOpen,
   Brain,
+  BarChart3,
   CheckCircle2,
+  CircleAlert,
   Clock3,
   Flame,
+  Eye,
+  Lock,
+  MoreHorizontal,
+  Pencil,
   PlayCircle,
   Rocket,
   ShieldHalf,
@@ -14,11 +20,14 @@ import {
   Sparkles,
   Star,
   Trophy,
+  Unlock,
   XCircle,
   Zap,
 } from 'lucide-react';
 import type { Account, Lesson, LessonContent, QuizQuestion, StudentLearningAnalyticsRow } from '../types';
 import { getVietnameseLevelLabel } from '../services/gemini';
+import { getLessonName, getLessonNumber } from '../utils/lessonCatalog';
+import { getLessonVisualCatalog } from '../utils/lessonVisualCatalog';
 
 interface KnowledgeArenaProps {
   lessons: Lesson[];
@@ -28,6 +37,10 @@ interface KnowledgeArenaProps {
   analyticsRows?: StudentLearningAnalyticsRow[];
   students?: Account[];
   canViewStats?: boolean;
+  canManageLesson?: (lesson: Lesson) => boolean;
+  lockUpdatingId?: string;
+  onToggleLessonLock?: (lesson: Lesson) => void;
+  onEditLesson?: (lesson: Lesson) => void;
   onSelectLesson: (lesson: Lesson) => void;
   onClearSelection: () => void;
 }
@@ -82,6 +95,21 @@ const MODE_META: Record<
     stats: ['75 giây', 'Đúng +10 điểm', 'Sai -2 điểm'],
   },
 };
+
+function formatArenaDate(value?: string) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return raw.split('T')[0] || raw;
+  return new Intl.DateTimeFormat('vi-VN', { day: '2-digit', month: '2-digit', year: 'numeric' }).format(date);
+}
+
+function getArenaReadiness(lesson: Lesson) {
+  const count = Number.isFinite(Number(lesson.arena_question_count)) ? Math.max(0, Number(lesson.arena_question_count)) : null;
+  const ready = lesson.arena_ready === true || (count !== null && count > 0);
+  const known = lesson.arena_ready !== undefined || count !== null;
+  return { count, ready, known };
+}
 
 function normalizeText(value?: string) {
   return String(value || '')
@@ -629,43 +657,37 @@ function GameArenaHeader({
 }) {
   const meta = MODE_META[mode];
   return (
-    <div className={`overflow-hidden rounded-[32px] bg-gradient-to-r ${meta.gradient} p-7 text-white shadow-[0_22px_55px_rgba(79,70,229,0.28)]`}>
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div className="max-w-4xl">
-          <div className="inline-flex items-center gap-2 rounded-full bg-white/15 px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em]">
-            {meta.icon} Đang thi đấu
+    <div className={`overflow-hidden rounded-[24px] bg-gradient-to-r ${meta.gradient} px-5 py-4 text-white shadow-[0_14px_34px_rgba(79,70,229,0.22)]`}>
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-white/15 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em]">
+              {meta.icon} Đang thi đấu
+            </span>
+            <span className="truncate text-xs font-semibold text-white/85">{lesson.tieu_de}</span>
           </div>
-          <h2 className="mt-4 text-3xl font-bold leading-tight lg:text-4xl">{meta.title}</h2>
-          <p className="mt-2 text-base font-semibold text-white/95">{lesson.tieu_de}</p>
-          <p className="mt-2 max-w-3xl text-sm leading-7 text-white/85">{meta.subtitle}</p>
-          <div className="mt-5 flex flex-wrap gap-3 text-sm text-white/90">
-            <span className="rounded-full bg-white/12 px-4 py-2 font-semibold">{lesson.mon_hoc}</span>
-            <span className="rounded-full bg-white/12 px-4 py-2 font-semibold">Khối {lesson.khoi}</span>
-            <span className="rounded-full bg-white/12 px-4 py-2 font-semibold">{questions.length} câu hỏi khả dụng</span>
+          <h2 className="mt-2 text-xl font-black leading-tight sm:text-2xl">{meta.title}</h2>
+          <div className="mt-2 flex flex-wrap gap-1.5 text-[11px] font-semibold text-white/90">
+            <span className="rounded-full bg-white/12 px-2.5 py-1">{lesson.mon_hoc}</span>
+            <span className="rounded-full bg-white/12 px-2.5 py-1">Khối {lesson.khoi}</span>
+            <span className="rounded-full bg-white/12 px-2.5 py-1">{questions.length} câu hỏi</span>
+            {meta.stats.map((item) => <span key={item} className="rounded-full bg-white/12 px-2.5 py-1">{item}</span>)}
           </div>
         </div>
-        <div className="flex flex-wrap gap-3">
+        <div className="flex shrink-0 flex-wrap gap-2">
           <button
             onClick={onResetMode}
-            className="inline-flex items-center gap-2 rounded-2xl border border-white/20 bg-white/10 px-4 py-3 text-sm font-semibold text-white backdrop-blur hover:bg-white/15"
+            className="inline-flex items-center gap-1.5 rounded-xl border border-white/20 bg-white/10 px-3 py-2 text-xs font-bold text-white backdrop-blur hover:bg-white/15"
           >
-            <ArrowLeft className="h-4 w-4" /> Đổi trò chơi
+            <ArrowLeft className="h-3.5 w-3.5" /> Đổi trò chơi
           </button>
           <button
             onClick={onBack}
-            className="inline-flex items-center gap-2 rounded-2xl border border-white/20 bg-white px-4 py-3 text-sm font-semibold text-slate-800"
+            className="inline-flex items-center gap-1.5 rounded-xl bg-white px-3 py-2 text-xs font-bold text-slate-800"
           >
-            <BookOpen className="h-4 w-4" /> Đổi bài học
+            <BookOpen className="h-3.5 w-3.5" /> Đổi bài học
           </button>
         </div>
-      </div>
-      <div className="mt-6 grid gap-3 md:grid-cols-3">
-        {meta.stats.map((item) => (
-          <div key={item} className="rounded-2xl bg-white/12 px-4 py-3 backdrop-blur-md">
-            <p className="text-xs uppercase tracking-[0.18em] text-white/70">Điểm nhấn</p>
-            <p className="mt-2 font-semibold text-white">{item}</p>
-          </div>
-        ))}
       </div>
     </div>
   );
@@ -1124,21 +1146,34 @@ export default function KnowledgeArena({
   analyticsRows = [],
   students = [],
   canViewStats = false,
+  canManageLesson = () => false,
+  lockUpdatingId = '',
+  onToggleLessonLock,
+  onEditLesson,
   onSelectLesson,
   onClearSelection,
 }: KnowledgeArenaProps) {
   const [mode, setMode] = useState<ArenaMode | null>(null);
   const [introCountdown, setIntroCountdown] = useState<number | null>(null);
+  const [libraryPage, setLibraryPage] = useState(1);
+  const lessonListKey = useMemo(() => lessons.map((lesson) => lesson.lesson_id).join('|'), [lessons]);
+  const libraryPageSize = 8;
+  const libraryPageCount = Math.max(1, Math.ceil(lessons.length / libraryPageSize));
+  const safeLibraryPage = Math.min(Math.max(1, libraryPage), libraryPageCount);
+  const libraryLessons = lessons.slice((safeLibraryPage - 1) * libraryPageSize, safeLibraryPage * libraryPageSize);
   const questions = useMemo(() => prepareQuestions(selectedContent), [selectedContent]);
   const selectedStats = useMemo(
     () => (selectedLesson ? computeArenaLessonStats(selectedLesson, analyticsRows, students, questions.length) : null),
     [selectedLesson, analyticsRows, students, questions.length],
   );
-
   useEffect(() => {
     setMode(null);
     setIntroCountdown(null);
   }, [selectedLesson?.lesson_id]);
+
+  useEffect(() => {
+    setLibraryPage(1);
+  }, [lessonListKey]);
 
   useEffect(() => {
     if (!mode) {
@@ -1163,7 +1198,7 @@ export default function KnowledgeArena({
   if (selectedLesson && selectedContent && mode) {
     const meta = MODE_META[mode];
     return (
-      <div className="space-y-6">
+      <div className="space-y-4">
         <GameArenaHeader lesson={selectedLesson} mode={mode} questions={questions} onBack={onClearSelection} onResetMode={() => setMode(null)} />
 
         {introCountdown !== null ? <GameTransitionOverlay meta={meta} countdown={introCountdown} /> : null}
@@ -1176,83 +1211,100 @@ export default function KnowledgeArena({
   }
 
   return (
-    <div className="space-y-6">
-      <div className="overflow-hidden rounded-[32px] bg-gradient-to-r from-amber-500 via-orange-500 to-fuchsia-600 p-7 text-white shadow-[0_22px_55px_rgba(234,88,12,0.28)] lg:p-8">
-        <div className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr] lg:items-end">
-          <div>
-            <p className="mb-3 inline-flex items-center gap-2 rounded-full bg-white/15 px-3 py-1 text-xs font-semibold">
-              <Trophy className="h-4 w-4" /> Đấu trường tri thức • ôn bài theo kiểu gameshow
-            </p>
-            <h1 className="text-3xl font-bold lg:text-4xl">Chọn bài học, chọn trò chơi và chinh phục điểm số</h1>
-            <p className="mt-3 max-w-3xl text-sm leading-7 text-white/90">
-              Em chọn một bài học phù hợp với khối của mình, sau đó bước vào đấu trường với 3 thử thách: leo thang điểm, chinh phục nhiều vòng và tăng tốc trả lời nhanh.
-            </p>
-          </div>
-          <div className="grid gap-3 rounded-[28px] bg-white/12 p-5 backdrop-blur-md">
-            {[
-              { label: 'Thử thách triệu điểm', text: 'Trả lời từng câu để leo lên các mốc điểm.' },
-              { label: 'Chinh phục đỉnh cao', text: 'Nhiều chặng khác nhau với điểm thưởng tăng dần.' },
-              { label: 'Tăng tốc tri thức', text: 'Ôn thật nhanh trong thời gian giới hạn.' },
-            ].map((item) => (
-              <div key={item.label} className="rounded-2xl bg-white/10 px-4 py-3">
-                <p className="text-sm font-semibold">{item.label}</p>
-                <p className="text-xs text-white/80">{item.text}</p>
-              </div>
-            ))}
-          </div>
+    <div className="space-y-4">
+      {!selectedLesson && !canViewStats ? (
+        <div className="flex flex-wrap items-center gap-2 rounded-[18px] border border-orange-100 bg-white px-3 py-2.5 shadow-sm ring-1 ring-orange-50">
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-orange-50 px-2.5 py-1 text-[10px] font-black uppercase tracking-[0.12em] text-orange-700">
+            <Trophy className="h-3.5 w-3.5" /> 3 chế độ chơi
+          </span>
+          {(Object.keys(MODE_META) as ArenaMode[]).map((gameMode) => {
+            const meta = MODE_META[gameMode];
+            return (
+              <span key={gameMode} className="inline-flex items-center gap-1.5 rounded-full bg-slate-50 px-2.5 py-1 text-[11px] font-bold text-slate-600 ring-1 ring-slate-100">
+                {meta.icon}{meta.title}
+              </span>
+            );
+          })}
+          <span className="ml-auto hidden text-[11px] font-medium text-slate-400 xl:inline">Chọn bài bên dưới để bắt đầu.</span>
         </div>
-      </div>
-
+      ) : null}
 
       {selectedLesson && selectedContent ? (
         <div className="space-y-5">
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-[28px] bg-white p-5 shadow-sm ring-1 ring-slate-100">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-indigo-500">Bài học đã chọn</p>
-              <h2 className="mt-2 text-2xl font-bold text-slate-900">{selectedLesson.tieu_de}</h2>
-              <p className="mt-1 text-sm text-slate-500">
-                {selectedLesson.mon_hoc} • Khối {selectedLesson.khoi} • {questions.length} câu hỏi có thể dùng cho trò chơi
-              </p>
+          <div className={`overflow-hidden rounded-[24px] bg-gradient-to-r px-5 py-4 text-white shadow-[0_14px_34px_rgba(234,88,12,0.20)] ${selectedLesson.is_locked ? 'from-amber-500 via-orange-500 to-rose-500 ring-2 ring-amber-200' : 'from-orange-500 via-fuchsia-500 to-violet-600'}`}>
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-white/15 px-2.5 py-1 text-[10px] font-black uppercase tracking-[0.12em]">
+                    <Trophy className="h-3.5 w-3.5" /> Bài học đã chọn
+                  </span>
+                  <span className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[10px] font-black uppercase ${selectedLesson.is_locked ? 'bg-white text-amber-700' : 'bg-white/15 text-white'}`}>
+                    {selectedLesson.is_locked ? <Lock className="h-3 w-3" /> : <PlayCircle className="h-3 w-3" />}
+                    {selectedLesson.is_locked ? 'Đang khóa' : 'Đang mở'}
+                  </span>
+                </div>
+                <h2 className="mt-2 truncate text-xl font-black sm:text-2xl">{selectedLesson.tieu_de}</h2>
+                <p className="mt-1 text-xs font-semibold text-white/85 sm:text-sm">
+                  {selectedLesson.mon_hoc} • Khối {selectedLesson.khoi}{selectedLesson.lop ? ` • ${selectedLesson.lop}` : ''} • {questions.length} câu hỏi
+                </p>
+              </div>
+              <div className="flex shrink-0 flex-wrap gap-2">
+                {canManageLesson(selectedLesson) && onToggleLessonLock ? (
+                  <button
+                    onClick={() => onToggleLessonLock(selectedLesson)}
+                    disabled={lockUpdatingId === selectedLesson.lesson_id}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-white/15 px-3 py-2 text-xs font-bold text-white ring-1 ring-white/20 backdrop-blur disabled:cursor-wait disabled:opacity-60"
+                  >
+                    {selectedLesson.is_locked ? <Unlock className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5" />}
+                    {selectedLesson.is_locked ? 'Mở khóa' : 'Khóa bài'}
+                  </button>
+                ) : null}
+                {canManageLesson(selectedLesson) && onEditLesson ? (
+                  <button onClick={() => onEditLesson(selectedLesson)} className="inline-flex items-center gap-1.5 rounded-xl bg-white/15 px-3 py-2 text-xs font-bold text-white ring-1 ring-white/20 backdrop-blur">
+                    <Pencil className="h-3.5 w-3.5" /> Sửa bài
+                  </button>
+                ) : null}
+                <button onClick={onClearSelection} className="inline-flex items-center gap-1.5 rounded-xl bg-white px-3 py-2 text-xs font-bold text-slate-800">
+                  <ArrowLeft className="h-3.5 w-3.5" /> Đổi bài học
+                </button>
+              </div>
             </div>
-            <button
-              onClick={onClearSelection}
-              className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 px-4 py-3 text-sm font-semibold text-slate-700"
-            >
-              <ArrowLeft className="h-4 w-4" /> Đổi bài học
-            </button>
           </div>
 
-          <div className="grid gap-5 xl:grid-cols-3">
-            {(Object.keys(MODE_META) as ArenaMode[]).map((gameMode) => {
-              const meta = MODE_META[gameMode];
-              const points = gameMode === 'million' ? '10 mốc điểm' : gameMode === 'peak' ? 'Nhiều vòng thi' : '75 giây bứt tốc';
-              return (
-                <div key={gameMode} className="rounded-[28px] bg-white p-6 shadow-sm ring-1 ring-slate-100 transition hover:-translate-y-1 hover:shadow-[0_18px_44px_rgba(15,23,42,0.08)]">
-                  <div className={`inline-flex items-center gap-2 rounded-full bg-gradient-to-r ${meta.gradient} px-3 py-1 text-xs font-semibold text-white`}>
-                    {meta.icon} {meta.title}
-                  </div>
-                  <p className="mt-4 text-sm leading-7 text-slate-600">{meta.subtitle}</p>
-                  <div className="mt-5 space-y-3 text-sm text-slate-500">
-                    <p className="flex items-center gap-2">
-                      <Star className="h-4 w-4 text-amber-500" /> {points}
-                    </p>
-                    <p className="flex items-center gap-2">
-                      <Brain className="h-4 w-4 text-indigo-500" /> Dùng các câu hỏi của chính bài học đã chọn
-                    </p>
-                    <p className="flex items-center gap-2">
-                      <BookOpen className="h-4 w-4 text-emerald-500" /> Có giải thích sau mỗi lượt chơi
-                    </p>
-                  </div>
-                  <button
-                    onClick={() => setMode(gameMode)}
-                    className="mt-6 inline-flex items-center gap-2 rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white"
-                  >
-                    <PlayCircle className="h-4 w-4" /> Bắt đầu trò chơi
-                  </button>
+          {questions.length === 0 ? (
+            <div className="rounded-[26px] border border-amber-200 bg-amber-50 p-5 text-amber-800">
+              <div className="flex items-start gap-3">
+                <CircleAlert className="mt-0.5 h-5 w-5 shrink-0" />
+                <div>
+                  <p className="font-bold">Bài học chưa có câu hỏi luyện tập dùng cho Đấu trường.</p>
+                  <p className="mt-1 text-sm leading-6">Hãy bổ sung câu hỏi ở phần Luyện tập của bài học. Sau khi lưu, trạng thái sẵn sàng Đấu trường sẽ được cập nhật tự động.</p>
                 </div>
-              );
-            })}
-          </div>
+              </div>
+            </div>
+          ) : (
+            <div className="grid gap-5 xl:grid-cols-3">
+              {(Object.keys(MODE_META) as ArenaMode[]).map((gameMode) => {
+                const meta = MODE_META[gameMode];
+                const points = gameMode === 'million' ? '10 mốc điểm' : gameMode === 'peak' ? 'Nhiều vòng thi' : '75 giây bứt tốc';
+                return (
+                  <div key={gameMode} className="rounded-[28px] bg-white p-6 shadow-sm ring-1 ring-slate-100 transition hover:-translate-y-1 hover:shadow-[0_18px_44px_rgba(15,23,42,0.08)]">
+                    <div className={`inline-flex items-center gap-2 rounded-full bg-gradient-to-r ${meta.gradient} px-3 py-1 text-xs font-semibold text-white`}>
+                      {meta.icon} {meta.title}
+                    </div>
+                    <p className="mt-4 text-sm leading-7 text-slate-600">{meta.subtitle}</p>
+                    <div className="mt-5 space-y-3 text-sm text-slate-500">
+                      <p className="flex items-center gap-2"><Star className="h-4 w-4 text-amber-500" /> {points}</p>
+                      <p className="flex items-center gap-2"><Brain className="h-4 w-4 text-indigo-500" /> Dùng các câu hỏi của chính bài học đã chọn</p>
+                      <p className="flex items-center gap-2"><BookOpen className="h-4 w-4 text-emerald-500" /> Có giải thích sau mỗi lượt chơi</p>
+                    </div>
+                    <button onClick={() => setMode(gameMode)} className="mt-6 inline-flex items-center gap-2 rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white">
+                      <PlayCircle className="h-4 w-4" /> Bắt đầu trò chơi
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
 
           {canViewStats && selectedStats ? <KnowledgeArenaStatsPanel lesson={selectedLesson} stats={selectedStats} /> : null}
         </div>
@@ -1261,45 +1313,135 @@ export default function KnowledgeArena({
           {isLoadingLesson ? (
             <div className="rounded-[28px] bg-white py-20 text-center text-slate-500 shadow-sm ring-1 ring-slate-100">Đang tải dữ liệu bài học cho đấu trường...</div>
           ) : lessons.length > 0 ? (
-            <div className="grid grid-cols-1 gap-6 md:grid-cols-2 xl:grid-cols-3">
-              {lessons.map((lesson, index) => (
-                <div
-                  key={lesson.lesson_id}
-                  className={`overflow-hidden rounded-[24px] border border-white/70 bg-white shadow-[0_12px_34px_rgba(15,23,42,0.08)] ${index === 0 ? 'ring-2 ring-amber-100' : ''}`}
-                >
-                  <div className="relative h-[150px] overflow-hidden bg-gradient-to-br from-amber-50 via-orange-50 to-fuchsia-50">
-                    <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_right,rgba(249,115,22,0.18),transparent_35%),radial-gradient(circle_at_bottom_left,rgba(217,70,239,0.12),transparent_25%)]" />
-                    <div className="relative flex h-full items-center justify-between px-6">
-                      <div>
-                        <div className="mb-3 inline-flex items-center gap-2 rounded-full bg-white/85 px-3 py-1 text-[11px] font-semibold text-orange-700 shadow-sm">
-                          <Trophy className="h-3.5 w-3.5" /> {lesson.mon_hoc}
-                        </div>
-                        <p className="text-sm font-semibold text-slate-500">
-                          Khối {lesson.khoi}
-                          {lesson.lop ? ` • ${lesson.lop}` : ''}
-                        </p>
-                      </div>
-                      <div className="text-5xl">🏆</div>
-                    </div>
-                  </div>
-
-                  <div className="space-y-3 p-5">
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="rounded-full bg-orange-50 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.16em] text-orange-700">Đấu trường</span>
-                      <span className="text-[11px] font-medium text-slate-400">{lesson.updated_at || lesson.ngay_tao || ''}</span>
-                    </div>
-                    <h3 className="line-clamp-2 text-lg font-bold leading-7 text-slate-900">{lesson.tieu_de}</h3>
-                    <p className="line-clamp-3 min-h-[66px] text-sm leading-6 text-slate-500">{lesson.mo_ta}</p>
-                    <button
-                      onClick={() => onSelectLesson(lesson)}
-                      className="inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white"
+            <div className="space-y-5">
+              <div className="lesson-library-grid">
+                {libraryLessons.map((lesson, index) => {
+                  const readiness = getArenaReadiness(lesson);
+                  const locked = lesson.is_locked === true;
+                  const manageable = canManageLesson(lesson);
+                  const lessonNumber = getLessonNumber(lesson);
+                  const lessonName = lessonNumber ? getLessonName(lesson) || lesson.tieu_de : lesson.tieu_de;
+                  const topicVisual = getLessonVisualCatalog(lessonName || lesson.tieu_de, lesson.mon_hoc);
+                  const PrimaryTopicIcon = topicVisual.PrimaryIcon;
+                  const SecondaryTopicIcon = topicVisual.SecondaryIcon;
+                  const TertiaryTopicIcon = topicVisual.TertiaryIcon;
+                  const studentDisabled = !canViewStats && (locked || (readiness.known && !readiness.ready));
+                  return (
+                    <article
+                      key={lesson.lesson_id}
+                      className={`lesson-library-tile relative min-w-0 overflow-visible rounded-[22px] border bg-white shadow-[0_10px_28px_rgba(15,23,42,0.07)] transition hover:z-20 hover:-translate-y-1 hover:border-indigo-200 hover:shadow-[0_18px_40px_rgba(79,70,229,0.14)] ${locked ? 'border-amber-200 ring-1 ring-amber-100' : index === 0 && safeLibraryPage === 1 ? 'border-indigo-100 ring-1 ring-indigo-50' : 'border-slate-100'}`}
                     >
-                      <PlayCircle className="h-4 w-4" /> Chọn bài này để thi đấu
-                    </button>
-                  </div>
-                </div>
-              ))}
+                      <button type="button" onClick={() => !studentDisabled && onSelectLesson(lesson)} disabled={studentDisabled} className={`group block w-full text-left ${studentDisabled ? 'cursor-not-allowed' : ''}`}>
+                        <div className={`lesson-library-cover relative overflow-hidden bg-gradient-to-br ${locked ? 'from-amber-500 via-orange-500 to-rose-400' : topicVisual.coverClass}`} aria-hidden="true">
+                          <div className="lesson-library-cover-grid" />
+                          <div className="lesson-library-cover-glow lesson-library-cover-glow--one" />
+                          <div className="lesson-library-cover-glow lesson-library-cover-glow--two" />
+                          <div className="lesson-library-cover-orb lesson-library-cover-orb--one" />
+                          <div className="lesson-library-cover-orb lesson-library-cover-orb--two" />
+
+                          <div className="absolute right-3 top-3 z-20">
+                            <span className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[9px] font-black uppercase tracking-[0.08em] shadow-sm backdrop-blur-sm ${locked ? 'bg-white/90 text-amber-700' : 'bg-white/92 text-emerald-700'}`}>
+                              {locked ? <Lock className="h-3 w-3" /> : <PlayCircle className="h-3 w-3" />}
+                              {locked ? 'Đã khóa' : 'Đang mở'}
+                            </span>
+                          </div>
+
+                          <div className="lesson-library-cover-art">
+                            <div className="lesson-library-cover-mini lesson-library-cover-mini--left"><SecondaryTopicIcon className="h-5 w-5" /></div>
+                            <div className="lesson-library-cover-primary">
+                              <div className={`lesson-library-cover-primary-inner ${locked ? 'bg-amber-100 text-amber-700' : topicVisual.iconClass}`}>
+                                {locked ? <Lock className="h-10 w-10" /> : <PrimaryTopicIcon className="h-10 w-10" />}
+                              </div>
+                            </div>
+                            <div className="lesson-library-cover-mini lesson-library-cover-mini--right"><TertiaryTopicIcon className="h-5 w-5" /></div>
+                          </div>
+
+                          <div className="lesson-library-cover-caption">
+                            <span className="truncate">{lesson.mon_hoc}</span>
+                            <span className="lesson-library-cover-caption-dot" />
+                            <span>Khối {lesson.khoi}</span>
+                            {lesson.lop ? <><span className="lesson-library-cover-caption-dot" /><span className="truncate">{lesson.lop}</span></> : null}
+                          </div>
+                        </div>
+
+                        <div className="px-4 pb-3 pt-3.5">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <p className="text-[10px] font-black uppercase tracking-[0.14em] text-orange-600">Đấu trường tri thức</p>
+                              <h3 className="mt-1 line-clamp-2 min-h-[2.7rem] text-[15px] font-black leading-[1.35rem] text-slate-900 transition group-hover:text-indigo-700">{lessonNumber ? `Bài ${lessonNumber}: ${lessonName}` : lessonName}</h3>
+                            </div>
+                            <span className="shrink-0 text-[10px] font-semibold text-slate-400">{formatArenaDate(lesson.updated_at || lesson.ngay_tao)}</span>
+                          </div>
+                          <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                            <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 px-2 py-1 text-[9px] font-black text-indigo-700 ring-1 ring-indigo-100">
+                              <Brain className="h-3 w-3" /> {readiness.count !== null ? `${readiness.count} câu hỏi` : 'Kiểm tra khi mở'}
+                            </span>
+                            <span className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[9px] font-black ring-1 ${readiness.known && !readiness.ready ? 'bg-rose-50 text-rose-700 ring-rose-100' : 'bg-emerald-50 text-emerald-700 ring-emerald-100'}`}>
+                              {readiness.known && !readiness.ready ? <CircleAlert className="h-3 w-3" /> : <Trophy className="h-3 w-3" />}
+                              {readiness.known ? (readiness.ready ? 'Sẵn sàng' : 'Thiếu câu hỏi') : 'Nội dung legacy'}
+                            </span>
+                          </div>
+                        </div>
+                      </button>
+
+                      <div className="border-t border-slate-100 px-3 pb-3 pt-2.5">
+                        {canViewStats ? (
+                          <div className="lesson-library-action-row">
+                            <button type="button" onClick={(event) => { event.stopPropagation(); onSelectLesson(lesson); }} className="lesson-library-open-button">
+                              <BarChart3 className="h-3.5 w-3.5" /> Xem
+                            </button>
+                            {(manageable && (onToggleLessonLock || onEditLesson)) ? (
+                              <details className="lesson-library-menu relative">
+                                <summary onClick={(event) => event.stopPropagation()} className="lesson-library-menu-trigger list-none [&::-webkit-details-marker]:hidden" title="Thao tác Đấu trường" aria-label="Thao tác Đấu trường">
+                                  <MoreHorizontal className="h-4 w-4" />
+                                </summary>
+                                <div className="absolute bottom-full right-0 z-50 mb-2 w-48 overflow-hidden rounded-2xl border border-slate-200 bg-white p-1.5 text-left shadow-[0_18px_40px_rgba(15,23,42,0.16)]">
+                                  {onToggleLessonLock ? (
+                                    <button
+                                      type="button"
+                                      onClick={(event) => { event.preventDefault(); event.stopPropagation(); event.currentTarget.closest('details')?.removeAttribute('open'); onToggleLessonLock(lesson); }}
+                                      disabled={lockUpdatingId === lesson.lesson_id}
+                                      className={`flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold disabled:cursor-wait disabled:opacity-60 ${locked ? 'text-emerald-700 hover:bg-emerald-50' : 'text-amber-700 hover:bg-amber-50'}`}
+                                    >
+                                      {locked ? <Unlock className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5" />} {locked ? 'Mở khóa bài học' : 'Khóa bài học'}
+                                    </button>
+                                  ) : null}
+                                  {onEditLesson ? (
+                                    <button type="button" onClick={(event) => { event.preventDefault(); event.stopPropagation(); event.currentTarget.closest('details')?.removeAttribute('open'); onEditLesson(lesson); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold text-indigo-700 hover:bg-indigo-50">
+                                      <Pencil className="h-3.5 w-3.5" /> Sửa bài học
+                                    </button>
+                                  ) : null}
+                                </div>
+                              </details>
+                            ) : null}
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => !studentDisabled && onSelectLesson(lesson)}
+                            disabled={studentDisabled}
+                            className={`inline-flex w-full items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-xs font-bold transition ${studentDisabled ? 'cursor-not-allowed bg-slate-100 text-slate-400' : 'bg-slate-900 text-white hover:bg-indigo-700'}`}
+                          >
+                            {locked ? <Lock className="h-4 w-4" /> : readiness.known && !readiness.ready ? <CircleAlert className="h-4 w-4" /> : <PlayCircle className="h-4 w-4" />}
+                            {locked ? 'Bài đang khóa' : readiness.known && !readiness.ready ? 'Chưa có câu hỏi thi đấu' : 'Chọn bài để thi đấu'}
+                          </button>
+                        )}
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+              {libraryPageCount > 1 ? (
+                <nav className="lesson-library-pagination" aria-label="Phân trang Đấu trường tri thức">
+                  <button type="button" onClick={() => setLibraryPage(Math.max(1, safeLibraryPage - 1))} disabled={safeLibraryPage === 1} className="lesson-library-page-button lesson-library-page-arrow" aria-label="Trang trước">‹</button>
+                  {Array.from({ length: libraryPageCount }, (_, pageIndex) => pageIndex + 1).map((page) => (
+                    <button key={page} type="button" onClick={() => setLibraryPage(page)} className={`lesson-library-page-button ${page === safeLibraryPage ? 'is-active' : ''}`} aria-current={page === safeLibraryPage ? 'page' : undefined}>{page}</button>
+                  ))}
+                  <button type="button" onClick={() => setLibraryPage(Math.min(libraryPageCount, safeLibraryPage + 1))} disabled={safeLibraryPage === libraryPageCount} className="lesson-library-page-button lesson-library-page-arrow" aria-label="Trang sau">›</button>
+                </nav>
+              ) : null}
             </div>
+
           ) : (
             <div className="rounded-[28px] bg-white py-20 text-center shadow-sm ring-1 ring-slate-100">
               <Trophy className="mx-auto h-10 w-10 text-slate-300" />

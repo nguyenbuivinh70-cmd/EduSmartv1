@@ -1,8 +1,29 @@
 import type { ReactNode } from 'react';
 import { motion } from 'motion/react';
-import { BookOpenCheck, ChevronRight, CircleDot, Clock3, Lock, ShieldAlert, Trophy, Users } from 'lucide-react';
+import {
+  Atom,
+  BookOpenCheck,
+  BookOpenText,
+  Calculator,
+  ChevronRight,
+  CircleDot,
+  Clock3,
+  Code2,
+  FlaskConical,
+  Languages,
+  Landmark,
+  Lock,
+  Map,
+  Microscope,
+  MonitorCog,
+  ShieldAlert,
+  Trophy,
+  Users,
+  type LucideIcon,
+} from 'lucide-react';
 import { Lesson, LessonProgressRecord } from '../types';
 import { getLessonName, getLessonNumber } from '../utils/lessonCatalog';
+import { getLessonVisualCatalog } from '../utils/lessonVisualCatalog';
 
 interface LessonCardProps {
   key?: any;
@@ -11,20 +32,21 @@ interface LessonCardProps {
   actions?: ReactNode;
   highlight?: boolean;
   progress?: LessonProgressRecord | null;
-  variant?: 'default' | 'compact';
+  variant?: 'default' | 'compact' | 'student' | 'library';
 }
 
-function getSubjectEmoji(subject: string) {
+function getSubjectVisual(subject: string): { Icon: LucideIcon; label: string; tone: string; iconTone: string } {
   const name = subject.toLowerCase();
-  if (name.includes('toán')) return '📐';
-  if (name.includes('văn')) return '📖';
-  if (name.includes('anh')) return '🇬🇧';
-  if (name.includes('lý')) return '⚡';
-  if (name.includes('hóa')) return '🧪';
-  if (name.includes('sử')) return '🏛️';
-  if (name.includes('địa')) return '🗺️';
-  if (name.includes('tin')) return '💻';
-  return '📘';
+  if (name.includes('toán')) return { Icon: Calculator, label: 'Toán học', tone: 'from-sky-50 via-indigo-50 to-white', iconTone: 'text-sky-700 bg-sky-100' };
+  if (name.includes('văn')) return { Icon: BookOpenText, label: 'Ngữ văn', tone: 'from-rose-50 via-orange-50 to-white', iconTone: 'text-rose-700 bg-rose-100' };
+  if (name.includes('anh')) return { Icon: Languages, label: 'Ngoại ngữ', tone: 'from-cyan-50 via-sky-50 to-white', iconTone: 'text-cyan-700 bg-cyan-100' };
+  if (name.includes('lý')) return { Icon: Atom, label: 'Vật lý', tone: 'from-violet-50 via-indigo-50 to-white', iconTone: 'text-violet-700 bg-violet-100' };
+  if (name.includes('hóa')) return { Icon: FlaskConical, label: 'Hóa học', tone: 'from-emerald-50 via-teal-50 to-white', iconTone: 'text-emerald-700 bg-emerald-100' };
+  if (name.includes('sinh')) return { Icon: Microscope, label: 'Sinh học', tone: 'from-lime-50 via-emerald-50 to-white', iconTone: 'text-lime-700 bg-lime-100' };
+  if (name.includes('sử')) return { Icon: Landmark, label: 'Lịch sử', tone: 'from-amber-50 via-orange-50 to-white', iconTone: 'text-amber-700 bg-amber-100' };
+  if (name.includes('địa')) return { Icon: Map, label: 'Địa lý', tone: 'from-teal-50 via-cyan-50 to-white', iconTone: 'text-teal-700 bg-teal-100' };
+  if (name.includes('tin')) return { Icon: Code2, label: 'Tin học', tone: 'from-indigo-50 via-violet-50 to-white', iconTone: 'text-indigo-700 bg-indigo-100' };
+  return { Icon: BookOpenCheck, label: subject || 'Bài học', tone: 'from-slate-50 via-indigo-50 to-white', iconTone: 'text-slate-700 bg-slate-100' };
 }
 
 const STATUS_LABELS: Record<string, string> = {
@@ -83,40 +105,110 @@ export default function LessonCard({ lesson, onClick, actions, highlight = false
   const lessonDate = formatLessonDate(lesson.updated_at || lesson.ngay_tao);
   const lessonNumber = getLessonNumber(lesson);
   const lessonDisplayName = lessonNumber ? getLessonName(lesson) || lesson.tieu_de : lesson.tieu_de;
+  const subjectVisual = getSubjectVisual(lesson.mon_hoc);
+  const SubjectIcon = subjectVisual.Icon;
+  const topicVisual = getLessonVisualCatalog(lessonDisplayName || lesson.tieu_de, lesson.mon_hoc);
 
-  if (variant === 'compact') {
+  if (variant === 'library') {
+    const PrimaryTopicIcon = topicVisual.PrimaryIcon;
+    const SecondaryTopicIcon = topicVisual.SecondaryIcon;
+    const TertiaryTopicIcon = topicVisual.TertiaryIcon;
+
     return (
       <motion.article
-        whileHover={{ y: -2 }}
-        className={`lesson-compact-card relative overflow-visible rounded-[20px] border bg-white shadow-[0_8px_24px_rgba(15,23,42,0.06)] transition hover:z-10 hover:shadow-[0_12px_30px_rgba(15,23,42,0.1)] ${accessLocked ? 'border-amber-200 ring-1 ring-amber-100' : highlight ? 'border-indigo-200 ring-2 ring-indigo-100' : 'border-slate-100 hover:border-indigo-100'}`}
+        whileHover={{ y: -5 }}
+        className={`lesson-library-tile relative min-w-0 overflow-visible rounded-[22px] border bg-white shadow-[0_10px_28px_rgba(15,23,42,0.07)] transition hover:z-20 hover:border-indigo-200 hover:shadow-[0_18px_40px_rgba(79,70,229,0.14)] ${accessLocked ? 'border-amber-200 ring-1 ring-amber-100' : highlight ? 'border-indigo-200 ring-2 ring-indigo-100' : 'border-slate-100'}`}
       >
-        <div className={`h-1.5 rounded-t-[20px] bg-gradient-to-r ${accessLocked ? 'from-amber-400 via-orange-400 to-rose-400' : 'from-indigo-500 via-violet-500 to-fuchsia-500'}`} />
-        <button onClick={onClick} className="block w-full text-left">
-          <div className="p-4">
-            <div className="flex items-start justify-between gap-3">
-              <div className="flex min-w-0 flex-wrap items-center gap-2">
-                <span className="inline-flex items-center gap-1.5 rounded-full bg-indigo-50 px-2.5 py-1 text-[10px] font-black text-indigo-700">
-                  <BookOpenCheck className="h-3.5 w-3.5" />{lesson.mon_hoc}
-                </span>
-                <span className="text-xs font-bold text-slate-500">Khối {lesson.khoi}{lesson.lop ? ` • ${lesson.lop}` : ''}</span>
-              </div>
-              {lessonDate ? <span className="shrink-0 pt-1 text-[10px] font-semibold text-slate-400">{lessonDate}</span> : null}
-            </div>
+        <button onClick={onClick} className="group block w-full text-left" title={`Mở ${lesson.tieu_de}`}>
+          <div className={`lesson-library-cover relative overflow-hidden bg-gradient-to-br ${accessLocked ? 'from-amber-500 via-orange-500 to-rose-400' : topicVisual.coverClass}`} aria-hidden="true">
+            <div className="lesson-library-cover-grid" />
+            <div className="lesson-library-cover-glow lesson-library-cover-glow--one" />
+            <div className="lesson-library-cover-glow lesson-library-cover-glow--two" />
+            <div className="lesson-library-cover-orb lesson-library-cover-orb--one" />
+            <div className="lesson-library-cover-orb lesson-library-cover-orb--two" />
 
-            <div className="mt-3 flex flex-wrap items-center gap-1.5">
-              <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.12em] text-slate-600">{STATUS_LABELS[lesson.trang_thai] || lesson.trang_thai}</span>
-              <span className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.08em] ${accessLocked ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700'}`}>
+            <div className="absolute right-3 top-3 z-20">
+              <span className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[9px] font-black uppercase tracking-[0.08em] shadow-sm backdrop-blur-sm ${accessLocked ? 'bg-white/90 text-amber-700' : 'bg-white/92 text-emerald-700'}`}>
                 {accessLocked ? <Lock className="h-3 w-3" /> : <CircleDot className="h-3 w-3" />}
                 {accessLocked ? 'Đã khóa' : 'Đang mở'}
               </span>
             </div>
 
-            {lessonNumber ? <div className="mt-3"><span className="inline-flex rounded-lg bg-indigo-600 px-2.5 py-1 text-[10px] font-black uppercase tracking-[0.12em] text-white">Bài {lessonNumber}</span></div> : null}
-            <h3 className={`${lessonNumber ? 'mt-2' : 'mt-3'} line-clamp-2 min-h-[48px] text-[17px] font-black leading-6 text-slate-900`}>{lessonDisplayName}</h3>
+            <div className="lesson-library-cover-art">
+              <div className="lesson-library-cover-mini lesson-library-cover-mini--left">
+                <SecondaryTopicIcon className="h-5 w-5" />
+              </div>
+              <div className="lesson-library-cover-primary">
+                <div className={`lesson-library-cover-primary-inner ${accessLocked ? 'bg-amber-100 text-amber-700' : topicVisual.iconClass}`}>
+                  {accessLocked ? <Lock className="h-10 w-10" /> : <PrimaryTopicIcon className="h-10 w-10" />}
+                </div>
+              </div>
+              <div className="lesson-library-cover-mini lesson-library-cover-mini--right">
+                <TertiaryTopicIcon className="h-5 w-5" />
+              </div>
+            </div>
 
-            <div className="mt-3 flex items-center justify-between gap-3 border-t border-slate-100 pt-3">
-              <span className="min-w-0 truncate text-xs font-semibold text-slate-500">{lesson.nguoi_tao}</span>
-              <span className={`shrink-0 text-[11px] font-black ${accessLocked ? 'text-amber-700' : 'text-indigo-700'}`}>{accessLocked ? 'Chưa cho học' : 'Sẵn sàng học'}</span>
+            <div className="lesson-library-cover-caption">
+              <span className="truncate">{lesson.mon_hoc}</span>
+              <span className="lesson-library-cover-caption-dot" />
+              <span>Khối {lesson.khoi}</span>
+              {lesson.lop ? <><span className="lesson-library-cover-caption-dot" /><span className="truncate">{lesson.lop}</span></> : null}
+            </div>
+          </div>
+
+          <div className="px-4 pb-3 pt-3.5">
+            <h3 className="line-clamp-2 min-h-[2.7rem] text-[15px] font-black leading-[1.35rem] text-slate-900 transition group-hover:text-indigo-700">{lessonNumber ? `Bài ${lessonNumber}: ${lessonDisplayName}` : lessonDisplayName}</h3>
+            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+              <span className="rounded-full bg-slate-100 px-2 py-1 text-[9px] font-black uppercase tracking-[0.08em] text-slate-600">{STATUS_LABELS[lesson.trang_thai] || lesson.trang_thai}</span>
+              {lessonDate ? <span className="rounded-full bg-white px-2 py-1 text-[9px] font-bold text-slate-400 ring-1 ring-slate-100">{lessonDate}</span> : null}
+            </div>
+          </div>
+        </button>
+
+        {actions ? <div className="lesson-library-actions border-t border-slate-100 px-3 pb-3 pt-2.5">{actions}</div> : null}
+      </motion.article>
+    );
+  }
+
+  if (variant === 'compact') {
+    return (
+      <motion.article
+        whileHover={{ y: -2 }}
+        className={`lesson-compact-card relative overflow-visible rounded-[22px] border bg-white shadow-[0_10px_28px_rgba(15,23,42,0.07)] transition hover:z-10 hover:shadow-[0_16px_38px_rgba(15,23,42,0.11)] ${accessLocked ? 'border-amber-200 ring-1 ring-amber-100' : highlight ? 'border-indigo-200 ring-2 ring-indigo-100' : 'border-slate-100 hover:border-indigo-100'}`}
+      >
+        <div className={`h-1.5 rounded-t-[22px] bg-gradient-to-r ${accessLocked ? 'from-amber-400 via-orange-400 to-rose-400' : 'from-indigo-500 via-violet-500 to-fuchsia-500'}`} />
+        <button onClick={onClick} className="block w-full text-left">
+          <div className="p-4 sm:p-5">
+            <div className="grid gap-4 md:grid-cols-[76px_minmax(0,1fr)_auto] md:items-start">
+              <div className={`flex h-[72px] w-[72px] items-center justify-center rounded-[22px] bg-gradient-to-br ${subjectVisual.tone} ring-1 ring-slate-100 shadow-sm`}>
+                <div className={`flex h-12 w-12 items-center justify-center rounded-2xl ${subjectVisual.iconTone}`}>
+                  {accessLocked ? <Lock className="h-6 w-6" /> : <SubjectIcon className="h-6 w-6" />}
+                </div>
+              </div>
+
+              <div className="min-w-0">
+                <div className="flex min-w-0 flex-wrap items-center gap-2">
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-indigo-50 px-2.5 py-1 text-[10px] font-black text-indigo-700">
+                    <MonitorCog className="h-3.5 w-3.5" />{lesson.mon_hoc}
+                  </span>
+                  <span className="text-xs font-bold text-slate-500">Khối {lesson.khoi}{lesson.lop ? ` • ${lesson.lop}` : ''}</span>
+                </div>
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  {lessonNumber ? <span className="inline-flex rounded-lg bg-indigo-600 px-2.5 py-1 text-[10px] font-black uppercase tracking-[0.12em] text-white">Bài {lessonNumber}</span> : null}
+                  <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.12em] text-slate-600">{STATUS_LABELS[lesson.trang_thai] || lesson.trang_thai}</span>
+                  <span className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.08em] ${accessLocked ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700'}`}>
+                    {accessLocked ? <Lock className="h-3 w-3" /> : <CircleDot className="h-3 w-3" />}
+                    {accessLocked ? 'Đã khóa' : 'Đang mở'}
+                  </span>
+                </div>
+                <h3 className="mt-2 line-clamp-2 text-[17px] font-black leading-6 text-slate-900">{lessonDisplayName}</h3>
+                <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs font-semibold text-slate-500">
+                  <span className="truncate">{lesson.nguoi_tao}</span>
+                  <span className={accessLocked ? 'text-amber-700' : 'text-indigo-700'}>{accessLocked ? 'Chưa cho học' : 'Sẵn sàng học'}</span>
+                </div>
+              </div>
+
+              {lessonDate ? <span className="shrink-0 pt-1 text-[10px] font-semibold text-slate-400">{lessonDate}</span> : null}
             </div>
           </div>
         </button>
@@ -125,17 +217,115 @@ export default function LessonCard({ lesson, onClick, actions, highlight = false
     );
   }
 
+  if (variant === 'student') {
+    const progressPercent = Math.max(0, Math.min(100, Number(progress?.completion_percent || 0)));
+    const statusLabel = accessLocked ? 'Đang khóa' : getProgressStatusLabel(progress);
+    const statusTone = accessLocked ? 'bg-amber-50 text-amber-700 ring-amber-100' : `${getProgressStatusTone(progress)} ring-slate-100`;
+    const actionLabel = accessLocked
+      ? 'Chưa thể học'
+      : progress?.status === 'in_progress'
+        ? 'Tiếp tục học'
+        : progress?.status === 'completed'
+          ? 'Xem lại bài'
+          : score
+            ? 'Xem kết quả'
+            : 'Bắt đầu học';
+    const progressLabel = accessLocked
+      ? 'Giáo viên chưa mở bài'
+      : progress?.status === 'completed'
+        ? 'Đã hoàn thành'
+        : progress
+          ? `Tiến độ ${progressPercent}%`
+          : 'Chưa bắt đầu';
+
+    return (
+      <motion.article
+        whileHover={accessLocked ? undefined : { y: -2 }}
+        className={`group relative overflow-hidden rounded-[20px] border bg-white shadow-[0_8px_24px_rgba(15,23,42,0.06)] transition ${accessLocked ? 'border-amber-200 bg-amber-50/20' : highlight ? 'border-indigo-200 ring-2 ring-indigo-100' : 'border-slate-100 hover:border-indigo-200 hover:shadow-[0_12px_30px_rgba(15,23,42,0.09)]'}`}
+      >
+        <div className={`absolute inset-y-0 left-0 w-1 ${accessLocked ? 'bg-amber-400' : progress?.status === 'completed' ? 'bg-emerald-500' : 'bg-indigo-500'}`} />
+        <button
+          type="button"
+          onClick={onClick}
+          className="block w-full text-left"
+          aria-label={`${actionLabel}: ${lesson.tieu_de}`}
+        >
+          <div className="grid gap-3 px-4 py-3.5 sm:grid-cols-[52px_minmax(0,1fr)_154px] sm:items-center sm:gap-4 sm:px-5 sm:py-4">
+            <div className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-[16px] bg-gradient-to-br ${accessLocked ? 'from-amber-50 via-orange-50 to-white' : subjectVisual.tone} ring-1 ring-slate-100 shadow-sm`}>
+              <div className={`flex h-9 w-9 items-center justify-center rounded-[12px] ${accessLocked ? 'bg-amber-100 text-amber-700' : subjectVisual.iconTone}`}>
+                {accessLocked ? <Lock className="h-[18px] w-[18px]" /> : <SubjectIcon className="h-[18px] w-[18px]" />}
+              </div>
+            </div>
+
+            <div className="min-w-0">
+              <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 px-2 py-0.5 text-[10px] font-black text-indigo-700">
+                  <BookOpenCheck className="h-3 w-3" /> {lesson.mon_hoc}
+                </span>
+                <span className="text-[11px] font-bold text-slate-500">Khối {lesson.khoi}{lesson.lop ? ` • ${lesson.lop}` : ''}</span>
+                <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-black ring-1 ${statusTone}`}>
+                  {accessLocked ? <Lock className="h-3 w-3" /> : <CircleDot className="h-3 w-3" />} {statusLabel}
+                </span>
+              </div>
+
+              <div className="mt-1.5 flex min-w-0 items-center gap-2">
+                {lessonNumber ? <span className="shrink-0 rounded-md bg-indigo-600 px-2 py-0.5 text-[10px] font-black uppercase tracking-[0.08em] text-white">Bài {lessonNumber}</span> : null}
+                <h3 className="truncate text-[17px] font-black leading-6 text-slate-900">{lessonDisplayName}</h3>
+              </div>
+
+              <p className="mt-1 line-clamp-1 text-[13px] leading-5 text-slate-500">
+                {lesson.mo_ta || 'Bài học được thiết kế theo tiến trình khởi động, kiến thức, luyện tập và vận dụng.'}
+              </p>
+
+              <div className="mt-2.5 grid min-w-0 grid-cols-[auto_minmax(90px,1fr)_auto] items-center gap-2.5">
+                <span className={`whitespace-nowrap text-[11px] font-bold ${accessLocked ? 'text-amber-700' : 'text-slate-600'}`}>{progressLabel}</span>
+                <div className={`h-1.5 min-w-0 overflow-hidden rounded-full ${accessLocked ? 'bg-amber-100' : 'bg-slate-100'}`}>
+                  {!accessLocked ? (
+                    <div
+                      className={`h-full rounded-full ${progress?.status === 'completed' ? 'bg-emerald-500' : 'bg-indigo-500'}`}
+                      style={{ width: `${progressPercent > 0 ? Math.max(5, progressPercent) : 0}%` }}
+                    />
+                  ) : null}
+                </div>
+                <span className="hidden whitespace-nowrap text-[10px] font-semibold text-slate-400 md:inline">
+                  {lessonDate ? `Cập nhật ${lessonDate}` : ''}
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between gap-3 border-t border-slate-100 pt-3 sm:block sm:border-l sm:border-t-0 sm:pl-4 sm:pt-0 sm:text-right">
+              <div>
+                <p className="text-[9px] font-black uppercase tracking-[0.12em] text-slate-400">Điểm bài học</p>
+                <div className="mt-0.5 flex items-baseline gap-1 sm:justify-end">
+                  <span className={`text-xl font-black ${score ? 'text-indigo-700' : 'text-slate-300'}`}>{score ? formatScore(score.value) : '-'}</span>
+                  {score ? <span className="text-[10px] font-bold text-slate-400">/10</span> : null}
+                </div>
+                {score?.provisional ? <p className="text-[9px] font-semibold text-amber-600">Tạm tính</p> : null}
+              </div>
+
+              <span className={`inline-flex min-w-[118px] items-center justify-center gap-1 rounded-xl px-3 py-2 text-[11px] font-black transition ${accessLocked ? 'bg-amber-50 text-amber-700 ring-1 ring-amber-100' : 'bg-indigo-600 text-white shadow-sm group-hover:bg-indigo-700'}`}>
+                {actionLabel}<ChevronRight className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" />
+              </span>
+            </div>
+          </div>
+        </button>
+      </motion.article>
+    );
+  }
+
   return (
     <motion.article whileHover={{ y: -3 }} className={`group overflow-hidden rounded-[24px] border bg-white shadow-[0_12px_34px_rgba(15,23,42,0.08)] transition ${accessLocked ? 'border-amber-200 ring-1 ring-amber-100' : highlight ? 'border-indigo-200 ring-2 ring-indigo-100' : 'border-white/80 hover:border-indigo-100'}`}>
       <button onClick={onClick} className="block w-full text-left">
-        <div className="relative h-[118px] overflow-hidden bg-gradient-to-br from-indigo-50 via-sky-50 to-fuchsia-50">
-          <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_right,rgba(99,102,241,0.2),transparent_38%),radial-gradient(circle_at_bottom_left,rgba(236,72,153,0.12),transparent_30%)]" />
+        <div className={`relative h-[118px] overflow-hidden bg-gradient-to-br ${accessLocked ? 'from-amber-50 via-orange-50 to-rose-50' : subjectVisual.tone}`}>
+          <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_right,rgba(99,102,241,0.16),transparent_38%),radial-gradient(circle_at_bottom_left,rgba(236,72,153,0.10),transparent_30%)]" />
           <div className="relative flex h-full items-center justify-between px-5">
             <div>
               <div className="mb-2 inline-flex items-center gap-2 rounded-full bg-white/85 px-3 py-1 text-[11px] font-bold text-indigo-700 shadow-sm"><BookOpenCheck className="h-3.5 w-3.5" />{lesson.mon_hoc}</div>
               <p className="text-sm font-bold text-slate-600">Khối {lesson.khoi}{lesson.lop ? ` • ${lesson.lop}` : ''}</p>
             </div>
-            <div className="flex h-16 w-16 items-center justify-center rounded-3xl bg-white/70 text-4xl shadow-sm ring-1 ring-white">{getSubjectEmoji(lesson.mon_hoc)}</div>
+            <div className={`flex h-16 w-16 items-center justify-center rounded-3xl bg-white/80 shadow-sm ring-1 ring-white ${accessLocked ? 'text-amber-700' : 'text-indigo-700'}`}>
+              {accessLocked ? <Lock className="h-8 w-8" /> : <SubjectIcon className="h-8 w-8" />}
+            </div>
           </div>
         </div>
 
