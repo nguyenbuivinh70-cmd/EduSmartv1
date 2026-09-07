@@ -1,7 +1,9 @@
 import { AI_MODELS, BACKEND_URL, DEFAULT_VIDEO_POPUP_CONFIG, VIDEO_CONFIG_STORAGE_KEY } from '../constants';
+import { normalizeGradeScope } from '../utils/gradeScope';
 import { AIConfig, Account, ApiResponse, CatalogClass, CatalogResponse, CoLearningPartnerCredential, CoLearningSession, GoogleSlidesPromptDetailResponse, GoogleSlidesPromptRecord, GoogleSlidesPromptSaveResponse, LearningResultModerationPayload, LearningResultModerationSummary, LessonBuilderDefaultsResponse, LessonBuilderSettings, LessonComment, LessonComposerValues, LessonContentResponse, LessonProgressRecord, LessonRow, PendingShareItem, ReviewPracticeAttempt, ReviewPracticeContentResponse, ReviewPracticeResultStudent, ReviewPracticeResultsResponse, ReviewPracticeRow, SchoolYear, SchoolYearTransferPayload, SchoolYearTransferSummary, MoveStudentsPayload, MoveStudentsSummary, StudentLearningAnalyticsRow, Subject, SystemDiagnostics, SystemDiagnosticIssue, SystemDiagnosticSection, User, VideoPopupConfig } from '../types';
 import {
   FIREBASE_SCHOOL_ID,
+  getFirebaseIdToken,
   firebaseInternalEmailForUsername,
   firebaseErrorMessage,
   registerFirebaseStudentForFirstLogin,
@@ -16,7 +18,10 @@ import {
 } from './firebase';
 import {
   clearFirebaseIdentityCache,
+  saveFirebaseHostConsent,
+  cleanupFirebaseCoLearningConsents,
   deleteFirebaseLesson,
+  repairFirebaseLessonIntegrity,
   getFirebaseLesson,
   findFirebaseReusableCoLearningSession,
   listFirebaseLessons,
@@ -33,7 +38,6 @@ import {
   deleteFirebaseUserAIConfig,
   deleteFirebaseReview,
   deleteFirebaseSlidesPrompt,
-  cascadeDeleteFirebaseAccountData,
   getFirebaseConfig,
   getFirebaseIdentity,
   getFirebaseUserAIConfig,
@@ -50,7 +54,6 @@ import {
   listFirebaseReviewAttempts,
   listFirebaseReviews,
   listFirebaseSlidesPrompts,
-  prepareFirebaseAccountDeletion,
   reviewFirebaseLesson,
   saveFirebaseCatalog,
   saveFirebaseCatalogBatch,
@@ -348,7 +351,9 @@ function normalizeAccount(raw: any): Account {
     ten_dang_nhap: toCleanString(raw?.ten_dang_nhap),
     vai_tro: normalizeRole(raw?.vai_tro),
     lop_id: normalizeClassId(raw?.lop_id),
-    khoi: normalizeGrade(raw?.khoi),
+    khoi: normalizeGrade(raw?.khoi || raw?.grade),
+    khoi_phu_trach: normalizeGradeScope(raw?.khoi_phu_trach ?? raw?.gradeScopes ?? raw?.grade_scope),
+    tat_ca_khoi: normalizeBoolean(raw?.tat_ca_khoi ?? raw?.allGrades, false),
     ten_lop: toCleanString(raw?.ten_lop),
     ten_lop_hien_thi: toCleanString(raw?.ten_lop_hien_thi),
     trang_thai: toCleanString(raw?.trang_thai),
@@ -381,6 +386,8 @@ function firebaseMemberToAccount(raw: any): Account {
     vai_tro: raw.role || raw.vai_tro,
     lop_id: raw.classId || raw.lop_id,
     khoi: raw.grade || raw.khoi,
+    khoi_phu_trach: raw.gradeScopes || raw.khoi_phu_trach || raw.grade_scope,
+    tat_ca_khoi: raw.allGrades ?? raw.tat_ca_khoi,
     trang_thai: raw.status || raw.trang_thai,
     created_at: raw.createdAt || raw.created_at,
     updated_at: raw.updated_at,
@@ -393,6 +400,7 @@ function firebaseMemberToAccount(raw: any): Account {
     quyen_admin: raw.adminPermission ?? raw.quyen_admin,
     nam_hoc: raw.academicYear || raw.nam_hoc,
     nguon_du_lieu: 'firebase',
+    da_doi_mat_khau: raw.passwordChanged ?? raw.da_doi_mat_khau,
     provisioning_status: raw.provisioningStatus === 'pending' ? 'pending' : 'ready',
   });
 }
@@ -862,6 +870,10 @@ function jsonpRequest<T>(payload: Record<string, unknown>): Promise<ApiResponse<
 }
 
 async function requestViaJsonpFallback<T>(payload: Record<string, unknown>): Promise<ApiResponse<T>> {
+  if (['createAccount', 'updateAccount', 'deleteAccount', 'batchDeleteAccounts', 'batchResetPasswords'].includes(String(payload.action))) {
+    return { ok: false, message: 'Chưa xác nhận được kết quả từ Apps Script. Hãy tải lại danh sách để kiểm tra, rồi thử lại nếu cần. Kiểm tra URL /exec và quyền triển khai Apps Script trong hướng dẫn V6.75.2.' };
+  }
+
   try {
     const fallback = await jsonpRequest<T>(payload);
     if (fallback.message !== '__JSONP_NOT_AVAILABLE__') return fallback;
@@ -935,11 +947,12 @@ async function rawRequest<T>(payload: Record<string, unknown>): Promise<ApiRespo
 }
 
 export async function apiRequest<T>(action: string, payload: Record<string, unknown> = {}, token?: string): Promise<ApiResponse<T>> {
-  return rawRequest<T>({
-    action,
-    ...(token ? { token } : {}),
-    ...payload,
-  });
+  let freshToken = token || '';
+  if (token) {
+    try { freshToken = await getFirebaseIdToken() || token; } catch { /* the server validates the supplied token */ }
+  }
+  return rawRequest<T>({ action, request_id: globalThis.crypto?.randomUUID?.() || `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+    ...payload, ...(freshToken ? { token: freshToken, firebase_id_token: freshToken } : {}) });
 }
 
 export async function loginApi(identifier: string, mat_khau: string): Promise<ApiResponse<User>> {
@@ -973,6 +986,8 @@ export async function loginApi(identifier: string, mat_khau: string): Promise<Ap
         token: firebaseIdentity.idToken,
         lop_id: member.classId || '',
         khoi: member.grade || '',
+        khoi_phu_trach: member.gradeScopes || [],
+        tat_ca_khoi: member.allGrades === true,
         quyen_admin: member.adminPermission,
         auth_provider: 'firebase',
         firebase_uid: firebaseIdentity.uid,
@@ -992,8 +1007,10 @@ function normalizeUser(raw: any, token: string): User {
     vai_tro: normalizeRole(raw?.vai_tro),
     token: toCleanString(token),
     lop_id: normalizeClassId(raw?.lop_id),
-    khoi: normalizeGrade(raw?.khoi),
-    quyen_admin: normalizeBoolean(raw?.quyen_admin, false),
+    khoi: normalizeGrade(raw?.khoi || raw?.grade),
+    khoi_phu_trach: normalizeGradeScope(raw?.khoi_phu_trach ?? raw?.gradeScopes ?? raw?.grade_scope),
+    tat_ca_khoi: normalizeBoolean(raw?.tat_ca_khoi ?? raw?.allGrades, false),
+    quyen_admin: normalizeBoolean(raw?.quyen_admin ?? raw?.adminPermission, false),
     auth_provider: toCleanString(raw?.auth_provider) === 'firebase' ? 'firebase' : 'legacy',
     firebase_uid: toCleanString(raw?.firebase_uid),
   };
@@ -1089,6 +1106,8 @@ export async function getCurrentUserApi(token: string): Promise<ApiResponse<User
         vai_tro: member.role,
         lop_id: member.classId,
         khoi: member.grade,
+        khoi_phu_trach: member.gradeScopes || [],
+        tat_ca_khoi: member.allGrades === true,
         quyen_admin: member.adminPermission,
         auth_provider: 'firebase',
         firebase_uid: member.uid,
@@ -1178,6 +1197,7 @@ export async function updateProfileApi(token: string, payload: Record<string, un
     return { ok: true, message: 'Đã cập nhật hồ sơ trên Firebase.', data: normalizeUser({
       user_id: member.userId, ten_dang_nhap: member.username, ho_ten: member.displayName,
       vai_tro: member.role, lop_id: member.classId, khoi: member.grade,
+      khoi_phu_trach: member.gradeScopes || [], tat_ca_khoi: member.allGrades === true,
       quyen_admin: member.adminPermission, auth_provider: 'firebase', firebase_uid: member.uid,
     }, token) };
   } catch (error) {
@@ -1460,144 +1480,46 @@ export async function importStudentAccountsBatchApi(
   }
 }
 
-export async function deleteAccountApi(token: string, user_id: string, firebaseIdToken = ''): Promise<ApiResponse<{
-  user_id: string;
-  deleted: boolean;
-  cleanup?: unknown;
-  firebaseCleanup?: unknown;
-  firebaseCleanupPending?: boolean;
-  legacyCleanupScheduled?: boolean;
-}>> {
-  let preparedTargets: Awaited<ReturnType<typeof prepareFirebaseAccountDeletion>>;
-  try {
-    preparedTargets = await prepareFirebaseAccountDeletion([user_id]);
-  } catch (error) {
-    return { ok: false, message: firebaseErrorMessage(error), error };
-  }
-  if (!preparedTargets.length) {
-    return { ok: false, message: 'Không tìm thấy hồ sơ tài khoản trên Firebase.' };
-  }
+export interface AccountOperationOptions { current_password?: string; auth_deleted_in_console?: boolean }
 
-  try {
-    const firebaseCleanup = await cascadeDeleteFirebaseAccountData([user_id], preparedTargets);
-    const cleanupWarningCount = firebaseCleanup.cleanupWarnings.length;
-    // Google Sheet/Drive chỉ còn là nguồn dữ liệu cũ. Dọn nền sau khi Firestore
-    // đã xóa thành công để Apps Script không còn chặn thao tác trên giao diện.
-    void apiRequest<{ user_id: string; deleted: boolean; cleanup?: unknown }>('deleteAccount', {
-      user_id,
-      cascade_data: true,
-      ...(firebaseIdToken ? { firebase_id_token: firebaseIdToken } : {}),
-    }, token).catch(() => undefined);
-    clearFirebaseIdentityCache();
-    return {
-      ok: true,
-      message: cleanupWarningCount
-        ? `Đã xóa tài khoản; ${cleanupWarningCount} dữ liệu phụ cần quản trị viên kiểm tra lại.`
-        : 'Đã xóa tài khoản khỏi hệ thống và dọn dữ liệu Firebase liên quan.',
-      data: {
-        user_id,
-        deleted: true,
-        firebaseCleanup,
-        firebaseCleanupPending: cleanupWarningCount > 0,
-        legacyCleanupScheduled: true,
-      },
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      message: `Không thể xóa tài khoản trên Firebase: ${firebaseErrorMessage(error)}`,
-      error,
-    };
-  }
+export async function deleteAccountApi(token: string, user_id: string, firebaseIdToken = '', options: AccountOperationOptions = {}): Promise<ApiResponse<{
+  user_id: string; deleted: boolean; firebaseCleanupPending?: boolean;
+}>> {
+  const response = await apiRequest<{ user_id: string; deleted: boolean; firebaseCleanupPending?: boolean }>(
+    'deleteAccount', { user_id, ...options, ...(firebaseIdToken ? { firebase_id_token: firebaseIdToken } : {}) }, token);
+  if (response.ok && response.data?.deleted !== true) return { ok: false, message: 'Backend chưa xác nhận hoàn tất xóa tài khoản.' };
+  if (response.ok) clearFirebaseIdentityCache();
+  return response;
 }
 
-export async function batchDeleteAccountsApi(token: string, user_ids: string[], firebaseIdToken = ''): Promise<ApiResponse<{
-  requested_count: number;
-  deleted_count: number;
-  failed_count: number;
-  deleted: Array<{ user_id: string; ho_ten: string; ten_dang_nhap: string; cleanup?: unknown }>;
-  failed: Array<{ user_id: string; ho_ten?: string; ten_dang_nhap?: string; reason: string }>;
-  firebaseCleanup?: unknown;
-  firebaseCleanupPending?: boolean;
-  legacyCleanupScheduled?: boolean;
-}>> {
-  const requestedIds = Array.from(new Set(user_ids.map(item => toCleanString(item)).filter(Boolean)));
-  if (!requestedIds.length) return { ok: false, message: 'Chưa chọn tài khoản cần xóa.' };
-  let preparedTargets: Awaited<ReturnType<typeof prepareFirebaseAccountDeletion>>;
-  try {
-    preparedTargets = await prepareFirebaseAccountDeletion(requestedIds, true);
-  } catch (error) {
-    return { ok: false, message: firebaseErrorMessage(error), error };
+export async function batchDeleteAccountsApi(token: string, user_ids: string[], firebaseIdToken = '', options: AccountOperationOptions = {}) {
+  const ids = Array.from(new Set(user_ids.map(toCleanString).filter(Boolean)));
+  const deleted: Array<{ user_id: string }> = [];
+  const failed: Array<{ user_id: string; reason: string }> = [];
+  for (const user_id of ids) {
+    const response = await deleteAccountApi(token, user_id, firebaseIdToken, options);
+    if (response.ok && response.data?.deleted) deleted.push({ user_id });
+    else failed.push({ user_id, reason: response.message || 'Chưa hoàn tất xóa.' });
   }
-
-  const preparedById = new Map(preparedTargets.map(item => [item.userId, item]));
-  const validTargets = requestedIds.flatMap(item => {
-    const target = preparedById.get(item);
-    return target ? [target] : [];
-  });
-  const validIds = validTargets.map(item => item.userId);
-  const failed = requestedIds
-    .filter(item => !preparedById.has(item))
-    .map(item => ({ user_id: item, reason: 'Không tìm thấy hồ sơ Firebase hoặc đây là tài khoản đang đăng nhập.' }));
-  if (!validIds.length) {
-    return {
-      ok: false,
-      message: 'Không có tài khoản hợp lệ để xóa.',
-      data: { requested_count: requestedIds.length, deleted_count: 0, failed_count: failed.length, deleted: [], failed },
-    };
-  }
-
-  try {
-    const firebaseCleanup = await cascadeDeleteFirebaseAccountData(validIds, validTargets);
-    const cleanupWarningCount = firebaseCleanup.cleanupWarnings.length;
-    const deleted = validTargets.map(item => ({
-      user_id: item.userId,
-      ho_ten: item.displayName,
-      ten_dang_nhap: item.username || item.studentCode || item.userId,
-    }));
-    void apiRequest('batchDeleteAccounts', {
-      user_ids: validIds,
-      cascade_data: true,
-      ...(firebaseIdToken ? { firebase_id_token: firebaseIdToken } : {}),
-    }, token).catch(() => undefined);
-    clearFirebaseIdentityCache();
-    return {
-      ok: true,
-      message: cleanupWarningCount
-        ? `Đã xóa ${deleted.length} tài khoản; ${cleanupWarningCount} dữ liệu phụ cần kiểm tra lại.`
-        : failed.length
-          ? `Đã xóa ${deleted.length} tài khoản; giữ lại ${failed.length} tài khoản không hợp lệ.`
-          : `Đã xóa ${deleted.length} tài khoản và dọn dữ liệu Firebase liên quan.`,
-      data: {
-        requested_count: requestedIds.length,
-        deleted_count: deleted.length,
-        failed_count: failed.length,
-        deleted,
-        failed,
-        firebaseCleanup,
-        firebaseCleanupPending: cleanupWarningCount > 0,
-        legacyCleanupScheduled: true,
-      },
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      message: `Không thể xóa danh sách tài khoản trên Firebase: ${firebaseErrorMessage(error)}`,
-      error,
-    };
-  }
+  return { ok: deleted.length > 0, message: `Đã dọn dữ liệu ${deleted.length}/${ids.length} tài khoản.${options.auth_deleted_in_console ? ' Việc xóa Authentication do quản trị viên xác nhận trong Firebase Console.' : ''}${failed.length ? ` Còn ${failed.length} tài khoản chưa hoàn tất. ${failed[0].reason}` : ''}`,
+    data: { requested_count: ids.length, deleted_count: deleted.length, failed_count: failed.length,
+      deleted, failed, firebaseCleanupPending: failed.length > 0 } };
 }
 
-export async function batchResetPasswordsApi(token: string, user_ids: string[], new_password = '123456', firebaseIdToken = '') {
-  return apiRequest<{
-    requested_count: number;
-    reset_count: number;
-    failed_count: number;
-    default_password: string;
-    student_password_policy: 'student_code';
-    reset: Array<{ user_id: string; ho_ten: string; ten_dang_nhap: string; password_policy: 'student_code' | 'system_default' }>;
-    failed: Array<{ user_id: string; ho_ten?: string; ten_dang_nhap?: string; reason: string }>;
-  }>('batchResetPasswords', { user_ids, new_password, ...(firebaseIdToken ? { firebase_id_token: firebaseIdToken } : {}) }, token);
+export async function batchResetPasswordsApi(token: string, user_ids: string[], new_password = '123456', firebaseIdToken = '', options: AccountOperationOptions = {}) {
+  const ids = Array.from(new Set(user_ids.map(toCleanString).filter(Boolean)));
+  const reset: Array<{ user_id: string; ho_ten?: string; ten_dang_nhap?: string; password_policy?: string }> = [];
+  const failed: Array<{ user_id: string; ho_ten?: string; reason: string }> = [];
+  for (let offset = 0; offset < ids.length; offset += 20) {
+    const chunk = ids.slice(offset, offset + 20);
+    const response = await apiRequest<{ reset: typeof reset; failed: typeof failed }>('batchResetPasswords',
+      { user_ids: chunk, new_password, ...options, ...(firebaseIdToken ? { firebase_id_token: firebaseIdToken } : {}) }, token);
+    if (response.ok && response.data) { reset.push(...response.data.reset); failed.push(...response.data.failed); }
+    else failed.push(...chunk.map(user_id => ({ user_id, reason: response.message || 'Chưa đặt lại được mật khẩu.' })));
+  }
+  return { ok: reset.length > 0, message: `Đã đặt lại mật khẩu ${reset.length}/${ids.length} tài khoản.${failed.length ? ` ${failed[0].reason}` : ''}`,
+    data: { requested_count: ids.length, reset_count: reset.length, failed_count: failed.length,
+      default_password: new_password, student_password_policy: 'student_code' as const, reset, failed } };
 }
 
 export async function listClassesApi(_token: string, payload: Record<string, unknown> = {}) {
@@ -1784,6 +1706,7 @@ export async function listClassmatesForStudyApi(token: string, lesson_id: string
 }
 
 export async function startCoLearningSessionApi(_token: string, lesson_id: string, credentials: CoLearningPartnerCredential[]) {
+  const sessionId = `COLEARN_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
   try {
     const uniqueCredentials = credentials.filter((item, index, source) => item.identifier
       && source.findIndex((candidate) => toCleanString(candidate.identifier) === toCleanString(item.identifier)) === index);
@@ -1799,23 +1722,24 @@ export async function startCoLearningSessionApi(_token: string, lesson_id: strin
     if (!lessonData) return { ok: false, message: 'Không tìm thấy bài học cần mở.' };
     const partners: FirebaseVerifiedClassmate[] = [];
     for (const credential of uniqueCredentials) {
-      const partner = await verifyOrActivateFirebaseClassmateInIsolation(credential.identifier, credential.password);
+      const partner = await verifyOrActivateFirebaseClassmateInIsolation(credential.identifier, credential.password, {
+        sessionId, lessonId: lesson_id, hostUid: me.uid, classId: me.classId, grade: me.grade,
+      });
       if (toCleanString(partner.uid) === toCleanString(me.uid)) {
-        return { ok: false, message: 'Em không thể chọn chính tài khoản đang đăng nhập để học cùng.' };
+        throw new Error('Em không thể chọn chính tài khoản đang đăng nhập để học cùng.');
       }
       if (toCleanString(credential.user_id) && toCleanString(partner.userId) !== toCleanString(credential.user_id)) {
-        return { ok: false, message: `Mật khẩu xác nhận không khớp học sinh đã chọn: ${toCleanString(partner.displayName) || credential.identifier}.` };
+        throw new Error(`Mật khẩu xác nhận không khớp học sinh đã chọn: ${toCleanString(partner.displayName) || credential.identifier}.`);
       }
       if (!toCleanString(me.classId) || toCleanString(partner.classId) !== toCleanString(me.classId)) {
-        return { ok: false, message: `${toCleanString(partner.displayName) || 'Bạn học'} không thuộc đúng lớp hiện tại của em.` };
+        throw new Error('Bạn học cùng không thuộc lớp hiện tại.');
       }
       if (!toCleanString(me.grade) || toCleanString(partner.grade) !== toCleanString(me.grade)) {
-        return { ok: false, message: `${toCleanString(partner.displayName) || 'Bạn học'} không thuộc cùng khối với em.` };
+        throw new Error('Bạn học cùng không thuộc khối hiện tại.');
       }
       partners.push(partner);
     }
     const now = new Date().toISOString();
-    const sessionId = `COLEARN_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const participantUserIds = [toCleanString(me.userId), ...partners.map((item) => toCleanString(item.userId))];
     const participantUids = [toCleanString(me.uid), ...partners.map((item) => toCleanString(item.uid))];
     const participantNames = [toCleanString(me.displayName || me.username || me.userId), ...partners.map((item) => toCleanString(item.displayName || item.username || item.userId))];
@@ -1840,9 +1764,11 @@ export async function startCoLearningSessionApi(_token: string, lesson_id: strin
       last_active_at: now,
       verified_at: now,
     };
+    await saveFirebaseHostConsent(sessionId, lesson_id);
     await saveFirebaseCoLearningSession({ ...data, lop_id: toCleanString(me.classId), khoi: toCleanString(me.grade) });
     return { ok: true, message: `Đã tạo nhóm học gồm ${participantUserIds.length} học sinh.`, data };
   } catch (error) {
+    await cleanupFirebaseCoLearningConsents(sessionId).catch(() => undefined);
     return { ok: false, message: firebaseErrorMessage(error), error };
   }
 }
@@ -1888,6 +1814,21 @@ export async function deleteLessonApi(token: string, lesson_id: string) {
       ok: true,
       message: 'Đã xóa bài học và dữ liệu liên quan trên Firebase.',
       data: deleted,
+    };
+  } catch (error) {
+    return { ok: false, message: firebaseErrorMessage(error), error };
+  }
+}
+
+export async function repairLessonIntegrityApi(_token: string) {
+  try {
+    const summary = await repairFirebaseLessonIntegrity();
+    return {
+      ok: true,
+      message: summary.removed_orphan_references > 0
+        ? `Đã sửa ${summary.removed_orphan_references} tham chiếu bài học mồ côi.`
+        : 'Không phát hiện registry bài học mồ côi.',
+      data: summary,
     };
   } catch (error) {
     return { ok: false, message: firebaseErrorMessage(error), error };

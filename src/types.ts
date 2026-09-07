@@ -18,6 +18,8 @@ export interface User {
   token: string;
   lop_id?: string;
   khoi?: string;
+  khoi_phu_trach?: string[];
+  tat_ca_khoi?: boolean;
   quyen_admin?: boolean | string;
   nam_hoc?: string;
   auth_provider?: 'firebase' | 'legacy';
@@ -59,6 +61,8 @@ export interface Account {
   vai_tro: Role;
   lop_id?: string;
   khoi?: string;
+  khoi_phu_trach?: string[];
+  tat_ca_khoi?: boolean;
   ten_lop?: string;
   ten_lop_hien_thi?: string;
   trang_thai?: string;

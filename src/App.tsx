@@ -67,6 +67,7 @@ import {
 import { AI_MODELS, DEFAULT_ACTIVE_GRADES, DEFAULT_VIDEO_POPUP_CONFIG, VIDEO_POPUP_VIEW_STORAGE_KEY, sortGrades } from './constants';
 import { compareStructuredLessons, resolveLessonIdentity } from './utils/lessonCatalog';
 import { getLessonScheduleAccess } from './utils/lessonAccess';
+import { canManageGrade, formatManagedGrades, getManagedGradeScope, teacherManagesAllGrades } from './utils/gradeScope';
 import {
   createAccountApi,
   createClassApi,
@@ -79,6 +80,7 @@ import {
   batchResetPasswordsApi,
   batchDeleteClassesApi,
   deleteLessonApi,
+  repairLessonIntegrityApi,
   deleteReviewPracticeApi,
   deleteSubjectApi,
   getCurrentUserApi,
@@ -143,7 +145,7 @@ import DataToolbar from './components/DataToolbar';
 import AccountFormModal from './components/AccountFormModal';
 import ClassFormModal from './components/ClassFormModal';
 import SubjectFormModal from './components/SubjectFormModal';
-import ConfirmDialog from './components/ConfirmDialog';
+import ConfirmDialog, { type AccountOperationCredentials } from './components/ConfirmDialog';
 import ProfileFormModal from './components/ProfileFormModal';
 import WelcomeVideoModal from './components/WelcomeVideoModal';
 import VideoConfigPanel from './components/VideoConfigPanel';
@@ -282,6 +284,8 @@ function sanitizeStoredUser(raw: unknown): User | null {
     token: String(user.token),
     lop_id: normalizeClassIdValue(user.lop_id),
     khoi: normalizeGradeValue(user.khoi),
+    khoi_phu_trach: getManagedGradeScope(user),
+    tat_ca_khoi: teacherManagesAllGrades(user),
     quyen_admin: hasAdminPermission(user),
     auth_provider: user.auth_provider === 'firebase' ? 'firebase' : 'legacy',
     firebase_uid: String(user.firebase_uid || '').trim(),
@@ -371,7 +375,8 @@ interface ConfirmDialogState {
   variant: 'danger' | 'primary';
   requiredText?: string;
   requiredTextLabel?: string;
-  onConfirm: () => Promise<void> | void;
+  accountOperation?: 'delete' | 'reset';
+  onConfirm: (credentials?: AccountOperationCredentials) => Promise<void> | void;
 }
 
 const DEFAULT_CONFIRM: ConfirmDialogState = {
@@ -783,6 +788,8 @@ export default function App() {
   const [lessonScopeFilter, setLessonScopeFilter] = useState('Tất cả');
   const [lessonAccessFilter, setLessonAccessFilter] = useState('Tất cả');
   const [lessonLockUpdatingId, setLessonLockUpdatingId] = useState('');
+  const [lessonDeletingId, setLessonDeletingId] = useState('');
+  const [lessonIntegrityRepairing, setLessonIntegrityRepairing] = useState(false);
   const [lessonLibraryView, setLessonLibraryView] = useState<'grid' | 'list'>('grid');
   const [lessonLibraryPage, setLessonLibraryPage] = useState(1);
 
@@ -812,10 +819,16 @@ export default function App() {
   }, [lessonSearch, lessonSubjectFilter, lessonGradeFilter, lessonStatusFilter, lessonScopeFilter, lessonAccessFilter, lessonLibraryView, activeMenu]);
 
 const gradeFilterOptions = useMemo(() => {
-  if (user?.khoi && !currentUserIsAdmin) return [String(user.khoi)];
-
   const discovered = sortGrades(classes.map((item) => normalizeGradeValue(item.khoi)));
-  return discovered.length > 0 ? discovered : DEFAULT_ACTIVE_GRADES;
+  const schoolGrades = discovered.length > 0 ? discovered : DEFAULT_ACTIVE_GRADES;
+  if (!user || currentUserIsAdmin) return schoolGrades;
+  if (user.vai_tro === 'teacher') {
+    if (teacherManagesAllGrades(user)) return schoolGrades;
+    const scope = getManagedGradeScope(user);
+    return scope.length ? scope.filter((grade) => schoolGrades.includes(grade)) : (user.khoi ? [String(user.khoi)] : []);
+  }
+  if (user.khoi) return [String(user.khoi)];
+  return schoolGrades;
 }, [classes, user, currentUserIsAdmin]);
 
 const classLabelById = useMemo(() => new Map(classes.map((item) => [item.lop_id, item.ten_lop || item.lop_id])), [classes]);
@@ -952,6 +965,9 @@ useEffect(() => {
                 };
                 if (isMounted) {
                   setAIConfig({ apiKey: '', model: AI_MODELS[0] });
+                  // Khôi phục đúng workspace theo vai trò trước khi setUser để tránh
+                  // tải nhầm domain `learning` của giáo viên trong một nhịp render đầu.
+                  setActiveMenu(restoredUser.vai_tro === 'admin' ? 'overview' : restoredUser.vai_tro === 'teacher' ? 'lessons' : 'learning');
                   setUser(restoredUser);
                 }
                 localStorage.setItem('user', JSON.stringify(restoredUser));
@@ -1028,9 +1044,10 @@ useEffect(() => {
 
   useEffect(() => {
     if (!user) return;
-    if (currentUserIsAdmin && activeMenu === 'learning') return;
+    if (user.vai_tro === 'teacher' && !['lessons', 'arena', 'analytics', 'ai_config', 'profile'].includes(activeMenu)) return;
+    if (user.vai_tro === 'admin' && activeMenu === 'learning') return;
     void loadMenuData(activeMenu);
-  }, [activeMenu, user?.user_id, currentUserIsAdmin]);
+  }, [activeMenu, user?.user_id, user?.vai_tro]);
 
   useEffect(() => {
     setIsAssistantReady(false);
@@ -1060,14 +1077,21 @@ useEffect(() => {
 
   useEffect(() => {
     if (!user) return;
-    if (currentUserIsAdmin && activeMenu === 'learning') {
+    // V6.74.2: giáo viên luôn dùng đúng 5 màn hình chung với Admin.
+    // Quyền admin ủy quyền chỉ mở rộng dữ liệu/thao tác, không mở thêm menu quản trị.
+    if (user.vai_tro === 'teacher') {
+      const teacherMenus = ['lessons', 'arena', 'analytics', 'ai_config', 'profile'];
+      if (!teacherMenus.includes(activeMenu)) setActiveMenu('lessons');
+      return;
+    }
+    if (user.vai_tro === 'admin' && activeMenu === 'learning') {
       setActiveMenu('analytics');
       return;
     }
     if (user.vai_tro === 'student' && ['my_lessons', 'create_lesson', 'lessons', 'approvals', 'accounts', 'classes', 'subjects', 'analytics', 'overview', 'video_config', 'school_years'].includes(activeMenu)) {
       setActiveMenu('learning');
     }
-  }, [user?.vai_tro, user?.quyen_admin, activeMenu, currentUserIsAdmin]);
+  }, [user?.vai_tro, user?.quyen_admin, activeMenu]);
 
   useEffect(() => {
     if (!user) return;
@@ -1086,7 +1110,7 @@ useEffect(() => {
   const showToast = (message: string, type: ToastType) => setToast({ message, type });
 
   // Khi học sinh đang ở trong bài, theo dõi metadata bài học theo thời gian thực.
-  // Nếu giáo viên khóa bài, viewer đóng ngay và Rules V6.68.0 đồng thời chặn đọc content.
+  // Nếu giáo viên khóa bài, viewer đóng ngay và Rules hiện hành đồng thời chặn đọc content.
   useEffect(() => {
     if (!user || user.vai_tro !== 'student' || !isLessonViewerOpen || !selectedLesson?.lesson_id) return;
     return subscribeFirebaseLessonAccess(
@@ -1395,7 +1419,8 @@ useEffect(() => {
     return lessons.filter((lesson) => {
       const isOwner = lesson.nguoi_tao_id === user.user_id;
       if (user.vai_tro === 'teacher') {
-        return isOwner || lesson.trang_thai === 'approved_shared';
+        const inManagedGrade = canManageGrade(user, lesson.khoi);
+        return inManagedGrade && (isOwner || lesson.trang_thai === 'approved_shared');
       }
       const sameGrade = !lesson.khoi || !user.khoi || String(lesson.khoi) === String(user.khoi);
       const classMatches = !lesson.lop_id || !user.lop_id || lesson.lop_id === user.lop_id;
@@ -1405,7 +1430,7 @@ useEffect(() => {
   }, [lessons, user, currentUserIsAdmin]);
 
   const lessonSourcePool = useMemo(() => {
-    if (!currentUserIsAdmin && ['learning', 'arena', 'my_lessons', 'create_lesson', 'analytics'].includes(activeMenu)) {
+    if (!currentUserIsAdmin && ['learning', 'lessons', 'arena', 'my_lessons', 'create_lesson', 'analytics'].includes(activeMenu)) {
       return visibleLessonsForCurrentUser;
     }
     return lessons;
@@ -1445,7 +1470,10 @@ useEffect(() => {
   const visibleReviewPractices = useMemo(() => {
     return reviewPractices.filter((review) => {
       if (!user) return false;
-      if (!currentUserIsAdmin && user.vai_tro === 'teacher' && review.nguoi_tao_id && review.nguoi_tao_id !== user.user_id && review.pham_vi !== 'shared') return false;
+      if (!currentUserIsAdmin && user.vai_tro === 'teacher') {
+        if (!canManageGrade(user, review.khoi)) return false;
+        if (review.nguoi_tao_id && review.nguoi_tao_id !== user.user_id && review.pham_vi !== 'shared') return false;
+      }
       if (user.vai_tro === 'student') {
         const sameGrade = !review.khoi || !user.khoi || String(review.khoi) === String(user.khoi);
         const sameClass = !review.lop_id || !user.lop_id || review.lop_id === user.lop_id;
@@ -1646,7 +1674,8 @@ useEffect(() => {
         normalizeText(item.so_dien_thoai).includes(normalizedQuery) ||
         normalizeText(item.tai_khoan_dinh_danh).includes(normalizedQuery);
       const matchesRole = accountRoleFilter === 'Tất cả' || item.vai_tro === accountRoleFilter;
-      const matchesGrade = accountGradeFilter === 'Tất cả' || item.khoi === accountGradeFilter;
+      const matchesGrade = accountGradeFilter === 'Tất cả'
+        || (item.vai_tro === 'teacher' ? canManageGrade(item, accountGradeFilter) : item.khoi === accountGradeFilter);
       const matchesClass = accountClassFilter === 'Tất cả' || item.lop_id === accountClassFilter;
       const matchesStatus = accountStatusFilter === 'Tất cả' || item.trang_thai === accountStatusFilter;
       return matchesQuery && matchesRole && matchesGrade && matchesClass && matchesStatus;
@@ -1743,7 +1772,9 @@ useEffect(() => {
     setAIConfig({ apiKey: '', model: AI_MODELS[0] });
     setUser(userData);
     localStorage.setItem('user', JSON.stringify(userData));
-    setActiveMenu(hasAdminPermission(userData) ? 'overview' : 'learning');
+    // Giáo viên vào thẳng màn hình Bài học dùng chung giao diện quản lý với Admin.
+    // Kể cả giáo viên có quyen_admin vẫn giữ workspace 5 chức năng của giáo viên.
+    setActiveMenu(userData.vai_tro === 'admin' ? 'overview' : userData.vai_tro === 'teacher' ? 'lessons' : 'learning');
   };
 
   const openProfileModal = async () => {
@@ -1757,7 +1788,8 @@ useEffect(() => {
   const handleProfileSubmit = async (payload: { ho_ten: string; khoi?: string; lop_id?: string; mat_khau?: string }) => {
     if (!user) return;
     const isStudentProfile = user.vai_tro === 'student';
-    const safePayload = isStudentProfile
+    const hasManagedAssignment = user.vai_tro === 'student' || user.vai_tro === 'teacher';
+    const safePayload = hasManagedAssignment
       ? { ho_ten: payload.ho_ten, mat_khau: payload.mat_khau }
       : payload;
     setIsSubmitting(true);
@@ -1766,7 +1798,7 @@ useEffect(() => {
       updatedUser = await withLoading('Đang cập nhật hồ sơ cá nhân...', async () => {
         if (user.auth_provider === 'firebase') {
           if (safePayload.mat_khau) await updateOwnFirebasePassword(safePayload.mat_khau);
-          await updateOwnFirebaseMemberProfile(isStudentProfile
+          await updateOwnFirebaseMemberProfile(hasManagedAssignment
             ? { displayName: safePayload.ho_ten }
             : {
                 displayName: safePayload.ho_ten,
@@ -1777,7 +1809,7 @@ useEffect(() => {
           return {
             ...user,
             ho_ten: safePayload.ho_ten,
-            ...(isStudentProfile ? {} : {
+            ...(hasManagedAssignment ? {} : {
               khoi: payload.khoi || '',
               lop_id: payload.lop_id || '',
             }),
@@ -2379,13 +2411,23 @@ useEffect(() => {
     }
 
     const savedRow = res.data as LessonRow | undefined;
-    await loadAppData();
+    // V6.75.2: publish thành công được phản ánh ngay trên UI. Không tải lại toàn
+    // bộ app vì một domain phụ lỗi có thể khiến giáo viên tưởng rằng publish thất bại.
+    if (savedRow) {
+      setLessonRows((current) => {
+        const exists = current.some((item) => item.lesson_id === savedRow.lesson_id);
+        if (exists) return current.map((item) => item.lesson_id === savedRow.lesson_id ? { ...item, ...savedRow } : item);
+        return [savedRow, ...current];
+      });
+      // Đồng bộ lại riêng domain bài học ở nền; lỗi refresh không đảo ngược kết quả publish.
+      void loadDataDomain('lessons', true).catch(() => undefined);
+    }
 
     if (!savingDraft && !values.lesson_id && savedRow && values.lesson_json) {
       setSelectedLesson(mapLessonRow(savedRow, subjects, classes, accounts, user));
       setSelectedLessonContent(values.lesson_json);
       setViewerStage('khoi_dong');
-      setActiveMenu(currentUserIsAdmin ? 'lessons' : 'my_lessons');
+      setActiveMenu(user?.vai_tro === 'teacher' || currentUserIsAdmin ? 'lessons' : 'my_lessons');
       setIsLessonViewerOpen(true);
       setIsComposerOpen(false);
       showToast('Đã tạo bài học mới và mở để xem ngay.', 'success');
@@ -2504,43 +2546,37 @@ useEffect(() => {
     setConfirmDialog({
       isOpen: true,
       title: 'Xóa bài học',
-      description: `Bạn có chắc muốn xóa bài học “${lesson.tieu_de}”? Hệ thống sẽ xóa bài học, nội dung, tiến trình, bình luận, phiên học cùng, nhật ký xử lý kết quả, prompt trình chiếu và các bài ôn tập được tạo từ bài này.`,
+      description: `Bạn có chắc muốn xóa bài học “${lesson.tieu_de}”? Hệ thống sẽ xóa bài học, nội dung, tiến trình, bình luận, phiên học cùng, nhật ký xử lý kết quả, prompt trình chiếu và các bài ôn tập được tạo từ bài này. Card chỉ biến mất sau khi Firestore xác nhận xóa hoàn toàn.`,
       confirmLabel: 'Xóa bài học',
       cancelLabel: 'Hủy',
       variant: 'danger',
       onConfirm: async () => {
-        if (!user) return;
+        if (!user || lessonDeletingId) return;
         const lessonId = lesson.lesson_id;
-
-        // V6.71.2: đóng hộp thoại ngay khi người dùng xác nhận. Firestore có thể
-        // cập nhật snapshot cục bộ trước khi server ACK; nếu giữ modal chờ Promise
-        // sẽ tạo cảm giác popup bị treo dù card đã biến mất khỏi danh sách.
         setConfirmDialog(DEFAULT_CONFIRM);
-        setIsSubmitting(false);
+        setLessonDeletingId(lessonId);
+        showToast('Đang xóa bài học và kiểm tra toàn vẹn dữ liệu...', 'info');
 
-        // Cập nhật UI lạc quan. Nếu xóa thất bại, loadAppData() bên dưới sẽ phục hồi
-        // lại dữ liệu thật từ Firestore.
-        setLessonRows((current) => current.filter((item) => item.lesson_id !== lessonId));
-        setProgressRecords((current) => current.filter((item) => item.lesson_id !== lessonId));
-        setLessonComments((current) => current.filter((item) => item.lesson_id !== lessonId));
-        setReviewPractices((current) => current.filter((review) => {
-          const raw = review.lesson_ids;
-          const ids = Array.isArray(raw) ? raw : String(raw || '').split(',');
-          return !ids.map((id) => String(id || '').trim()).includes(lessonId);
-        }));
-        setSelectedLesson((current) => current?.lesson_id === lessonId ? null : current);
-        setSelectedLessonContent((current) => selectedLesson?.lesson_id === lessonId ? null : current);
-        setArenaLesson((current) => current?.lesson_id === lessonId ? null : current);
-        setArenaLessonContent((current) => arenaLesson?.lesson_id === lessonId ? null : current);
-
-        showToast('Đang xóa bài học và toàn bộ dữ liệu liên quan...', 'info');
         try {
           const res = await deleteLessonApi(user.token, lessonId);
           if (!res.ok) {
-            await loadAppData();
             if (!handleSessionError(res.message)) showToast(res.message || 'Không xóa được bài học.', 'error');
             return;
           }
+
+          // Chỉ cập nhật giao diện sau khi backend đã hoàn tất finalization + verify.
+          setLessonRows((current) => current.filter((item) => item.lesson_id !== lessonId));
+          setProgressRecords((current) => current.filter((item) => item.lesson_id !== lessonId));
+          setLessonComments((current) => current.filter((item) => item.lesson_id !== lessonId));
+          setReviewPractices((current) => current.filter((review) => {
+            const raw = review.lesson_ids;
+            const ids = Array.isArray(raw) ? raw : String(raw || '').split(',');
+            return !ids.map((id) => String(id || '').trim()).includes(lessonId);
+          }));
+          setSelectedLesson((current) => current?.lesson_id === lessonId ? null : current);
+          setSelectedLessonContent((current) => selectedLesson?.lesson_id === lessonId ? null : current);
+          setArenaLesson((current) => current?.lesson_id === lessonId ? null : current);
+          setArenaLessonContent((current) => arenaLesson?.lesson_id === lessonId ? null : current);
 
           const counts = (res.data as any)?.deleted_counts || {};
           const relatedDeleted = [
@@ -2553,21 +2589,45 @@ useEffect(() => {
             counts.reviewAttempts,
           ].reduce((sum: number, value: unknown) => sum + Math.max(0, Number(value || 0)), 0);
 
-          // Đồng bộ lại các danh sách liên quan sau cascade, nhưng không khóa giao diện
-          // bằng popup xác nhận trong thời gian chờ network/server ACK.
-          await loadAppData();
           showToast(
             relatedDeleted > 0
-              ? `Đã xóa bài học và ${relatedDeleted} bản ghi dữ liệu liên quan.`
-              : 'Đã xóa bài học và hoàn tất dọn dữ liệu liên quan.',
+              ? `Đã xóa hoàn toàn bài học và ${relatedDeleted} bản ghi liên quan.`
+              : 'Đã xóa hoàn toàn bài học và giải phóng số bài để có thể tạo lại.',
             'success',
           );
+          void loadAppData().catch(() => undefined);
         } catch (error) {
-          await loadAppData().catch(() => undefined);
           showToast(error instanceof Error ? error.message : 'Không xóa được bài học.', 'error');
+        } finally {
+          setLessonDeletingId('');
         }
       },
     });
+  };
+
+  const handleRepairLessonIntegrity = async () => {
+    if (!user || !currentUserIsAdmin || lessonIntegrityRepairing) return;
+    setLessonIntegrityRepairing(true);
+    showToast('Đang kiểm tra registry và dữ liệu bài học cũ...', 'info');
+    try {
+      const res = await repairLessonIntegrityApi(user.token);
+      if (!res.ok || !res.data) {
+        if (!handleSessionError(res.message)) showToast(res.message || 'Không thể kiểm tra dữ liệu bài học.', 'error');
+        return;
+      }
+      const summary = res.data as any;
+      showToast(
+        Number(summary.removed_orphan_references || 0) > 0
+          ? `Đã sửa ${summary.removed_orphan_references} tham chiếu mồ côi trong ${summary.repaired_registries} registry.`
+          : 'Kiểm tra hoàn tất: không còn registry bài học mồ côi.',
+        'success',
+      );
+      await loadAppData();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Không thể sửa dữ liệu bài học.', 'error');
+    } finally {
+      setLessonIntegrityRepairing(false);
+    }
   };
 
   const handleToggleLessonLock = async (lesson: Lesson) => {
@@ -2784,20 +2844,31 @@ useEffect(() => {
     showToast(payload.user_id ? 'Đã cập nhật tài khoản' : 'Đã tạo tài khoản mới', 'success');
   };
 
+  const refreshAfterAccountDeletion = async () => {
+    await Promise.allSettled(Array.from(domainLoadPromisesRef.current.values()));
+    loadedDataDomainsRef.current.clear();
+    setLessonRows([]);
+    setReviewPractices([]);
+    setPendingShares([]);
+    setProgressRecordsSync([]);
+    await loadAppData();
+  };
+
   const askDeleteAccount = (account: Account) => {
     setConfirmDialog({
       isOpen: true,
       title: 'Xóa tài khoản',
-      description: `Bạn có chắc muốn xóa tài khoản “${account.ho_ten}” (${account.ten_dang_nhap})? Dữ liệu cá nhân như cấu hình AI, tiến trình, bình luận và kết quả ôn tập sẽ bị xóa. Bài học và nội dung dùng chung sẽ được chuyển cho quản trị viên đang thao tác.`,
+      description: `Bạn có chắc muốn xóa tài khoản “${account.ho_ten}” (${account.ten_dang_nhap})? Dữ liệu cá nhân như cấu hình AI, tiến trình, bình luận và kết quả ôn tập sẽ bị xóa. Bài học do tài khoản tạo và dữ liệu liên quan sẽ được dọn. Danh tính Firebase được xóa bằng mật khẩu hiện tại hoặc do bạn hoàn tất trong Firebase Console; tệp Drive chuyển vào Thùng rác.`,
       confirmLabel: 'Xóa tài khoản',
       cancelLabel: 'Hủy',
       variant: 'danger',
-      onConfirm: async () => {
+      accountOperation: 'delete',
+      onConfirm: async (credentials) => {
         if (!user) return;
         setIsSubmitting(true);
         const res = await withLoading('Đang xóa tài khoản...', async () => {
           const firebaseIdToken = user.auth_provider === 'firebase' ? await getFirebaseIdToken(true) : '';
-          return deleteAccountApi(user.token, account.user_id, firebaseIdToken);
+          return deleteAccountApi(user.token, account.user_id, firebaseIdToken, credentials);
         });
         setIsSubmitting(false);
         if (!res.ok) {
@@ -2807,7 +2878,7 @@ useEffect(() => {
         setConfirmDialog(DEFAULT_CONFIRM);
         setSelectedAccountIds((current) => current.filter((id) => id !== account.user_id));
         setAccounts((current) => current.filter((item) => item.user_id !== account.user_id));
-        await loadDataDomain('accounts', true);
+        await refreshAfterAccountDeletion();
         showToast(res.message || 'Đã xóa tài khoản', res.data?.firebaseCleanupPending ? 'info' : 'success');
       },
     });
@@ -2820,17 +2891,18 @@ useEffect(() => {
     setConfirmDialog({
       isOpen: true,
       title: `Xóa ${selectedAccounts.length} tài khoản đã chọn`,
-      description: `Bạn có chắc muốn xóa các tài khoản đã chọn: ${previewNames}${moreText}? Dữ liệu cá nhân sẽ bị xóa; bài học và nội dung dùng chung được chuyển cho quản trị viên. Hệ thống chỉ bỏ qua tài khoản đang đăng nhập hoặc tài khoản không hợp lệ.`,
+      description: `Bạn có chắc muốn xóa các tài khoản đã chọn: ${previewNames}${moreText}? Dữ liệu ứng dụng và bài học do các tài khoản tạo sẽ được dọn; tệp Drive chuyển vào Thùng rác. Danh tính Firebase cần được xóa bằng xác thực hoặc hoàn tất trong Firebase Console. Các tác vụ chưa hoàn tất có thể được thực hiện lại.`,
       confirmLabel: 'Xóa các tài khoản đã chọn',
       cancelLabel: 'Hủy',
       variant: 'danger',
-      onConfirm: async () => {
+      accountOperation: 'delete',
+      onConfirm: async (credentials) => {
         if (!user) return;
         const ids = selectedAccounts.map((item) => item.user_id);
         setIsSubmitting(true);
         const res = await withLoading('Đang xóa các tài khoản đã chọn...', async () => {
           const firebaseIdToken = user.auth_provider === 'firebase' ? await getFirebaseIdToken(true) : '';
-          return batchDeleteAccountsApi(user.token, ids, firebaseIdToken);
+          return batchDeleteAccountsApi(user.token, ids, firebaseIdToken, credentials);
         });
         setIsSubmitting(false);
         if (!res.ok) {
@@ -2841,7 +2913,7 @@ useEffect(() => {
         const deletedIds = new Set((res.data?.deleted || []).map((item) => item.user_id));
         setSelectedAccountIds((current) => current.filter((id) => !deletedIds.has(id)));
         setAccounts((current) => current.filter((item) => !deletedIds.has(item.user_id)));
-        await loadDataDomain('accounts', true);
+        await refreshAfterAccountDeletion();
         const deletedCount = res.data?.deleted_count || 0;
         const failedCount = res.data?.failed_count || 0;
         showToast(res.message || (failedCount > 0 ? `Đã xóa ${deletedCount} tài khoản, giữ lại ${failedCount} tài khoản.` : `Đã xóa ${deletedCount} tài khoản đã chọn.`), failedCount > 0 || res.data?.firebaseCleanupPending ? 'info' : 'success');
@@ -2862,17 +2934,18 @@ useEffect(() => {
     setConfirmDialog({
       isOpen: true,
       title: `Reset mật khẩu ${selectedAccounts.length} tài khoản`,
-      description: `Bạn sắp reset mật khẩu các tài khoản đã chọn: ${previewNames}${moreText}. ${passwordPolicyText}. Các phiên đăng nhập cũ sẽ bị thu hồi và trạng thái đổi mật khẩu sẽ chuyển về Chưa đổi.`,
+      description: `Bạn sắp reset mật khẩu các tài khoản đã chọn: ${previewNames}${moreText}. ${passwordPolicyText}. Chỉ tài khoản xác thực được bằng mật khẩu hiện tại mới được đổi mật khẩu. Các tài khoản còn lại sẽ báo lỗi riêng.`,
       confirmLabel: 'Reset mật khẩu mặc định',
       cancelLabel: 'Hủy',
       variant: 'primary',
-      onConfirm: async () => {
+      accountOperation: 'reset',
+      onConfirm: async (credentials) => {
         if (!user) return;
         const ids = selectedAccounts.map((item) => item.user_id);
         setIsSubmitting(true);
         const res = await withLoading('Đang reset mật khẩu các tài khoản đã chọn...', async () => {
           const firebaseIdToken = user.auth_provider === 'firebase' ? await getFirebaseIdToken(true) : '';
-          return batchResetPasswordsApi(user.token, ids, '123456', firebaseIdToken);
+          return batchResetPasswordsApi(user.token, ids, '123456', firebaseIdToken, credentials);
         });
         setIsSubmitting(false);
         if (!res.ok) {
@@ -2883,7 +2956,7 @@ useEffect(() => {
         await loadAppData();
         const resetCount = res.data?.reset_count || 0;
         const failedCount = res.data?.failed_count || 0;
-        showToast(failedCount > 0 ? `Đã reset ${resetCount} tài khoản, ${failedCount} tài khoản không reset được.` : `Đã reset mật khẩu ${resetCount} tài khoản; học sinh dùng chính mã học sinh.`, failedCount > 0 ? 'info' : 'success');
+        showToast(res.message || `Đã reset ${resetCount} tài khoản, ${failedCount} tài khoản chưa hoàn tất.`, failedCount > 0 ? 'info' : 'success');
       },
     });
   };
@@ -3217,6 +3290,16 @@ useEffect(() => {
       setActiveMenu('analytics');
     };
 
+    if (lessonDeletingId === lesson.lesson_id) {
+      return (
+        <div className="lesson-library-action-row">
+          <div className="flex w-full items-center justify-center gap-2 rounded-xl bg-rose-50 px-3 py-2.5 text-xs font-bold text-rose-700 ring-1 ring-rose-100">
+            <RefreshCw className="h-3.5 w-3.5 animate-spin" /> Đang xóa và kiểm tra dữ liệu...
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="lesson-library-action-row">
         <button
@@ -3261,8 +3344,8 @@ useEffect(() => {
               ) : null}
               {canModify ? <div className="my-1 border-t border-slate-100" /> : null}
               {canModify ? (
-                <button onClick={(event) => { stopTileAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); askDeleteLesson(lesson); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold text-rose-700 hover:bg-rose-50">
-                  <Trash2 className="h-3.5 w-3.5" /> Xóa bài học
+                <button disabled={Boolean(lessonDeletingId)} onClick={(event) => { stopTileAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); askDeleteLesson(lesson); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold text-rose-700 hover:bg-rose-50 disabled:cursor-wait disabled:opacity-60">
+                  {lessonDeletingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />} {lessonDeletingId === lesson.lesson_id ? 'Đang xóa...' : 'Xóa bài học'}
                 </button>
               ) : null}
             </div>
@@ -3352,8 +3435,8 @@ useEffect(() => {
                   <button onClick={(event) => { stopCardAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); void handleSubmitReview(lesson); }} className="flex w-full items-center rounded-lg px-3 py-2 text-left text-xs font-semibold text-amber-700 transition hover:bg-amber-50">Gửi admin duyệt</button>
                 )}
                 {canModify && (
-                  <button onClick={(event) => { stopCardAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); askDeleteLesson(lesson); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-semibold text-rose-700 transition hover:bg-rose-50">
-                    <Trash2 className="h-3.5 w-3.5" /> Xóa bài học
+                  <button disabled={Boolean(lessonDeletingId)} onClick={(event) => { stopCardAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); askDeleteLesson(lesson); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-semibold text-rose-700 transition hover:bg-rose-50 disabled:cursor-wait disabled:opacity-60">
+                    {lessonDeletingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />} {lessonDeletingId === lesson.lesson_id ? 'Đang xóa...' : 'Xóa bài học'}
                   </button>
                 )}
               </div>
@@ -3396,8 +3479,8 @@ useEffect(() => {
           </button>
         )}
         {canModify && (
-          <button onClick={(event) => { stopCardAction(event); askDeleteLesson(lesson); }} className="rounded-full bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700 hover:bg-rose-100">
-            <span className="inline-flex items-center gap-1"><Trash2 className="h-3.5 w-3.5" /> Xóa</span>
+          <button disabled={Boolean(lessonDeletingId)} onClick={(event) => { stopCardAction(event); askDeleteLesson(lesson); }} className="rounded-full bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700 hover:bg-rose-100 disabled:cursor-wait disabled:opacity-60">
+            <span className="inline-flex items-center gap-1">{lessonDeletingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />} {lessonDeletingId === lesson.lesson_id ? 'Đang xóa...' : 'Xóa'}</span>
           </button>
         )}
       </div>
@@ -4056,7 +4139,7 @@ useEffect(() => {
                     {getRoleLabel(item)}
                   </span>
                 </td>
-                <td className="px-5 py-4 text-sm text-slate-600">{item.vai_tro === 'student' ? (item.ten_lop_hien_thi || `${item.khoi ? `Khối ${item.khoi}` : ''}${item.lop_id ? ` • Lớp ${classLabelById.get(item.lop_id) || item.lop_id}` : ''}`) : item.vai_tro === 'teacher' ? (item.khoi ? `Khối ${item.khoi}` : 'Theo dõi nhiều khối') : '-'}</td>
+                <td className="px-5 py-4 text-sm text-slate-600">{item.vai_tro === 'student' ? (item.ten_lop_hien_thi || `${item.khoi ? `Khối ${item.khoi}` : ''}${item.lop_id ? ` • Lớp ${classLabelById.get(item.lop_id) || item.lop_id}` : ''}`) : item.vai_tro === 'teacher' ? formatManagedGrades(item) : '-'}</td>
                 <td className="px-5 py-4 text-sm text-slate-600">{item.so_dien_thoai || '-'}</td>
                 <td className="px-5 py-4 text-sm text-slate-600">
                   {item.provisioning_status === 'pending' ? (
@@ -4424,6 +4507,11 @@ useEffect(() => {
           'Quản lý, chia sẻ và kiểm soát quyền học.',
           filteredLessons,
           <div className="flex flex-wrap gap-3">
+            {currentUserIsAdmin ? (
+              <button disabled={lessonIntegrityRepairing} onClick={() => void handleRepairLessonIntegrity()} className="inline-flex items-center gap-2 rounded-xl bg-slate-700 px-3.5 py-2.5 text-xs font-bold text-white shadow-md shadow-slate-700/15 disabled:cursor-wait disabled:opacity-60" title="Quét và sửa registry bài học mồ côi">
+                <RefreshCw className={`h-4 w-4 ${lessonIntegrityRepairing ? 'animate-spin' : ''}`} /> {lessonIntegrityRepairing ? 'Đang kiểm tra...' : 'Kiểm tra dữ liệu'}
+              </button>
+            ) : null}
             <button onClick={openReviewPracticeCreator} className="inline-flex items-center gap-2 rounded-xl bg-amber-600 px-3.5 py-2.5 text-xs font-bold text-white shadow-md shadow-amber-600/15"><BookOpenCheck className="h-4 w-4" /> Tạo bài ôn tập</button>
             <button onClick={openComposerForCreate} className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-3.5 py-2.5 text-xs font-bold text-white shadow-md shadow-indigo-600/15">
               <Plus className="h-4 w-4" /> Tạo bài học
@@ -4567,8 +4655,8 @@ useEffect(() => {
                     ['Họ tên', user.ho_ten],
                     ['Tên đăng nhập', user.ten_dang_nhap],
                     ['Vai trò', getRoleLabel(user)],
-                    ['Khối', user.khoi || '-'],
-                    ['Lớp', user.lop_id || '-'],
+                    ['Khối', user.vai_tro === 'teacher' ? formatManagedGrades(user) : (user.khoi || '-')],
+                    ['Lớp', user.vai_tro === 'teacher' ? 'Không áp dụng' : (user.lop_id || '-')],
                   ].map((row) => (
                     <tr key={String(row[0])} className="border-b border-slate-50 last:border-0">
                       <td className="px-3 py-3 font-medium text-slate-700">{row[0]}</td>
@@ -4804,7 +4892,8 @@ useEffect(() => {
         requiredText={confirmDialog.requiredText}
         requiredTextLabel={confirmDialog.requiredTextLabel}
         onClose={() => setConfirmDialog(DEFAULT_CONFIRM)}
-        onConfirm={() => void confirmDialog.onConfirm()}
+        accountOperation={confirmDialog.accountOperation}
+        onConfirm={(credentials) => void confirmDialog.onConfirm(credentials)}
       />
 
       {isAIConfigOpen && <AIConfigModal

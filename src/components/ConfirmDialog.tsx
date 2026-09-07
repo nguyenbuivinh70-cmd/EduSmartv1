@@ -2,6 +2,11 @@ import { useEffect, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { AlertTriangle, LoaderCircle, X } from 'lucide-react';
 
+export interface AccountOperationCredentials {
+  current_password?: string;
+  auth_deleted_in_console?: boolean;
+}
+
 interface ConfirmDialogProps {
   isOpen: boolean;
   title: string;
@@ -12,7 +17,8 @@ interface ConfirmDialogProps {
   isSubmitting?: boolean;
   requiredText?: string;
   requiredTextLabel?: string;
-  onConfirm: () => void;
+  accountOperation?: 'delete' | 'reset';
+  onConfirm: (credentials?: AccountOperationCredentials) => void;
   onClose: () => void;
 }
 
@@ -26,17 +32,20 @@ export default function ConfirmDialog({
   isSubmitting = false,
   requiredText = '',
   requiredTextLabel = '',
+  accountOperation,
   onConfirm,
   onClose,
 }: ConfirmDialogProps) {
   const [typedText, setTypedText] = useState('');
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [deletedInConsole, setDeletedInConsole] = useState(false);
   const normalizedRequiredText = String(requiredText || '').trim();
   const isTextConfirmationRequired = !!normalizedRequiredText;
   const isConfirmDisabled = isSubmitting || (isTextConfirmationRequired && typedText.trim().toUpperCase() !== normalizedRequiredText.toUpperCase());
 
   useEffect(() => {
-    if (isOpen) setTypedText('');
-  }, [isOpen, requiredText]);
+    setTypedText(''); setCurrentPassword(''); setDeletedInConsole(false);
+  }, [isOpen, requiredText, accountOperation]);
 
   return (
     <AnimatePresence>
@@ -60,6 +69,29 @@ export default function ConfirmDialog({
               </button>
             </div>
             <div className="app-modal-body app-modal-body-padded app-scrollbar">
+              {accountOperation && (
+                <div className="mb-4 space-y-3 rounded-2xl border border-indigo-100 bg-indigo-50/60 p-4 text-sm text-slate-700">
+                  <label className="block font-semibold">
+                    Mật khẩu hiện tại của tài khoản cần xử lý
+                    <input type="password" autoComplete="off" value={currentPassword}
+                      onChange={event => setCurrentPassword(event.target.value)} disabled={isSubmitting || deletedInConsole}
+                      className="mt-2 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 outline-none focus:border-indigo-500 disabled:opacity-50"
+                      placeholder="Nhập khi đã đổi mật khẩu ban đầu" />
+                  </label>
+                  <p className="text-xs leading-5">Mật khẩu chỉ dùng cho lần xác thực này. Khi chọn nhiều tài khoản, giá trị nhập áp dụng cho cả nhóm. Tài khoản không xác thực được sẽ báo lỗi riêng.</p>
+                  {accountOperation === 'delete' ? (
+                    <>
+                      <a href="https://console.firebase.google.com/project/hthtv1/authentication/users" target="_blank" rel="noopener noreferrer" className="inline-block font-semibold text-indigo-700 underline">Mở Firebase Console để xóa danh tính đăng nhập</a>
+                      <label className="flex items-start gap-2 font-medium">
+                        <input type="checkbox" checked={deletedInConsole} disabled={isSubmitting}
+                          onChange={event => { setDeletedInConsole(event.target.checked); setCurrentPassword(''); }} className="mt-1" />
+                        <span>Tôi đã kiểm tra và xóa danh tính đăng nhập của tất cả tài khoản đang chọn trong Firebase Console, hoặc xác nhận chúng chưa từng được tạo.</span>
+                      </label>
+                      <p className="text-xs leading-5">Chỉ đánh dấu sau khi hoàn tất kiểm tra. Ứng dụng sẽ dọn dữ liệu dựa trên xác nhận này và không tự xác minh thao tác trong Console.</p>
+                    </>
+                  ) : <p className="text-xs leading-5">Nếu đã quên mật khẩu, mô hình hiện tại không thể ép đặt lại mật khẩu Firebase của người khác. Liên hệ chủ tài khoản hoặc dùng khôi phục qua email thật nếu tài khoản có email nhận được thư.</p>}
+                </div>
+              )}
               {isTextConfirmationRequired ? (
                 <div className="rounded-[24px] border border-rose-100 bg-rose-50/70 p-4">
                   <label className="block text-sm font-bold text-rose-700">{requiredTextLabel || `Nhập ${normalizedRequiredText} để xác nhận`}</label>
@@ -87,7 +119,7 @@ export default function ConfirmDialog({
                 {cancelLabel}
               </button>
               <button
-                onClick={onConfirm}
+                onClick={() => onConfirm(accountOperation ? { current_password: currentPassword, auth_deleted_in_console: accountOperation === 'delete' && deletedInConsole } : undefined)}
                 disabled={isConfirmDisabled}
                 className={`inline-flex items-center gap-2 rounded-2xl px-4 py-2.5 text-sm font-semibold text-white transition disabled:cursor-not-allowed disabled:opacity-70 ${variant === 'danger' ? 'bg-rose-600 hover:bg-rose-700' : 'bg-indigo-600 hover:bg-indigo-700'}`}
               >

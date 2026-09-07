@@ -2,10 +2,11 @@ import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   Menu, X, LayoutDashboard, Users, BookOpen, GraduationCap,
-  Settings, LogOut, User as UserIcon, CheckSquare, PlusCircle,
-  Bell, Search, FolderKanban, Trophy, BarChart3, ClipboardList, MonitorPlay, CalendarDays, WifiOff
+  Settings, LogOut, User as UserIcon, CheckSquare,
+  Bell, Search, FolderKanban, Trophy, BarChart3, MonitorPlay, CalendarDays, WifiOff
 } from 'lucide-react';
 import { User } from '../types';
+import { formatManagedGrades } from '../utils/gradeScope';
 
 
 function hasAdminPermission(user: User) {
@@ -63,12 +64,13 @@ export default function Layout({ user, onLogout, children, activeMenu, setActive
     { id: 'ai_config', label: 'Cấu hình AI', icon: <Settings className="h-5 w-5" /> },
   ];
 
+  // V6.74.2: giáo viên dùng chung đúng các màn hình quản lý của Admin,
+  // nhưng sidebar chỉ hiển thị 5 chức năng nghiệp vụ được giao. Không còn
+  // các route/giao diện riêng như Học tập, Bài học của tôi, Tạo bài học.
   const teacherMenu = [
-    { id: 'learning', label: 'Học tập', icon: <BookOpen className="h-5 w-5" /> },
-    { id: 'my_lessons', label: 'Bài học của tôi', icon: <FolderKanban className="h-5 w-5" /> },
-    { id: 'create_lesson', label: 'Tạo bài học', icon: <PlusCircle className="h-5 w-5" /> },
+    { id: 'lessons', label: 'Bài học', icon: <FolderKanban className="h-5 w-5" /> },
     { id: 'arena', label: 'Đấu trường tri thức', icon: <Trophy className="h-5 w-5" /> },
-    { id: 'analytics', label: 'Theo dõi học tập', icon: <ClipboardList className="h-5 w-5" /> },
+    { id: 'analytics', label: 'Theo dõi học tập', icon: <BarChart3 className="h-5 w-5" /> },
     { id: 'ai_config', label: 'Cấu hình AI', icon: <Settings className="h-5 w-5" /> },
     { id: 'profile', label: 'Hồ sơ cá nhân', icon: <UserIcon className="h-5 w-5" /> },
   ];
@@ -82,8 +84,10 @@ export default function Layout({ user, onLogout, children, activeMenu, setActive
     { id: 'profile', label: 'Hồ sơ cá nhân', icon: <UserIcon className="h-5 w-5" /> },
   ];
 
-  const menuItems = adminLike ? adminMenu : user.vai_tro === 'teacher' ? teacherMenu : studentMenu;
-  const roleLabel = user.vai_tro === 'admin' ? 'Quản trị viên' : adminLike ? 'Giáo viên + quyền admin' : user.vai_tro === 'teacher' ? 'Giáo viên' : 'Học sinh';
+  // Quyền admin được ủy quyền cho giáo viên chỉ mở rộng phạm vi dữ liệu/thao tác,
+  // không biến sidebar giáo viên thành sidebar quản trị viên.
+  const menuItems = user.vai_tro === 'admin' ? adminMenu : user.vai_tro === 'teacher' ? teacherMenu : studentMenu;
+  const roleLabel = user.vai_tro === 'admin' ? 'Quản trị viên' : user.vai_tro === 'teacher' ? (adminLike ? 'Giáo viên + quyền admin' : 'Giáo viên') : 'Học sinh';
 
   return (
     <div className="notranslate flex h-dvh overflow-hidden bg-bg-main" translate="no">
@@ -207,7 +211,8 @@ export default function Layout({ user, onLogout, children, activeMenu, setActive
                 <p className="text-[14px] font-semibold text-text-main">{user.ho_ten}</p>
                 <p className="hidden text-[12px] font-medium text-text-muted sm:block">
                   {roleLabel}
-                  {!adminLike && user.vai_tro !== 'admin' && user.khoi ? ` • Khối ${user.khoi}` : ''}
+                  {user.vai_tro === 'teacher' ? ` • ${adminLike ? 'Toàn trường' : formatManagedGrades(user)}` : ''}
+                  {user.vai_tro === 'student' && user.khoi ? ` • Khối ${user.khoi}` : ''}
                   {user.vai_tro === 'student' && user.lop_id ? ` • ${user.lop_id}` : ''}
                 </p>
               </div>

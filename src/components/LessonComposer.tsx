@@ -15,6 +15,7 @@ import { analyzeLessonMaterial, fileToUploadedSourceFile, reviseLessonWithAI } f
 import { getLessonBuilderDefaultsApi, resetLessonBuilderDefaultsApi, saveLessonBuilderDefaultsApi } from '../services/api';
 import { DEFAULT_ACTIVE_GRADES, sortGrades } from '../constants';
 import { buildLessonTitle, normalizeLessonName, normalizeLessonNumber, resolveLessonIdentity } from '../utils/lessonCatalog';
+import { getManagedGradeScope, teacherManagesAllGrades } from '../utils/gradeScope';
 import LessonBuilderSettingsPanel, { DEFAULT_LESSON_BUILDER_SETTINGS } from './LessonBuilderSettingsPanel';
 import LessonPreviewModal from './LessonPreviewModal';
 import AIRevisionPanel from './AIRevisionPanel';
@@ -94,9 +95,14 @@ function normalizeGradeValue(value?: string | number | null) {
 
 function getAvailableLessonGrades(classes: CatalogClass[], user: User) {
   const discovered = sortGrades(classes.map((item) => normalizeGradeValue(item.khoi)).filter(Boolean));
-  if (discovered.length) return discovered;
+  const schoolGrades = discovered.length ? discovered : DEFAULT_ACTIVE_GRADES;
+  if (user.vai_tro === 'teacher') {
+    if (teacherManagesAllGrades(user)) return schoolGrades;
+    const scope = getManagedGradeScope(user);
+    return scope.length ? scope.filter((grade) => schoolGrades.includes(grade)) : (user.khoi ? [normalizeGradeValue(user.khoi)] : []);
+  }
   if (user.khoi) return [normalizeGradeValue(user.khoi)];
-  return DEFAULT_ACTIVE_GRADES;
+  return schoolGrades;
 }
 
 function currentSchoolYear() {
@@ -154,7 +160,7 @@ function buildInitialValues(user: User, lesson?: Lesson | null, content?: Lesson
     lesson_name: identity.lessonName,
     tom_tat: lesson?.mo_ta || content?.metadata?.tom_tat || '',
     mon_id: lesson?.mon_id || '',
-    khoi: lesson?.khoi || user.khoi || '6',
+    khoi: lesson?.khoi || getManagedGradeScope(user)[0] || user.khoi || '6',
     lop_id: lesson?.lop_id || '',
     pham_vi: lesson?.pham_vi || 'private',
     share_now: lesson?.trang_thai === 'pending_review',
@@ -177,6 +183,16 @@ function buildInitialValues(user: User, lesson?: Lesson | null, content?: Lesson
 }
 
 const fieldClass = 'w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100';
+
+function lessonSaveDisplayError(error: unknown) {
+  const raw = String((error as any)?.message || error || 'Không thể lưu bài học.').trim();
+  if (!raw) return 'Không thể lưu bài học.';
+  if (/ReferenceError|is not defined|Cannot access .* before initialization/i.test(raw)) {
+    console.error('[EduSmart][LessonComposer][PUBLISH_RUNTIME]', error);
+    return 'Không thể xuất bản bài học do lỗi xử lý nội bộ. Hệ thống đã ghi nhận để chẩn đoán. [PUBLISH_RUNTIME]';
+  }
+  return raw;
+}
 
 export default function LessonComposer({ isOpen, user, aiConfig, subjects, classes, existingLessons = [], initialLesson, initialContent, currentSchoolYear: systemSchoolYear, onClose, onSave, onOpenConfig }: LessonComposerProps) {
   const [lessonBuilderDefaults, setLessonBuilderDefaults] = useState<LessonBuilderSettings | null>(null);
@@ -495,7 +511,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
       });
       onClose();
     } catch (error) {
-      setErrorMessage(String((error as any)?.message || error || 'Không thể lưu bài học.'));
+      setErrorMessage(lessonSaveDisplayError(error));
     } finally {
       setIsSaving(false);
     }

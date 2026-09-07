@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from 'motion/react';
-import { GraduationCap, LoaderCircle, ShieldCheck, UserRound, X } from 'lucide-react';
+import { Check, GraduationCap, Layers3, LoaderCircle, ShieldCheck, UserRound, X } from 'lucide-react';
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { Account, CatalogClass, Role } from '../types';
 import { DEFAULT_ACTIVE_GRADES, sortGrades } from '../constants';
@@ -9,9 +9,12 @@ interface AccountFormValues {
   ho_ten: string;
   ten_dang_nhap: string;
   mat_khau: string;
+  current_password?: string;
   vai_tro: Role;
   lop_id: string;
   khoi: string;
+  khoi_phu_trach: string[];
+  tat_ca_khoi: boolean;
   trang_thai: string;
   ghi_chu: string;
   ma_hoc_sinh: string;
@@ -41,6 +44,8 @@ const INITIAL_VALUES: AccountFormValues = {
   vai_tro: 'student',
   lop_id: '',
   khoi: '',
+  khoi_phu_trach: [],
+  tat_ca_khoi: false,
   trang_thai: 'active',
   ghi_chu: '',
   ma_hoc_sinh: '',
@@ -64,6 +69,7 @@ function normalizeBooleanFlag(value: unknown) {
 export default function AccountFormModal({ isOpen, classes, availableGrades = DEFAULT_ACTIVE_GRADES, initialData, isSubmitting = false, onClose, onSubmit }: AccountFormModalProps) {
   const gradeOptions = useMemo(() => sortGrades(availableGrades.length ? availableGrades : DEFAULT_ACTIVE_GRADES), [availableGrades]);
   const [values, setValues] = useState<AccountFormValues>(INITIAL_VALUES);
+  const [assignmentError, setAssignmentError] = useState('');
 
   useEffect(() => {
     if (!isOpen) return;
@@ -76,6 +82,8 @@ export default function AccountFormModal({ isOpen, classes, availableGrades = DE
         vai_tro: initialData.vai_tro || 'student',
         lop_id: initialData.lop_id || '',
         khoi: initialData.khoi || '',
+        khoi_phu_trach: Array.isArray(initialData.khoi_phu_trach) && initialData.khoi_phu_trach.length ? initialData.khoi_phu_trach : (initialData.khoi ? [initialData.khoi] : []),
+        tat_ca_khoi: initialData.tat_ca_khoi === true,
         trang_thai: initialData.trang_thai || 'active',
         ghi_chu: initialData.ghi_chu || '',
         ma_hoc_sinh: initialData.ma_hoc_sinh || '',
@@ -90,25 +98,29 @@ export default function AccountFormModal({ isOpen, classes, availableGrades = DE
       return;
     }
     setValues(INITIAL_VALUES);
+    setAssignmentError('');
   }, [isOpen, initialData]);
 
   const filteredClasses = useMemo(() => classes.filter((item) => !values.khoi || String(item.khoi || '') === String(values.khoi || '')), [classes, values.khoi]);
-  const shouldSelectGrade = values.vai_tro === 'student' || values.vai_tro === 'teacher';
+  const shouldSelectGrade = values.vai_tro === 'student';
   const shouldSelectClass = values.vai_tro === 'student';
   const isStudent = values.vai_tro === 'student';
+  const isTeacher = values.vai_tro === 'teacher';
   const canGrantAdminPermission = values.vai_tro === 'teacher';
+  const teacherManagedGrades = values.tat_ca_khoi ? gradeOptions : sortGrades(values.khoi_phu_trach);
 
   useEffect(() => {
     if (values.vai_tro === 'admin') {
-      if (values.lop_id || values.khoi) {
-        setValues((current) => ({ ...current, lop_id: '', khoi: '' }));
+      if (values.lop_id || values.khoi || values.khoi_phu_trach.length || values.tat_ca_khoi) {
+        setValues((current) => ({ ...current, lop_id: '', khoi: '', khoi_phu_trach: [], tat_ca_khoi: false }));
       }
+      setAssignmentError('');
       return;
     }
 
     if (values.vai_tro === 'teacher') {
-      if (values.lop_id) {
-        setValues((current) => ({ ...current, lop_id: '' }));
+      if (values.lop_id || values.khoi) {
+        setValues((current) => ({ ...current, lop_id: '', khoi: '' }));
       }
       return;
     }
@@ -119,17 +131,25 @@ export default function AccountFormModal({ isOpen, classes, availableGrades = DE
         setValues((current) => ({ ...current, lop_id: '' }));
       }
     }
-  }, [values.vai_tro, values.khoi, values.lop_id, filteredClasses]);
+  }, [values.vai_tro, values.khoi, values.lop_id, values.khoi_phu_trach.length, values.tat_ca_khoi, filteredClasses]);
 
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
+    if (isTeacher && !values.tat_ca_khoi && teacherManagedGrades.length === 0) {
+      setAssignmentError('Hãy chọn ít nhất một khối phụ trách hoặc chọn “Tất cả các khối”.');
+      return;
+    }
+    setAssignmentError('');
     const studentCode = values.ma_hoc_sinh.trim();
+    const primaryTeacherGrade = teacherManagedGrades[0] || '';
     const payload: AccountFormValues = {
       ...values,
       ten_dang_nhap: values.vai_tro === 'student' ? studentCode : values.ten_dang_nhap,
       mat_khau: values.vai_tro === 'student' && !initialData?.user_id ? studentCode : values.mat_khau,
       mat_khau_khoi_tao: values.vai_tro === 'student' && !initialData?.user_id ? studentCode : values.mat_khau_khoi_tao,
-      khoi: shouldSelectGrade ? values.khoi : '',
+      khoi: isStudent ? values.khoi : isTeacher ? primaryTeacherGrade : '',
+      khoi_phu_trach: isTeacher ? teacherManagedGrades : [],
+      tat_ca_khoi: isTeacher ? values.tat_ca_khoi : false,
       lop_id: shouldSelectClass ? values.lop_id : '',
       quyen_admin: canGrantAdminPermission ? values.quyen_admin : false,
     };
@@ -200,15 +220,23 @@ export default function AccountFormModal({ isOpen, classes, availableGrades = DE
 
                     <label className="space-y-2">
                       <span className="text-sm font-semibold text-slate-700">Tên đăng nhập</span>
-                      <input value={values.ten_dang_nhap} onChange={(e) => setValues((c) => ({ ...c, ten_dang_nhap: e.target.value }))} required disabled={isStudent} className={fieldClassName} placeholder={isStudent ? 'Tự động lấy theo mã học sinh' : 'Ví dụ: giaovien01'} />
-                      {isStudent && <span className="block text-xs text-indigo-600">Tên đăng nhập được đồng bộ tự động với mã học sinh.</span>}
+                      <input value={values.ten_dang_nhap} onChange={(e) => setValues((c) => ({ ...c, ten_dang_nhap: e.target.value }))} required disabled={isStudent || isEdit} className={fieldClassName} placeholder={isStudent ? 'Tự động lấy theo mã học sinh' : 'Ví dụ: giaovien01'} />
+                      {isStudent && <span className="block text-xs text-indigo-600">Tên đăng nhập được đồng bộ với mã học sinh và giữ cố định sau khi tạo.</span>}
                     </label>
 
                     <label className="space-y-2">
                       <span className="text-sm font-semibold text-slate-700">{isEdit ? 'Mật khẩu mới (để trống nếu giữ nguyên)' : 'Mật khẩu'}</span>
-                      <input type="password" minLength={6} value={values.mat_khau} onChange={(e) => setValues((c) => ({ ...c, mat_khau: e.target.value }))} required={!isEdit} disabled={isStudent} className={fieldClassName} placeholder={isStudent ? (isEdit ? 'Dùng chức năng reset tại danh sách' : 'Tự động lấy theo mã học sinh') : isEdit ? 'Nhập khi cần đổi mật khẩu' : 'Tối thiểu 6 ký tự'} />
+                      <input type="password" minLength={6} value={values.mat_khau} onChange={(e) => setValues((c) => ({ ...c, mat_khau: e.target.value }))} required={!isEdit} disabled={isStudent && !isEdit} className={fieldClassName} placeholder={isEdit ? 'Nhập khi cần đổi mật khẩu' : isStudent ? 'Tự động lấy theo mã học sinh' : 'Tối thiểu 6 ký tự'} />
                       {isStudent && <span className="block text-xs text-indigo-600">Mật khẩu ban đầu/reset mặc định là mã học sinh.</span>}
                     </label>
+
+                    {isEdit && values.mat_khau && <label className="space-y-2 md:col-span-2">
+                      <span className="text-sm font-semibold text-slate-700">Mật khẩu hiện tại của tài khoản đang sửa</span>
+                      <input type="password" autoComplete="off" value={values.current_password || ''}
+                        onChange={event => setValues(current => ({ ...current, current_password: event.target.value }))}
+                        className={fieldClassName} placeholder="Dùng để xác thực lần đổi mật khẩu này" />
+                      <span className="block text-xs text-slate-600">Không biết mật khẩu hiện tại thì không thể ép đổi mật khẩu Firebase trong mô hình này.</span>
+                    </label>}
 
                     <label className="space-y-2">
                       <span className="text-sm font-semibold text-slate-700">Vai trò</span>
@@ -255,40 +283,110 @@ export default function AccountFormModal({ isOpen, classes, availableGrades = DE
                   </section>
                 )}
 
-                <section className="app-modal-section">
-                  <div className="mb-4 flex items-start gap-3">
-                    <div className="mt-0.5 flex h-10 w-10 items-center justify-center rounded-2xl bg-indigo-100 text-indigo-600">
-                      <GraduationCap className="h-5 w-5" />
+                {(isStudent || isTeacher) && (
+                  <section className="app-modal-section">
+                    <div className="mb-4 flex items-start gap-3">
+                      <div className="mt-0.5 flex h-10 w-10 items-center justify-center rounded-2xl bg-indigo-100 text-indigo-600">
+                        {isTeacher ? <Layers3 className="h-5 w-5" /> : <GraduationCap className="h-5 w-5" />}
+                      </div>
+                      <div>
+                        <p className="app-modal-section-title">{isTeacher ? 'Phân công khối lớp phụ trách' : 'Phân quyền theo khối và lớp'}</p>
+                        <p className="app-modal-section-description">
+                          {isTeacher
+                            ? 'Giáo viên có thể được phân công một khối, nhiều khối hoặc toàn bộ các khối. Phạm vi này được dùng để giới hạn học sinh, bài học, kết quả và dữ liệu giáo viên được phép quản lý.'
+                            : 'Học sinh bắt buộc gắn với đúng một khối và một lớp học.'}
+                        </p>
+                      </div>
                     </div>
-                    <div>
-                      <p className="app-modal-section-title">Phân quyền theo khối và lớp</p>
-                      <p className="app-modal-section-description">Học sinh phải gắn với đúng lớp. Giáo viên chỉ cần khối phụ trách. Admin không bắt buộc chọn khối/lớp.</p>
-                    </div>
-                  </div>
-                  <div className="grid gap-4 md:grid-cols-2">
-                    <label className="space-y-2">
-                      <span className="text-sm font-semibold text-slate-700">Khối phụ trách</span>
-                      <select value={values.khoi} onChange={(e) => setValues((c) => ({ ...c, khoi: e.target.value }))} required={shouldSelectGrade} disabled={!shouldSelectGrade} className={fieldClassName}>
-                        <option value="">{shouldSelectGrade ? 'Chọn khối' : 'Không áp dụng cho admin'}</option>
-                        {gradeOptions.map((grade) => (
-                          <option key={grade} value={grade}>Khối {grade}</option>
-                        ))}
-                      </select>
-                      
-                    </label>
 
-                    <label className="space-y-2">
-                      <span className="text-sm font-semibold text-slate-700">Lớp học</span>
-                      <select value={values.lop_id} onChange={(e) => setValues((c) => ({ ...c, lop_id: e.target.value }))} required={shouldSelectClass} disabled={!shouldSelectClass || !values.khoi} className={fieldClassName}>
-                        <option value="">{shouldSelectClass ? (filteredClasses.length ? 'Chọn lớp' : 'Không có lớp phù hợp') : 'Chỉ áp dụng cho học sinh'}</option>
-                        {filteredClasses.map((item) => (
-                          <option key={item.lop_id} value={item.lop_id}>{item.ten_lop} • {item.lop_id}</option>
-                        ))}
-                      </select>
-                      
-                    </label>
-                  </div>
-                </section>
+                    {isTeacher ? (
+                      <div className="space-y-4">
+                        <label className={`flex cursor-pointer items-start gap-3 rounded-2xl border px-4 py-3.5 transition ${values.tat_ca_khoi ? 'border-indigo-300 bg-indigo-50 ring-2 ring-indigo-100' : 'border-slate-200 bg-white hover:border-indigo-200'}`}>
+                          <input
+                            type="checkbox"
+                            checked={values.tat_ca_khoi}
+                            onChange={(e) => {
+                              setAssignmentError('');
+                              setValues((current) => ({ ...current, tat_ca_khoi: e.target.checked }));
+                            }}
+                            className="mt-1 h-4 w-4 rounded border-indigo-300 text-indigo-600 focus:ring-indigo-500"
+                          />
+                          <span className="min-w-0">
+                            <span className="flex items-center gap-2 text-sm font-black text-slate-800">
+                              Tất cả các khối
+                              {values.tat_ca_khoi ? <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-indigo-600 text-white"><Check className="h-3.5 w-3.5" /></span> : null}
+                            </span>
+                            <span className="mt-1 block text-xs leading-5 text-slate-500">Giáo viên được quản lý dữ liệu của toàn bộ khối đang hoạt động trong trường.</span>
+                          </span>
+                        </label>
+
+                        <div>
+                          <div className="mb-2 flex items-center justify-between gap-3">
+                            <span className="text-sm font-semibold text-slate-700">Chọn các khối phụ trách</span>
+                            <span className="text-xs font-bold text-indigo-600">
+                              {values.tat_ca_khoi ? 'Tất cả khối' : teacherManagedGrades.length ? `${teacherManagedGrades.length} khối đã chọn` : 'Chưa chọn khối'}
+                            </span>
+                          </div>
+                          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                            {gradeOptions.map((grade) => {
+                              const checked = values.tat_ca_khoi || values.khoi_phu_trach.includes(grade);
+                              return (
+                                <label key={grade} className={`flex min-h-[52px] cursor-pointer items-center justify-center gap-2 rounded-2xl border px-3 py-3 text-sm font-black transition ${checked ? 'border-indigo-300 bg-indigo-50 text-indigo-700 shadow-sm' : 'border-slate-200 bg-white text-slate-600 hover:border-indigo-200'} ${values.tat_ca_khoi ? 'cursor-default opacity-80' : ''}`}>
+                                  <input
+                                    type="checkbox"
+                                    checked={checked}
+                                    disabled={values.tat_ca_khoi}
+                                    onChange={(e) => {
+                                      setAssignmentError('');
+                                      setValues((current) => ({
+                                        ...current,
+                                        khoi_phu_trach: e.target.checked
+                                          ? sortGrades([...current.khoi_phu_trach, grade])
+                                          : current.khoi_phu_trach.filter((item) => item !== grade),
+                                      }));
+                                    }}
+                                    className="h-4 w-4 rounded border-indigo-300 text-indigo-600 focus:ring-indigo-500"
+                                  />
+                                  Khối {grade}
+                                </label>
+                              );
+                            })}
+                          </div>
+                        </div>
+
+                        <div className={`rounded-2xl px-4 py-3 text-xs font-semibold ${assignmentError ? 'bg-rose-50 text-rose-700 ring-1 ring-rose-100' : 'bg-slate-50 text-slate-600 ring-1 ring-slate-100'}`}>
+                          {assignmentError || (values.tat_ca_khoi
+                            ? 'Phạm vi hiện tại: Tất cả các khối.'
+                            : teacherManagedGrades.length
+                              ? `Phạm vi hiện tại: ${teacherManagedGrades.map((grade) => `Khối ${grade}`).join(' • ')}.`
+                              : 'Chọn ít nhất một khối để giới hạn đúng phạm vi dữ liệu của giáo viên.')}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="grid gap-4 md:grid-cols-2">
+                        <label className="space-y-2">
+                          <span className="text-sm font-semibold text-slate-700">Khối học</span>
+                          <select value={values.khoi} onChange={(e) => setValues((c) => ({ ...c, khoi: e.target.value }))} required={shouldSelectGrade} className={fieldClassName}>
+                            <option value="">Chọn khối</option>
+                            {gradeOptions.map((grade) => (
+                              <option key={grade} value={grade}>Khối {grade}</option>
+                            ))}
+                          </select>
+                        </label>
+
+                        <label className="space-y-2">
+                          <span className="text-sm font-semibold text-slate-700">Lớp học</span>
+                          <select value={values.lop_id} onChange={(e) => setValues((c) => ({ ...c, lop_id: e.target.value }))} required={shouldSelectClass} disabled={!values.khoi} className={fieldClassName}>
+                            <option value="">{filteredClasses.length ? 'Chọn lớp' : 'Không có lớp phù hợp'}</option>
+                            {filteredClasses.map((item) => (
+                              <option key={item.lop_id} value={item.lop_id}>{item.ten_lop} • {item.lop_id}</option>
+                            ))}
+                          </select>
+                        </label>
+                      </div>
+                    )}
+                  </section>
+                )}
 
                 {isStudent && (
                   <section className="app-modal-section">
@@ -299,7 +397,7 @@ export default function AccountFormModal({ isOpen, classes, availableGrades = DE
                     <div className="grid gap-4 md:grid-cols-2">
                       <label className="space-y-2">
                         <span className="text-sm font-semibold text-slate-700">Mã học sinh vnEdu</span>
-                        <input value={values.ma_hoc_sinh} onChange={(e) => setValues((c) => ({ ...c, ma_hoc_sinh: e.target.value.replace(/\D/g, '') }))} required inputMode="numeric" pattern="[0-9]{6,}" minLength={6} className={fieldClassName} placeholder="Ví dụ: 2100175651" />
+                        <input disabled={isEdit} value={values.ma_hoc_sinh} onChange={(e) => setValues((c) => ({ ...c, ma_hoc_sinh: e.target.value.replace(/\D/g, '') }))} required inputMode="numeric" pattern="[0-9]{6,}" minLength={6} className={fieldClassName} placeholder="Ví dụ: 2100175651" />
                       </label>
                       <label className="space-y-2">
                         <span className="text-sm font-semibold text-slate-700">Ngày sinh</span>

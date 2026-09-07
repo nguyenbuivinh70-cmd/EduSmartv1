@@ -1,18 +1,44 @@
-# EduSmart V6.74.0
+# EduSmart V6.75.2
 
-## Mobile Lesson Viewer UX
+Mô hình Firebase Authentication + Firestore + Google Sheets + Apps Script như dự án ban đầu. Frontend React/Vite dùng trên Google AI Studio và Netlify.
 
-V6.74.0 nâng cấp mạnh giao diện **màn hình học bài trên điện thoại** để thao tác nhanh, ít che nội dung và phù hợp với iPhone/Android.
+## Chạy trên máy
 
-### Nâng cấp chính
-- **Cấu trúc bài học** trên mobile chuyển từ khối chiếm chỗ trong luồng nội dung sang **bottom-sheet drawer** mở/đóng theo nhu cầu.
-- Bổ sung thanh điều hướng cố định phía dưới: **Trước / Mục hiện tại / Sau**.
-- Header mobile gọn hơn, giữ tiêu đề bài, đồng hồ, menu và đóng bài với vùng chạm lớn.
-- Trợ lý AI trên mobile thu gọn thành nút nổi nhỏ và chuyển sang bên trái để tránh che nội dung/nút Netlify.
-- Tối ưu khoảng cách, cỡ chữ, card nội dung, nút hỏi AI và phần hướng dẫn hoàn thành mục học trên màn hình hẹp.
-- Bổ sung hỗ trợ `safe-area` cho iPhone có notch/home indicator.
-- Khi đang làm **kiểm tra cuối bài**, menu điều hướng mobile bị ẩn để tránh thoát khỏi bài kiểm tra.
-- Giữ nguyên toàn bộ logic tiến độ, điểm, câu hỏi, comment, AI và kiểm soát lịch học từ V6.73.5.
+Trong thư mục có package.json, dùng Node.js 24:
 
-### Backend
-Không thay đổi backend/schema trong V6.74.0. Tiếp tục sử dụng Firestore Rules V6.73.5, Code.gs V6.71.2 và DATA V4 V6.68.0.
+```sh
+npm ci
+npm run lint
+npm run build
+npm run dev
+```
+
+Bản build ở dist. Netlify dùng npm run build, publish dist (đã có netlify.toml).
+
+## Cấu hình
+
+Firebase project/school: hthtv1, giữ theo mã nguồn người dùng cung cấp.
+Firebase web config ở src/services/firebase.ts.
+BACKEND_URL ở src/constants.ts; dùng URL Web App kết thúc /exec.
+
+Triển khai đồng bộ Code.gs, appsscript.json, firestore.rules và frontend V6.75.2.
+Indexes đi kèm giữ cấu trúc V6.75.0; dùng Google Sheet hiện có, không nhập đè dữ liệu.
+Bản này bỏ yêu cầu liên kết dự án Google Cloud riêng, vai trò IAM, service account và Cloud Functions.
+Backend xác minh Firebase ID token của quản trị viên và truy cập dữ liệu theo Firestore Rules.
+Sheets/Drive dùng các dịch vụ Apps Script có sẵn và quyền Google thông thường của người triển khai.
+
+## Quản lý tài khoản
+
+Tạo mới: Firebase Auth REST bằng web API key, ghi hồ sơ Firestore.
+Sửa họ tên, lớp, khối, vai trò và khóa trong ứng dụng: Firestore.
+Tên đăng nhập/mã học sinh được giữ cố định sau khi tạo.
+Đổi/reset mật khẩu: xác thực mật khẩu hiện tại của tài khoản; không lưu mật khẩu nhập vào.
+Khi không nhập mật khẩu, backend có thể thử một lần giá trị cũ trong Sheet hoặc mã học sinh theo chính sách mật khẩu ban đầu. Sai mật khẩu thì dừng, không tạo lại danh tính và không báo thành công.
+Quên mật khẩu: chế độ này không có quyền ép reset Auth của người khác. Email định danh nội bộ không nhận được thư reset. Không xóa/tạo lại Auth để reset vì sẽ đổi UID và có thể mất liên kết học tập.
+Xóa: dùng xác thực hiện tại hoặc xóa Auth trong Firebase Console rồi xác nhận để dọn dữ liệu. Kết quả phân biệt xóa bằng API với xác nhận thủ công.
+Dữ liệu bài học, kết quả, nhóm và tham chiếu được dọn theo schema của bộ mã nguồn này. Tệp Drive được chuyển vào Thùng rác, chưa xóa vĩnh viễn.
+
+kiemTraCauHinhQuanTri trong trình soạn thảo kiểm tra Sheet/Drive; Firebase được ghi not_tested vì không có phiên đăng nhập web app trong trình soạn thảo.
+
+Đọc Huong_dan_trien_khai_EduSmart_V6.75.2.html trong bộ đầy đủ trước khi triển khai.
+36 ca kiểm thử backend/Rules đã đạt; TypeScript và build thành công. Chưa triển khai hoặc kiểm chứng trên dự án Google thực của người dùng.

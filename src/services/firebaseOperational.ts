@@ -1,5 +1,5 @@
 import { deleteDoc, deleteField, doc, getDoc, getDocs, collection, limit, onSnapshot, orderBy, query, runTransaction, serverTimestamp, setDoc, Timestamp, updateDoc, where, writeBatch } from 'firebase/firestore';
-import type { CollectionReference, DocumentData, DocumentReference, QueryDocumentSnapshot } from 'firebase/firestore';
+import type { CollectionReference, DocumentData, DocumentReference, QueryDocumentSnapshot, Transaction } from 'firebase/firestore';
 import type {
   Account,
   CoLearningSession,
@@ -19,6 +19,7 @@ import {
   loadValidatedCurrentFirebaseMember,
   firestoreDb,
 } from './firebase';
+import { getAllQueryDocs } from './firebaseQueries';
 import { resolveLessonSaveState } from '../utils/lessonWorkflow';
 import { buildLessonTitle, normalizeLessonName, normalizeLessonNumber, resolveLessonIdentity } from '../utils/lessonCatalog';
 import { getLessonScheduleAccess } from '../utils/lessonAccess';
@@ -34,10 +35,79 @@ let identityCache: { uid: string; expiresAt: number; value: any } | null = null;
 let identityPromise: { uid: string; value: Promise<any> } | null = null;
 let bootstrapCache: { uid: string; expiresAt: number; value: Record<string, any[]> } | null = null;
 let bootstrapPromise: { uid: string; value: Promise<Record<string, any[]>> } | null = null;
+let lessonPublishRulesVerifiedUid = '';
 
 function clean(value: unknown) { return value == null ? '' : String(value).trim(); }
 function cleanStringList(value: unknown) {
   return Array.isArray(value) ? value.map(clean).filter(Boolean) : [];
+}
+
+function cleanGradeScopes(value: unknown, fallbackGrade: unknown = '') {
+  const source = Array.isArray(value)
+    ? value
+    : clean(value).split(/[;,|\s]+/).filter(Boolean);
+  const grades = Array.from(new Set(source.map(clean).map((item) => item.replace(/\.0+$/, '')).filter(Boolean)))
+    .sort((a, b) => Number(a) - Number(b) || a.localeCompare(b, 'vi'));
+  const fallback = clean(fallbackGrade).replace(/\.0+$/, '');
+  if (!grades.length && fallback) grades.push(fallback);
+  return grades;
+}
+
+function teacherManagedGrades(member: any) {
+  return cleanGradeScopes(member?.gradeScopes ?? member?.khoi_phu_trach ?? member?.grade_scope, member?.grade);
+}
+
+function teacherManagesAllGrades(member: any) {
+  return member?.role === 'admin' || member?.adminPermission === true || member?.allGrades === true || clean(member?.tat_ca_khoi).toLowerCase() === 'true';
+}
+
+function teacherCanManageGrade(member: any, grade: unknown) {
+  if (!member || member.role !== 'teacher') return true;
+  if (teacherManagesAllGrades(member)) return true;
+  const normalizedGrade = clean(grade).replace(/\.0+$/, '');
+  if (!normalizedGrade) return true;
+  return teacherManagedGrades(member).includes(normalizedGrade);
+}
+
+function assertTeacherCanManageGrade(member: any, grade: unknown) {
+  if (!member || member.role !== 'teacher' || member.adminPermission === true) return;
+  if (!teacherCanManageGrade(member, grade)) {
+    const scope = teacherManagedGrades(member);
+    throw new Error(`Giáo viên chỉ được thao tác dữ liệu thuộc ${scope.length ? `khối ${scope.join(', ')}` : 'các khối đã được phân công'}.`);
+  }
+}
+
+const DEFAULT_SCHOOL_GRADES = ['6', '7', '8', '9'];
+
+/**
+ * Firestore Rules không phải bộ lọc. Vì vậy kể cả giáo viên có allGrades=true,
+ * các truy vấn dữ liệu theo học sinh/bài học/tiến độ vẫn phải mang điều kiện
+ * `grade/khoi == <khối>` để Rules chứng minh toàn bộ result set hợp lệ.
+ * Hàm này biến "Tất cả khối" thành danh sách khối thật của trường và chỉ dùng
+ * 6-9 làm fallback khi catalog chưa tải được.
+ */
+async function teacherQueryGrades(member: any) {
+  if (!member || member.role !== 'teacher' || member.adminPermission === true) return [];
+  if (!teacherManagesAllGrades(member)) return teacherManagedGrades(member);
+
+  const discovered = new Set<string>();
+  try {
+    const bootstrap = await getFirebaseBootstrap();
+    (bootstrap.classes || []).forEach((item: any) => {
+      const grade = clean(item?.khoi ?? item?.grade).replace(/\.0+$/, '');
+      if (grade) discovered.add(grade);
+    });
+    (bootstrap.subjects || []).forEach((item: any) => {
+      clean(item?.khoi_ap_dung ?? item?.grades).split(/[;,|\s]+/).filter(Boolean).forEach((raw) => {
+        const grade = clean(raw).replace(/\.0+$/, '');
+        if (grade) discovered.add(grade);
+      });
+    });
+  } catch {
+    // Catalog chỉ giúp khám phá khối. Query dữ liệu vẫn có fallback an toàn bên dưới.
+  }
+  const grades = Array.from(discovered).sort((a, b) => Number(a) - Number(b) || a.localeCompare(b, 'vi'));
+  return grades.length ? grades : DEFAULT_SCHOOL_GRADES;
 }
 
 function lessonScheduleTimestamp(value: unknown) {
@@ -93,15 +163,34 @@ function registryClassMap(data: any): Record<string, string> {
   return Object.fromEntries(Object.entries(data.classLessonIds).map(([key, value]) => [clean(key), clean(value)]).filter(([key, value]) => key && value));
 }
 
+function registryClassOwnerMap(data: any): Record<string, string> {
+  if (!data?.classOwnerUids || typeof data.classOwnerUids !== 'object' || Array.isArray(data.classOwnerUids)) return {};
+  return Object.fromEntries(Object.entries(data.classOwnerUids).map(([key, value]) => [clean(key), clean(value)]).filter(([key, value]) => key && value));
+}
+
+function registryLessonIds(data: any) {
+  return Array.from(new Set([
+    clean(data?.allLessonId),
+    ...Object.values(registryClassMap(data)).map(clean),
+  ].filter(Boolean)));
+}
+
 function removeLessonFromRegistry(data: any, lessonId: string) {
   const nextClassMap = registryClassMap(data);
+  const nextOwnerMap = registryClassOwnerMap(data);
   Object.keys(nextClassMap).forEach((classId) => {
-    if (clean(nextClassMap[classId]) === lessonId) delete nextClassMap[classId];
+    if (clean(nextClassMap[classId]) === lessonId) {
+      delete nextClassMap[classId];
+      delete nextOwnerMap[classId];
+    }
   });
+  const removeAll = clean(data?.allLessonId) === lessonId;
   return {
     ...data,
-    allLessonId: clean(data?.allLessonId) === lessonId ? '' : clean(data?.allLessonId),
+    allLessonId: removeAll ? '' : clean(data?.allLessonId),
+    allOwnerUid: removeAll ? '' : clean(data?.allOwnerUid),
     classLessonIds: nextClassMap,
+    classOwnerUids: nextOwnerMap,
   };
 }
 
@@ -117,6 +206,49 @@ function assertLessonNumberAvailable(registryData: any, lessonId: string, classI
   if (allLessonId || hasClassConflict) {
     throw new Error(`${title} đã tồn tại trong phạm vi khối/lớp đã chọn. Hãy chọn số bài khác hoặc chỉnh sửa bài hiện có.`);
   }
+}
+
+function registryConflictLessonIds(registryData: any, lessonId: string, classId: string) {
+  const normalized = removeLessonFromRegistry(registryData || {}, lessonId);
+  const classMap = registryClassMap(normalized);
+  return Array.from(new Set([
+    clean(normalized.allLessonId),
+    ...(classId ? [clean(classMap[classId])] : Object.values(classMap).map(clean)),
+  ].filter(Boolean)));
+}
+
+/**
+ * V6.75.2: registry cũ có thể còn trỏ tới lesson đã bị xóa từ các phiên bản trước.
+ * Khi reserve số bài, kiểm tra các lesson đang gây xung đột. Reference nào trỏ tới
+ * document không còn tồn tại sẽ được loại khỏi registry ngay trong cùng transaction;
+ * reference còn tồn tại vẫn được coi là xung đột hợp lệ.
+ */
+async function repairOrAssertLessonNumberAvailable(
+  transaction: Transaction,
+  registryData: any,
+  lessonId: string,
+  classId: string,
+  title: string,
+) {
+  let normalized = removeLessonFromRegistry(registryData || {}, lessonId);
+  const candidateIds = registryConflictLessonIds(normalized, lessonId, classId);
+  if (!candidateIds.length) return { registryData: normalized, removedOrphanIds: [] as string[] };
+
+  const snapshots = await Promise.all(candidateIds.map((candidateId) => transaction.get(doc(lessons(), candidateId))));
+  const orphanIds: string[] = [];
+  const liveIds: string[] = [];
+  snapshots.forEach((snapshot, index) => {
+    const candidateId = candidateIds[index];
+    if (snapshot.exists()) liveIds.push(candidateId);
+    else orphanIds.push(candidateId);
+  });
+
+  orphanIds.forEach((orphanId) => { normalized = removeLessonFromRegistry(normalized, orphanId); });
+  const remainingConflictIds = registryConflictLessonIds(normalized, lessonId, classId);
+  if (remainingConflictIds.length || liveIds.length) {
+    throw new Error(`${title} đã tồn tại trong phạm vi khối/lớp đã chọn. Hãy chọn số bài khác hoặc chỉnh sửa bài hiện có.`);
+  }
+  return { registryData: normalized, removedOrphanIds: orphanIds };
 }
 function memberAudienceKeys(member: any) {
   return Array.from(new Set([
@@ -185,6 +317,7 @@ export function clearFirebaseIdentityCache() {
   identityPromise = null;
   bootstrapCache = null;
   bootstrapPromise = null;
+  lessonPublishRulesVerifiedUid = '';
 }
 
 async function migrateLegacyLessonDocuments(items: Array<{ id: string; data: () => DocumentData }>) {
@@ -199,6 +332,10 @@ async function migrateLegacyLessonDocuments(items: Array<{ id: string; data: () 
         lesson_json: withoutUndefined(content),
         schoolId: FIREBASE_SCHOOL_ID,
         lessonId: item.id,
+        ownerUid: clean(current.createdByUid),
+        createdByUid: clean(current.createdByUid),
+        khoi: clean(current.khoi),
+        lop_id: clean(current.lop_id),
         schemaVersion: 2,
         updated_at: clean(current.updated_at) || new Date().toISOString(),
         updatedAt: serverTimestamp(),
@@ -253,19 +390,29 @@ function row(data: any, lessonId: string): LessonRow {
 
 export async function listFirebaseLessons(filters: Record<string, unknown> = {}) {
   const me = await identity();
-  const snapshots = me.role === 'admin' || me.adminPermission === true
-    ? [await getDocs(query(lessons(), orderBy('updated_at', 'desc'), limit(250)))]
-    : me.role === 'teacher'
-      ? await Promise.all([
-          getDocs(query(lessons(), where('pham_vi', '==', 'shared'), orderBy('updated_at', 'desc'), limit(120))),
-          getDocs(query(lessons(), where('createdByUid', '==', me.uid), orderBy('updated_at', 'desc'), limit(120))),
-        ])
-      : [await getDocs(query(
-          lessons(),
-          where('pham_vi', '==', 'shared'),
-          where('trang_thai', '==', 'approved_shared'),
-          limit(250),
-        ))];
+  let snapshots: Awaited<ReturnType<typeof getAllQueryDocs>>[] = [];
+
+  if (me.role === 'admin' || me.adminPermission === true) {
+    snapshots = [await getAllQueryDocs(query(lessons(), orderBy('updated_at', 'desc')))];
+  } else if (me.role === 'teacher') {
+    // V6.74.2: kể cả allGrades=true cũng query từng khối thật. Không query rộng
+    // toàn collection rồi lọc client, vì Firestore Rules không phải bộ lọc.
+    const grades = await teacherQueryGrades(me);
+    if (!grades.length) return [];
+
+    const buildTeacherQueries = (grade: string) => [
+      getAllQueryDocs(query(lessons(), where('khoi', '==', grade), where('pham_vi', '==', 'shared'))),
+      getAllQueryDocs(query(lessons(), where('khoi', '==', grade), where('createdByUid', '==', me.uid))),
+    ];
+
+    snapshots = await Promise.all(grades.flatMap(grade => buildTeacherQueries(grade)));
+  } else {
+    snapshots = [await getAllQueryDocs(query(
+      lessons(),
+      where('pham_vi', '==', 'shared'),
+      where('trang_thai', '==', 'approved_shared')
+    ))];
+  }
   if (me.role === 'admin' || me.adminPermission === true) {
     await migrateLegacyLessonDocuments(snapshots.flatMap(snapshot => snapshot.docs));
   }
@@ -280,8 +427,11 @@ export async function listFirebaseLessons(filters: Record<string, unknown> = {})
     if (filters.lop_id && item.lop_id !== clean(filters.lop_id)) return false;
     if (filters.khoi && item.khoi !== clean(filters.khoi)) return false;
     if (filters.nam_hoc && item.nam_hoc !== clean(filters.nam_hoc)) return false;
-    if (me.role === 'teacher' && item.pham_vi !== 'shared' && item.nguoi_tao_id !== clean(me.userId)) return false;
-    if (me.role === 'student' && !matchesMemberAudience(source, me)) return false;
+    if (me.role === 'teacher') {
+      if (!teacherCanManageGrade(me, item.khoi)) return false;
+      if (item.pham_vi !== 'shared' && item.nguoi_tao_id !== clean(me.userId)) return false;
+    }
+    if (me.role === 'student' && (source.content_status === 'preparing' || !matchesMemberAudience(source, me))) return false;
     return true;
   }).map(({ lesson }) => lesson)
     .sort((left, right) => clean(right.updated_at).localeCompare(clean(left.updated_at)));
@@ -313,6 +463,9 @@ export async function setFirebaseLessonLock(lessonId: string, locked: boolean) {
   const snap = await getDoc(target);
   if (!snap.exists()) throw new Error('Không tìm thấy bài học cần cập nhật.');
   const current = snap.data() as any;
+  if (me.role === 'teacher' && me.adminPermission !== true) {
+    assertTeacherCanManageGrade(me, current.khoi);
+  }
   const isOwnerTeacher = me.role === 'teacher' && clean(current.createdByUid) === clean(me.uid);
   if (!(me.role === 'admin' || me.adminPermission === true || isOwnerTeacher)) {
     throw new Error('Bạn không có quyền khóa hoặc mở khóa bài học này.');
@@ -338,8 +491,210 @@ export function subscribeFirebaseLessonAccess(
   });
 }
 
+type LessonPublishStage = 'PUBLISH_PREFLIGHT' | 'REGISTRY_RESERVE' | 'LESSON_CREATE' | 'CONTENT_CREATE' | 'PUBLISH_RUNTIME' | 'REGISTRY_ROLLBACK' | 'LESSON_UPDATE';
+
+const LESSON_PUBLISH_STAGE_LABELS: Record<LessonPublishStage, string> = {
+  PUBLISH_PREFLIGHT: 'Kiểm tra quyền xuất bản',
+  REGISTRY_RESERVE: 'Kiểm tra và giữ số bài',
+  LESSON_CREATE: 'Tạo thông tin bài học',
+  CONTENT_CREATE: 'Tạo nội dung bài học',
+  PUBLISH_RUNTIME: 'Xử lý quy trình xuất bản',
+  REGISTRY_ROLLBACK: 'Khôi phục dữ liệu xuất bản',
+  LESSON_UPDATE: 'Cập nhật bài học',
+};
+
+function lessonPublishStageError(stage: LessonPublishStage, error: unknown) {
+  const existingStage = clean((error as any)?.stage) as LessonPublishStage;
+  if (existingStage && LESSON_PUBLISH_STAGE_LABELS[existingStage] && error instanceof Error) return error;
+  const detail = firebaseErrorMessage(error);
+  const message = `${LESSON_PUBLISH_STAGE_LABELS[stage]} không thành công. ${detail} [${stage}]`;
+  const wrapped = new Error(message);
+  (wrapped as any).stage = stage;
+  (wrapped as any).cause = error;
+  return wrapped;
+}
+
+function lessonPublishErrorWithRollback(error: unknown, rollbackMessages: string[]) {
+  const original = error instanceof Error
+    ? error
+    : lessonPublishStageError('PUBLISH_RUNTIME', error);
+  if (!rollbackMessages.length) return original;
+  const stage = clean((original as any)?.stage) || 'PUBLISH_RUNTIME';
+  const wrapped = new Error(`${original.message} Rollback chưa hoàn tất: ${rollbackMessages.join('; ')}. [REGISTRY_ROLLBACK]`);
+  (wrapped as any).stage = stage;
+  (wrapped as any).rollbackStage = 'REGISTRY_ROLLBACK';
+  (wrapped as any).cause = original;
+  return wrapped;
+}
+
+async function verifyLessonPublishRulesCapability(uid: string) {
+  const normalizedUid = clean(uid);
+  if (!normalizedUid) throw new Error('Không xác định được Firebase UID để kiểm tra quyền xuất bản.');
+  if (lessonPublishRulesVerifiedUid === normalizedUid) return;
+
+  const probeRef = doc(school(), 'rulesProbes', normalizedUid);
+  try {
+    await setDoc(probeRef, {
+      schoolId: FIREBASE_SCHOOL_ID,
+      ownerUid: normalizedUid,
+      rulesVersion: '6.75.2',
+      purpose: 'lesson-publish-probe',
+      updatedAt: serverTimestamp(),
+    }, { merge: false });
+    await deleteDoc(probeRef);
+    lessonPublishRulesVerifiedUid = normalizedUid;
+  } catch (error) {
+    throw new Error(`Chưa xác minh được Firestore Rules V6.75.2 trên project ${FIREBASE_SCHOOL_ID}. Hãy deploy file firestore.rules của bộ V6.75.2 trước khi xuất bản bài học. ${firebaseErrorMessage(error)}`);
+  }
+}
+
+async function freshLessonPublishIdentity(grade: unknown) {
+  try {
+    const current = firebaseAuth.currentUser;
+    if (!current) throw new Error('Bạn cần đăng nhập Firebase để xuất bản bài học.');
+    // V6.75.2: luôn đọc lại member thật trước thao tác xuất bản, không dùng cache 5 phút.
+    const member = await loadValidatedCurrentFirebaseMember();
+    identityCache = { uid: current.uid, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS, value: member };
+    if (member.role !== 'admin' && member.role !== 'teacher') {
+      throw new Error('Tài khoản hiện tại không có quyền tạo hoặc xuất bản bài học.');
+    }
+    assertTeacherCanManageGrade(member, grade);
+    await verifyLessonPublishRulesCapability(current.uid);
+    return member;
+  } catch (error) {
+    throw lessonPublishStageError('PUBLISH_PREFLIGHT', error);
+  }
+}
+
+function buildLessonRegistryDocument(
+  registryData: any,
+  lessonId: string,
+  payload: LessonComposerValues,
+  registryKey: string,
+  lessonNumber: number,
+  uid: string,
+  now: string,
+) {
+  const nextRegistry = removeLessonFromRegistry(registryData || {}, lessonId);
+  const classMap = registryClassMap(nextRegistry);
+  const classOwnerMap = registryClassOwnerMap(nextRegistry);
+  const classId = clean(payload.lop_id);
+  if (classId) {
+    classMap[classId] = lessonId;
+    classOwnerMap[classId] = uid;
+  }
+  return withoutUndefined({
+    schoolId: FIREBASE_SCHOOL_ID,
+    schemaVersion: 2,
+    registryKey,
+    lessonNumber,
+    subjectId: clean(payload.mon_id),
+    grade: clean(payload.khoi),
+    academicYear: clean(payload.nam_hoc),
+    semester: clean(payload.hoc_ky || 'HK1'),
+    allLessonId: classId ? clean(nextRegistry.allLessonId) : lessonId,
+    allOwnerUid: classId ? clean(nextRegistry.allOwnerUid) : uid,
+    classLessonIds: classId ? classMap : {},
+    classOwnerUids: classId ? classOwnerMap : {},
+    updatedByUid: uid,
+    updated_at: now,
+    updatedAt: serverTimestamp(),
+  });
+}
+
+function buildLessonContentDocument(
+  lessonId: string,
+  lessonJson: any,
+  payload: LessonComposerValues,
+  ownerUid: string,
+  now: string,
+) {
+  return withoutUndefined({
+    lesson_json: lessonJson,
+    schoolId: FIREBASE_SCHOOL_ID,
+    lessonId,
+    ownerUid,
+    createdByUid: ownerUid,
+    khoi: clean(payload.khoi),
+    lop_id: clean(payload.lop_id),
+    schemaVersion: 2,
+    updated_at: now,
+    updatedAt: serverTimestamp(),
+  });
+}
+
+function assertCanonicalLessonMetadataForWrite(data: any, lessonId: string, expectedOwnerUid: string) {
+  const problems: string[] = [];
+  const lessonNumber = Number(data?.lesson_number);
+  if (clean(data?.lesson_id) !== clean(lessonId)) problems.push('lesson_id không khớp document path');
+  if (clean(data?.schoolId) !== FIREBASE_SCHOOL_ID) problems.push(`schoolId phải là ${FIREBASE_SCHOOL_ID}`);
+  if (Number(data?.schemaVersion) !== 2) problems.push('schemaVersion phải bằng 2');
+  if (clean(data?.createdByUid) !== clean(expectedOwnerUid)) problems.push('createdByUid không khớp Firebase UID của người tạo');
+  if (!Number.isInteger(lessonNumber) || lessonNumber < 1 || lessonNumber > 999) problems.push('lesson_number phải là số nguyên từ 1 đến 999');
+  if (!clean(data?.lesson_name)) problems.push('lesson_name bị trống');
+  if (!clean(data?.lesson_key)) problems.push('lesson_key bị trống');
+  if (!clean(data?.tieu_de)) problems.push('tieu_de bị trống');
+  if (!clean(data?.mon_id)) problems.push('mon_id bị trống');
+  if (!clean(data?.khoi)) problems.push('khoi bị trống');
+  if (!clean(data?.nam_hoc)) problems.push('nam_hoc bị trống');
+  if (!clean(data?.hoc_ky)) problems.push('hoc_ky bị trống');
+  if (data?.arena_question_count !== undefined) {
+    const count = Number(data.arena_question_count);
+    if (!Number.isFinite(count) || count < 0 || count > 5000) problems.push('arena_question_count không hợp lệ');
+  }
+  if (data?.arena_ready !== undefined && typeof data.arena_ready !== 'boolean') problems.push('arena_ready phải là boolean');
+
+  if (problems.length) {
+    const error = new Error(`Thông tin bài học chưa đạt chuẩn trước khi ghi Firestore: ${problems.join('; ')}.`);
+    (error as any).stage = 'LESSON_CREATE';
+    throw error;
+  }
+}
+
+function lessonCreateSecurityDiagnostic(data: any, me: any, lessonId: string) {
+  return {
+    lessonId,
+    authenticatedUid: clean(firebaseAuth.currentUser?.uid),
+    memberUid: clean(me?.uid),
+    memberAuthUid: clean(me?.authUid),
+    memberRole: clean(me?.role),
+    memberStatus: clean(me?.status),
+    memberSchoolId: clean(me?.schoolId),
+    adminPermission: me?.adminPermission === true,
+    allGrades: me?.allGrades === true,
+    gradeScopes: Array.isArray(me?.gradeScopes) ? me.gradeScopes.map(clean) : [],
+    lessonSchoolId: clean(data?.schoolId),
+    lessonCreatedByUid: clean(data?.createdByUid),
+    lessonGrade: clean(data?.khoi),
+    lessonNumber: data?.lesson_number,
+    lessonNumberType: typeof data?.lesson_number,
+    lessonIdField: clean(data?.lesson_id),
+    schemaVersion: data?.schemaVersion,
+    monId: clean(data?.mon_id),
+    academicYear: clean(data?.nam_hoc),
+    semester: clean(data?.hoc_ky),
+  };
+}
+
+async function rollbackLessonRegistryReservation(registryRef: DocumentReference<DocumentData>, lessonId: string) {
+  await runTransaction(firestoreDb, async (transaction) => {
+    const snapshot = await transaction.get(registryRef);
+    if (!snapshot.exists()) return;
+    const cleaned = removeLessonFromRegistry(snapshot.data(), lessonId);
+    if (registryHasAnyLesson(cleaned)) {
+      transaction.set(registryRef, {
+        ...cleaned,
+        updatedByUid: firebaseAuth.currentUser?.uid,
+        updated_at: new Date().toISOString(),
+        updatedAt: serverTimestamp(),
+      }, { merge: false });
+    } else {
+      transaction.delete(registryRef);
+    }
+  });
+}
+
 export async function saveFirebaseLesson(payload: LessonComposerValues, updating = false) {
-  const me = await identity();
   const lessonId = clean(payload.lesson_id) || id('LESSON');
   const target = doc(lessons(), lessonId);
   const lessonNumber = normalizeLessonNumber(payload.lesson_number);
@@ -358,6 +713,8 @@ export async function saveFirebaseLesson(payload: LessonComposerValues, updating
     khoi: clean(payload.khoi),
     lop_id: clean(payload.lop_id),
   };
+
+  const me = await freshLessonPublishIdentity(normalizedPayload.khoi);
   const registryKey = lessonRegistryKey(normalizedPayload);
   if (!registryKey) throw new Error('Không thể xác định khóa danh mục bài học. Hãy kiểm tra lại môn, khối, năm học và bài số.');
   const registryRef = doc(school(), 'lessonNumberRegistry', registryKey);
@@ -382,23 +739,7 @@ export async function saveFirebaseLesson(payload: LessonComposerValues, updating
   const arenaQuestionCount = lessonJson ? (Array.isArray(lessonJson?.luyen_tap?.trac_nghiem) ? lessonJson.luyen_tap.trac_nghiem.length : 0) : undefined;
   const arenaReady = arenaQuestionCount === undefined ? undefined : arenaQuestionCount > 0;
 
-  return runTransaction(firestoreDb, async (transaction) => {
-    const existing = await transaction.get(target);
-    if (updating && !existing.exists()) return null;
-
-    const existingData = existing.exists() ? existing.data() as any : null;
-    const oldRegistryKey = existingData ? (clean(existingData.lesson_key) || lessonRegistryKey(existingData)) : '';
-    const oldRegistryRef = oldRegistryKey && oldRegistryKey !== registryKey
-      ? doc(school(), 'lessonNumberRegistry', oldRegistryKey)
-      : null;
-
-    // Tất cả thao tác đọc của transaction phải hoàn tất trước khi ghi.
-    const registrySnap = await transaction.get(registryRef);
-    const oldRegistrySnap = oldRegistryRef ? await transaction.get(oldRegistryRef) : null;
-    const registryData = registrySnap.exists() ? registrySnap.data() as any : {};
-
-    assertLessonNumberAvailable(registryData, lessonId, clean(normalizedPayload.lop_id), normalizedPayload.tieu_de);
-
+  const createMetadata = (existingData: any = null) => {
     const saveMode = normalizedPayload.save_mode || '';
     const existingStatus = existingData ? clean(existingData.trang_thai) : '';
     const saveState = resolveLessonSaveState({
@@ -441,55 +782,171 @@ export async function saveFirebaseLesson(payload: LessonComposerValues, updating
       access_start_at: lessonScheduleTimestamp(normalizedPayload.thoi_gian_bat_dau),
       access_end_at: lessonScheduleTimestamp(normalizedPayload.thoi_gian_ket_thuc),
       contentPath: `lessons/${lessonId}/content/main`,
+      content_status: existingData ? (existingData.content_status || 'ready') : 'preparing',
       created_at: existingData ? clean(existingData.created_at) : now,
       updated_at: now,
       updatedAt: serverTimestamp(),
     });
     assertSafeDocument(data, 'Thông tin bài học', 200 * 1024);
+    return data;
+  };
 
-    // Nếu sửa bài làm thay đổi môn/khối/bài số/năm học/học kỳ, giải phóng registry cũ.
-    if (oldRegistryRef && oldRegistrySnap?.exists()) {
-      const cleanedOld = removeLessonFromRegistry(oldRegistrySnap.data(), lessonId);
-      if (registryHasAnyLesson(cleanedOld)) {
-        transaction.set(oldRegistryRef, { ...cleanedOld, updated_at: now, updatedAt: serverTimestamp() }, { merge: true });
+  // UPDATE: giữ transaction nguyên tử vì parent lesson đã tồn tại và Rules có thể
+  // đối chiếu ownership trực tiếp. V6.75.2 vẫn ghi metadata bảo mật vào content.
+  if (updating) {
+    try {
+      return await runTransaction(firestoreDb, async (transaction) => {
+        const existing = await transaction.get(target);
+        if (!existing.exists()) return null;
+        const existingData = existing.data() as any;
+        assertTeacherCanManageGrade(me, existingData.khoi);
+        const oldRegistryKey = clean(existingData.lesson_key) || lessonRegistryKey(existingData);
+        const oldRegistryRef = oldRegistryKey && oldRegistryKey !== registryKey
+          ? doc(school(), 'lessonNumberRegistry', oldRegistryKey)
+          : null;
+
+        const registrySnap = await transaction.get(registryRef);
+        const oldRegistrySnap = oldRegistryRef ? await transaction.get(oldRegistryRef) : null;
+        const registryData = registrySnap.exists() ? registrySnap.data() as any : {};
+        const registryCheck = await repairOrAssertLessonNumberAvailable(
+          transaction,
+          registryData,
+          lessonId,
+          clean(normalizedPayload.lop_id),
+          normalizedPayload.tieu_de,
+        );
+
+        const data = createMetadata(existingData);
+        assertCanonicalLessonMetadataForWrite(data, lessonId, clean(existingData.createdByUid) || me.uid);
+        if (oldRegistryRef && oldRegistrySnap?.exists()) {
+          const cleanedOld = removeLessonFromRegistry(oldRegistrySnap.data(), lessonId);
+          if (registryHasAnyLesson(cleanedOld)) {
+            transaction.set(oldRegistryRef, { ...cleanedOld, updatedByUid: me.uid, updated_at: now, updatedAt: serverTimestamp() }, { merge: false });
+          } else {
+            transaction.delete(oldRegistryRef);
+          }
+        }
+
+        transaction.set(
+          registryRef,
+          buildLessonRegistryDocument(registryCheck.registryData, lessonId, normalizedPayload, registryKey, lessonNumber, me.uid, now),
+          { merge: false },
+        );
+        transaction.set(target, { ...data, lesson_json: deleteField() }, { merge: true });
+        transaction.set(
+          lessonContentRef(lessonId),
+          buildLessonContentDocument(lessonId, withoutUndefined(lessonJson), normalizedPayload, clean(existingData.createdByUid) || me.uid, now),
+          { merge: true },
+        );
+        return row(data, lessonId);
+      });
+    } catch (error) {
+      throw lessonPublishStageError('LESSON_UPDATE', error);
+    }
+  }
+
+  // V6.75.2: reserve + metadata are atomic. A concurrent publisher never sees
+  // a live reservation whose parent is missing. Content still reads an existing parent.
+  let registryReserved = false;
+  let lessonMetadataCreated = false;
+  let lessonContentCreated = false;
+  let metadataData: any = null;
+  let currentStage: LessonPublishStage = 'REGISTRY_RESERVE';
+
+  try {
+    try {
+      currentStage = 'REGISTRY_RESERVE';
+      await runTransaction(firestoreDb, async (transaction) => {
+        const registrySnap = await transaction.get(registryRef);
+        const registryData = registrySnap.exists() ? registrySnap.data() as any : {};
+        const registryCheck = await repairOrAssertLessonNumberAvailable(
+          transaction,
+          registryData,
+          lessonId,
+          clean(normalizedPayload.lop_id),
+          normalizedPayload.tieu_de,
+        );
+        transaction.set(
+          registryRef,
+          buildLessonRegistryDocument(registryCheck.registryData, lessonId, normalizedPayload, registryKey, lessonNumber, me.uid, now),
+          { merge: false },
+        );
+        metadataData = createMetadata(null);
+        assertCanonicalLessonMetadataForWrite(metadataData, lessonId, me.uid);
+        transaction.set(target, metadataData);
+      });
+      registryReserved = true;
+      lessonMetadataCreated = true;
+    } catch (error) {
+      throw lessonPublishStageError('REGISTRY_RESERVE', error);
+    }
+
+    try {
+      currentStage = 'CONTENT_CREATE';
+      const contentData = buildLessonContentDocument(lessonId, withoutUndefined(lessonJson), normalizedPayload, me.uid, now);
+      await setDoc(lessonContentRef(lessonId), contentData);
+      lessonContentCreated = true;
+      await updateDoc(target, { content_status: 'ready', updatedAt: serverTimestamp() });
+      metadataData.content_status = 'ready';
+    } catch (error) {
+      throw lessonPublishStageError('CONTENT_CREATE', error);
+    }
+
+    return row(metadataData, lessonId);
+  } catch (error) {
+    const rollbackMessages: string[] = [];
+    const originalError = clean((error as any)?.stage)
+      ? error
+      : lessonPublishStageError('PUBLISH_RUNTIME', error || new Error(`Lỗi không xác định tại ${currentStage}.`));
+
+    // V6.75.2: rollback không được phép che mất lỗi gốc. Theo dõi riêng metadata/content
+    // đã tạo để dọn theo đúng trạng thái thực của pipeline.
+    if (lessonMetadataCreated) {
+      if (lessonContentCreated) {
+        try {
+          await deleteDoc(lessonContentRef(lessonId));
+          lessonContentCreated = false;
+        } catch (rollbackError) {
+          rollbackMessages.push(`không xóa được nội dung bài dở dang: ${firebaseErrorMessage(rollbackError)}`);
+        }
       } else {
-        transaction.delete(oldRegistryRef);
+        // setDoc(content) có thể thất bại sau khi request đã rời client; thử dọn best-effort
+        // nhưng không xem việc document không tồn tại là lỗi rollback nghiêm trọng.
+        try {
+          await deleteDoc(lessonContentRef(lessonId));
+        } catch {
+          // Không làm mất lỗi gốc chỉ vì bước dọn content best-effort thất bại.
+        }
+      }
+
+      try {
+        await deleteDoc(target);
+        lessonMetadataCreated = false;
+      } catch (rollbackError) {
+        rollbackMessages.push(`không xóa được thông tin bài dở dang: ${firebaseErrorMessage(rollbackError)}`);
       }
     }
 
-    const nextRegistry = removeLessonFromRegistry(registryData, lessonId);
-    const classMap = registryClassMap(nextRegistry);
-    if (clean(normalizedPayload.lop_id)) classMap[clean(normalizedPayload.lop_id)] = lessonId;
-    const registryDocument = withoutUndefined({
-      schoolId: FIREBASE_SCHOOL_ID,
-      schemaVersion: 1,
-      registryKey,
-      lessonNumber,
-      subjectId: clean(normalizedPayload.mon_id),
-      grade: clean(normalizedPayload.khoi),
-      academicYear: clean(normalizedPayload.nam_hoc),
-      semester: clean(normalizedPayload.hoc_ky || 'HK1'),
-      allLessonId: clean(normalizedPayload.lop_id) ? clean(nextRegistry.allLessonId) : lessonId,
-      classLessonIds: clean(normalizedPayload.lop_id) ? classMap : {},
-      updatedByUid: me.uid,
-      updated_at: now,
-      updatedAt: serverTimestamp(),
-    });
-    transaction.set(registryRef, registryDocument, { merge: false });
+    if (registryReserved) {
+      try {
+        await rollbackLessonRegistryReservation(registryRef, lessonId);
+        registryReserved = false;
+      } catch (rollbackError) {
+        rollbackMessages.push(`không khôi phục được danh mục số bài: ${firebaseErrorMessage(rollbackError)}`);
+      }
+    }
 
-    if (existing.exists()) transaction.set(target, { ...data, lesson_json: deleteField() }, { merge: true });
-    else transaction.set(target, data);
-    transaction.set(lessonContentRef(lessonId), {
-      lesson_json: withoutUndefined(lessonJson),
-      schoolId: FIREBASE_SCHOOL_ID,
+    console.error('[EduSmart][LessonPublish]', {
       lessonId,
-      schemaVersion: 2,
-      updated_at: now,
-      updatedAt: serverTimestamp(),
+      currentStage,
+      registryReserved,
+      lessonMetadataCreated,
+      lessonContentCreated,
+      rollbackMessages,
+      error: originalError,
     });
-
-    return row(data, lessonId);
-  });
+    throw lessonPublishErrorWithRollback(originalError, rollbackMessages);
+  }
 }
 
 type LessonCascadeDeleteSummary = {
@@ -509,6 +966,111 @@ type LessonCascadeDeleteSummary = {
     reviewContents: number;
   };
 };
+
+export type LessonIntegrityRepairSummary = {
+  scanned_registries: number;
+  repaired_registries: number;
+  deleted_empty_registries: number;
+  removed_orphan_references: number;
+  normalized_registries: number;
+  orphan_lesson_ids: string[];
+};
+
+function normalizeRegistryForWrite(data: any, uid: string, fallbackGrade = '') {
+  const directLessonNumber = Number(data?.lessonNumber || 0);
+  const keyMatch = clean(data?.registryKey).match(/__n(\d+)$/i);
+  const keyLessonNumber = keyMatch ? Number(keyMatch[1]) : 0;
+  const lessonNumber = Number.isInteger(directLessonNumber) && directLessonNumber > 0
+    ? directLessonNumber
+    : (Number.isInteger(keyLessonNumber) && keyLessonNumber > 0 ? keyLessonNumber : 1);
+  return withoutUndefined({
+    ...data,
+    schoolId: FIREBASE_SCHOOL_ID,
+    schemaVersion: 2,
+    grade: clean(data?.grade) || clean(fallbackGrade),
+    lessonNumber,
+    allOwnerUid: clean(data?.allOwnerUid),
+    classOwnerUids: registryClassOwnerMap(data),
+    updatedByUid: uid,
+    updated_at: new Date().toISOString(),
+    updatedAt: serverTimestamp(),
+  });
+}
+
+/**
+ * V6.75.2: công cụ Admin dọn registry mồ côi từ các phiên bản cũ.
+ * Chỉ loại reference trỏ tới lesson không còn tồn tại; registry còn reference
+ * hợp lệ được giữ lại và chuẩn hóa schemaVersion=2/owner metadata khi có thể.
+ */
+export async function repairFirebaseLessonIntegrity(): Promise<LessonIntegrityRepairSummary> {
+  const me = await identity();
+  if (me.role !== 'admin' && me.adminPermission !== true) {
+    throw new Error('Chỉ quản trị viên mới được chạy công cụ kiểm tra và sửa dữ liệu bài học toàn trường.');
+  }
+
+  const registrySnap = await getDocs(namedCollection('lessonNumberRegistry'));
+  const summary: LessonIntegrityRepairSummary = {
+    scanned_registries: registrySnap.size,
+    repaired_registries: 0,
+    deleted_empty_registries: 0,
+    removed_orphan_references: 0,
+    normalized_registries: 0,
+    orphan_lesson_ids: [],
+  };
+
+  for (const registryDoc of registrySnap.docs) {
+    const original = registryDoc.data() as any;
+    const ids = registryLessonIds(original);
+    if (!ids.length) {
+      await deleteDoc(registryDoc.ref);
+      summary.deleted_empty_registries += 1;
+      summary.repaired_registries += 1;
+      continue;
+    }
+
+    const lessonSnaps = await Promise.all(ids.map((lessonId) => getDoc(doc(lessons(), lessonId))));
+    const liveById = new Map<string, any>();
+    lessonSnaps.forEach((snapshot, index) => {
+      if (snapshot.exists()) liveById.set(ids[index], snapshot.data());
+    });
+    const orphanIds = ids.filter((lessonId) => !liveById.has(lessonId));
+    let cleaned = original;
+    orphanIds.forEach((lessonId) => { cleaned = removeLessonFromRegistry(cleaned, lessonId); });
+
+    // Bổ sung owner metadata cho các reference còn sống để registry mới tự mô tả rõ ownership.
+    const classMap = registryClassMap(cleaned);
+    const ownerMap = registryClassOwnerMap(cleaned);
+    Object.entries(classMap).forEach(([classId, linkedLessonId]) => {
+      const live = liveById.get(clean(linkedLessonId));
+      if (live?.createdByUid) ownerMap[classId] = clean(live.createdByUid);
+    });
+    const allLessonId = clean(cleaned.allLessonId);
+    const allOwnerUid = allLessonId ? clean(liveById.get(allLessonId)?.createdByUid || cleaned.allOwnerUid) : '';
+    cleaned = { ...cleaned, classOwnerUids: ownerMap, allOwnerUid };
+
+    summary.removed_orphan_references += orphanIds.length;
+    summary.orphan_lesson_ids.push(...orphanIds);
+
+    if (!registryHasAnyLesson(cleaned)) {
+      await deleteDoc(registryDoc.ref);
+      summary.deleted_empty_registries += 1;
+      summary.repaired_registries += 1;
+      continue;
+    }
+
+    const needsNormalization = Number(original.schemaVersion || 0) !== 2
+      || clean(original.allOwnerUid) !== allOwnerUid
+      || JSON.stringify(registryClassOwnerMap(original)) !== JSON.stringify(ownerMap);
+    if (orphanIds.length || needsNormalization) {
+      await setDoc(registryDoc.ref, normalizeRegistryForWrite(cleaned, me.uid, clean(cleaned.grade)), { merge: false });
+      summary.repaired_registries += 1;
+      if (needsNormalization) summary.normalized_registries += 1;
+    }
+  }
+
+  summary.orphan_lesson_ids = Array.from(new Set(summary.orphan_lesson_ids));
+  return summary;
+}
 
 function reviewReferencesLesson(data: any, lessonId: string) {
   const raw = data?.lesson_ids;
@@ -544,8 +1106,15 @@ export async function deleteFirebaseLesson(lessonId: string): Promise<LessonCasc
   const lessonData = lessonExists ? lessonSnap.data() as any : null;
   const isAdminUser = me.role === 'admin' || me.adminPermission === true;
 
-  // Giáo viên chỉ có thể cascade khi bài học vẫn tồn tại và thuộc quyền sở hữu.
+  // Giáo viên chỉ cascade bài thật sự còn tồn tại và do chính mình tạo.
+  // Registry mồ côi lịch sử được xử lý tự động khi reserve hoặc bằng công cụ repair Admin.
   if (!lessonExists && !isAdminUser) return false;
+  if (lessonExists && me.role === 'teacher' && me.adminPermission !== true) {
+    assertTeacherCanManageGrade(me, lessonData?.khoi);
+    if (clean(lessonData?.createdByUid) !== clean(me.uid)) {
+      throw new Error('Bạn chỉ được xóa bài học do chính mình tạo.');
+    }
+  }
 
   const deletedCounts: LessonCascadeDeleteSummary['deleted_counts'] = {
     lesson: 0,
@@ -561,13 +1130,19 @@ export async function deleteFirebaseLesson(lessonId: string): Promise<LessonCasc
     reviewContents: 0,
   };
 
-  // Thu thập các dependency trực tiếp. Các truy vấn chỉ dùng một field để
-  // không phát sinh composite index mới.
-  const [progressSnap, resultActionSnap, commentSnap, coLearningSnap] = await Promise.all([
-    getDocs(query(namedCollection('learningProgress'), where('lesson_id', '==', normalizedLessonId))),
-    getDocs(query(namedCollection('learningResultActions'), where('lesson_id', '==', normalizedLessonId))),
+  const lessonGrade = clean(lessonData?.khoi);
+  const progressQuery = !isAdminUser && me.role === 'teacher'
+    ? query(namedCollection('learningProgress'), where('lesson_id', '==', normalizedLessonId), where('khoi', '==', lessonGrade))
+    : query(namedCollection('learningProgress'), where('lesson_id', '==', normalizedLessonId));
+  const resultActionQuery = !isAdminUser && me.role === 'teacher'
+    ? query(namedCollection('learningResultActions'), where('lesson_id', '==', normalizedLessonId), where('khoi', '==', lessonGrade))
+    : query(namedCollection('learningResultActions'), where('lesson_id', '==', normalizedLessonId));
+  const [progressSnap, resultActionSnap, commentSnap, coLearningSnap, consentSnap] = await Promise.all([
+    getDocs(progressQuery),
+    getDocs(resultActionQuery),
     getDocs(query(namedCollection('lessonComments'), where('lesson_id', '==', normalizedLessonId))),
     getDocs(query(namedCollection('coLearningSessions'), where('lesson_id', '==', normalizedLessonId))),
+    getDocs(query(namedCollection('coLearningConsents'), where('lessonId', '==', normalizedLessonId))),
   ]);
 
   const promptSnap = isAdminUser
@@ -575,14 +1150,17 @@ export async function deleteFirebaseLesson(lessonId: string): Promise<LessonCasc
     : await getDocs(query(namedCollection('slidesPrompts'), where('ownerUid', '==', me.uid)));
   const promptDocs = promptSnap.docs.filter(item => clean(item.data().lesson_id) === normalizedLessonId);
 
-  // Bài ôn tập là dữ liệu dẫn xuất từ câu hỏi của bài học. Nếu còn tham chiếu
-  // đến bài bị xóa, xóa cả bài ôn tập + nội dung + lượt làm để không để dữ liệu
-  // dẫn xuất mồ côi. Giáo viên chỉ xóa bài ôn tập do chính mình tạo; admin xóa hết.
-  const allReviewSnap = await getDocs(namedCollection('reviewPractices'));
-  const relatedReviews = allReviewSnap.docs.filter(item => {
-    if (!reviewReferencesLesson(item.data(), normalizedLessonId)) return false;
-    return isAdminUser || clean(item.data().ownerUid) === clean(me.uid);
-  });
+  let reviewDocs: QueryDocumentSnapshot<DocumentData>[] = [];
+  if (isAdminUser) {
+    reviewDocs = (await getDocs(namedCollection('reviewPractices'))).docs;
+  } else if (me.role === 'teacher') {
+    reviewDocs = (await getDocs(query(
+      namedCollection('reviewPractices'),
+      where('ownerUid', '==', me.uid),
+      where('khoi', '==', lessonGrade),
+    ))).docs;
+  }
+  const relatedReviews = reviewDocs.filter(item => reviewReferencesLesson(item.data(), normalizedLessonId));
   const relatedReviewIds = relatedReviews.map(item => item.id);
   const attemptSnaps = await Promise.all(relatedReviewIds.map(reviewId =>
     getDocs(query(namedCollection('reviewAttempts'), where('review_id', '==', reviewId))),
@@ -593,6 +1171,7 @@ export async function deleteFirebaseLesson(lessonId: string): Promise<LessonCasc
   resultActionSnap.docs.forEach(item => dependencyRefs.push(item.ref));
   commentSnap.docs.forEach(item => dependencyRefs.push(item.ref));
   coLearningSnap.docs.forEach(item => dependencyRefs.push(item.ref));
+  consentSnap.docs.forEach(item => dependencyRefs.push(item.ref));
   promptDocs.forEach(item => dependencyRefs.push(item.ref));
   attemptSnaps.forEach(snap => snap.docs.forEach(item => dependencyRefs.push(item.ref)));
   relatedReviews.forEach(item => {
@@ -609,39 +1188,63 @@ export async function deleteFirebaseLesson(lessonId: string): Promise<LessonCasc
   deletedCounts.reviewPractices = relatedReviews.length;
   deletedCounts.reviewContents = relatedReviews.length;
 
+  // Dependency xóa trước để Rules vẫn có parent lesson xác minh quyền sở hữu.
   if (dependencyRefs.length) await commitDeleteRefs(dependencyRefs);
 
-  // Thu hồi mọi registry tham chiếu tới bài. Quét fallback giúp dọn được cả
-  // registry mồ côi nếu metadata bài đã bị xóa cục bộ ở lần thao tác trước.
+  // Xác định registry liên quan trước bước finalization nguyên tử.
   const registryCollection = namedCollection('lessonNumberRegistry');
-  const registrySnap = await getDocs(registryCollection);
-  const registryItems = registrySnap.docs.filter(item => {
-    const data = item.data();
-    return clean(data.allLessonId) === normalizedLessonId
-      || Object.values(registryClassMap(data)).some(value => clean(value) === normalizedLessonId);
-  });
-  for (const item of registryItems) {
-    const cleaned = removeLessonFromRegistry(item.data(), normalizedLessonId);
-    if (registryHasAnyLesson(cleaned)) {
-      await setDoc(item.ref, { ...cleaned, updated_at: new Date().toISOString(), updatedAt: serverTimestamp() }, { merge: true });
-    } else {
-      await deleteDoc(item.ref);
+  let registryItems: Array<{ ref: DocumentReference<DocumentData>; data: () => DocumentData }> = [];
+  if (isAdminUser) {
+    const registrySnap = await getDocs(registryCollection);
+    registryItems = registrySnap.docs.filter(item => registryLessonIds(item.data()).includes(normalizedLessonId));
+  } else if (lessonData) {
+    const registryKey = clean(lessonData.lesson_key) || lessonRegistryKey(lessonData);
+    if (registryKey) {
+      const registrySnap = await getDoc(doc(school(), 'lessonNumberRegistry', registryKey));
+      if (registrySnap.exists() && registryLessonIds(registrySnap.data()).includes(normalizedLessonId)) {
+        registryItems = [registrySnap];
+      }
     }
   }
-  deletedCounts.registry = registryItems.length;
 
-  // Content + lesson metadata xóa cuối để Rules còn kiểm tra owner cho dependency.
-  if (lessonExists) {
-    const finalBatch = writeBatch(firestoreDb);
-    finalBatch.delete(lessonContentRef(normalizedLessonId));
-    finalBatch.delete(target);
-    await finalBatch.commit();
-    deletedCounts.content = 1;
-    deletedCounts.lesson = 1;
-  } else if (isAdminUser) {
-    // Admin có thể chạy lại thao tác để dọn content mồ côi từ lần xóa cũ.
-    await deleteDoc(lessonContentRef(normalizedLessonId)).catch(() => undefined);
-    deletedCounts.content = 1;
+  // V6.75.2: registry + content + parent lesson được finalization trong cùng transaction.
+  // Không còn trạng thái card biến mất nhưng registry vẫn giữ số bài.
+  await runTransaction(firestoreDb, async (transaction) => {
+    const freshRegistrySnaps = [];
+    for (const item of registryItems) {
+      freshRegistrySnaps.push(await transaction.get(item.ref));
+    }
+
+    freshRegistrySnaps.forEach((snapshot, index) => {
+      if (!snapshot.exists()) return;
+      const cleaned = removeLessonFromRegistry(snapshot.data(), normalizedLessonId);
+      const ref = registryItems[index].ref;
+      if (registryHasAnyLesson(cleaned)) {
+        transaction.set(ref, normalizeRegistryForWrite(cleaned, me.uid, lessonGrade), { merge: false });
+      } else {
+        transaction.delete(ref);
+      }
+    });
+
+    // Firestore transaction commit là nguyên tử: content/metadata và registry cùng thành công hoặc cùng rollback.
+    transaction.delete(lessonContentRef(normalizedLessonId));
+    if (lessonExists) transaction.delete(target);
+  });
+
+  deletedCounts.registry = registryItems.length;
+  deletedCounts.content = 1;
+  deletedCounts.lesson = lessonExists ? 1 : 0;
+
+  // DELETE_VERIFY: xác nhận không registry nào vừa xử lý còn tham chiếu tới lesson ID.
+  for (const item of registryItems) {
+    const verify = await getDoc(item.ref);
+    if (verify.exists() && registryLessonIds(verify.data()).includes(normalizedLessonId)) {
+      throw new Error('[DELETE_REGISTRY_VERIFY] Registry vẫn còn tham chiếu bài học sau khi xóa. Hãy chạy công cụ “Kiểm tra dữ liệu bài học”.');
+    }
+  }
+  const verifyLesson = await getDoc(target);
+  if (verifyLesson.exists()) {
+    throw new Error('[DELETE_LESSON_VERIFY] Thông tin bài học vẫn còn tồn tại sau thao tác xóa.');
   }
 
   return {
@@ -652,9 +1255,17 @@ export async function deleteFirebaseLesson(lessonId: string): Promise<LessonCasc
 }
 
 export async function submitFirebaseLessonReview(lessonId: string) {
+  const me = await identity();
   const target = doc(lessons(), lessonId);
   const snap = await getDoc(target);
   if (!snap.exists()) return null;
+  const current = snap.data() as any;
+  if (me.role === 'teacher' && me.adminPermission !== true) {
+    assertTeacherCanManageGrade(me, current.khoi);
+    if (clean(current.createdByUid) !== clean(me.uid)) {
+      throw new Error('Bạn chỉ được gửi duyệt bài học do chính mình tạo.');
+    }
+  }
   const now = new Date().toISOString();
   await updateDoc(target, { trang_thai: 'pending_review', pham_vi: 'shared', updated_at: now, updatedAt: serverTimestamp() });
   return row({ ...snap.data(), trang_thai: 'pending_review', pham_vi: 'shared', updated_at: now }, lessonId);
@@ -663,16 +1274,34 @@ export async function submitFirebaseLessonReview(lessonId: string) {
 export async function listFirebaseProgress(filters: Record<string, unknown> = {}) {
   const me = await identity();
   const base = collection(school(), 'learningProgress');
-  const snap = me.role === 'admin' || me.adminPermission === true
-    ? await getDocs(filters.user_id
-        ? query(base, where('user_id', '==', clean(filters.user_id)), orderBy('updated_at', 'desc'), limit(250))
-        : query(base, orderBy('updated_at', 'desc'), limit(500)))
-    : me.role === 'teacher'
-      ? await getDocs(filters.user_id
-          ? query(base, where('user_id', '==', clean(filters.user_id)), orderBy('updated_at', 'desc'), limit(250))
-          : query(base, where('khoi', '==', clean(me.grade)), orderBy('updated_at', 'desc'), limit(500)))
-      : await getDocs(query(base, where('ownerUid', '==', me.uid), orderBy('updated_at', 'desc'), limit(80)));
-  return snap.docs.map(item => ({ progress_id: item.id, ...item.data() } as unknown as LessonProgressRecord)).filter(item => {
+  let docs: QueryDocumentSnapshot<DocumentData>[] = [];
+
+  if (me.role === 'admin' || me.adminPermission === true) {
+    const snap = await getAllQueryDocs(filters.user_id
+      ? query(base, where('user_id', '==', clean(filters.user_id)), orderBy('updated_at', 'desc'))
+      : query(base, orderBy('updated_at', 'desc')));
+    docs = snap.docs;
+  } else if (me.role === 'teacher') {
+    const grades = await teacherQueryGrades(me);
+    if (!grades.length) return [];
+    // Mỗi query luôn có `khoi == grade`. Sau đó mới lọc user_id/lớp ở client
+    // để không ép thêm composite index và vẫn tương thích Rules theo khối.
+    const snapshots = await Promise.all(grades.map(grade => getAllQueryDocs(query(
+      base,
+      where('khoi', '==', grade)
+    ))));
+    const merged = new Map<string, QueryDocumentSnapshot<DocumentData>>();
+    snapshots.forEach(snapshot => snapshot.docs.forEach(item => merged.set(item.id, item)));
+    docs = Array.from(merged.values()).sort((left, right) =>
+      clean((right.data() as any).updated_at).localeCompare(clean((left.data() as any).updated_at)),
+    );
+  } else {
+    const snap = await getAllQueryDocs(query(base, where('ownerUid', '==', me.uid), orderBy('updated_at', 'desc')));
+    docs = snap.docs;
+  }
+
+  return docs.map(item => ({ progress_id: item.id, ...item.data() } as unknown as LessonProgressRecord)).filter(item => {
+    if (me.role === 'teacher' && me.adminPermission !== true && !teacherCanManageGrade(me, item.khoi)) return false;
     if (filters.user_id && clean(item.user_id) !== clean(filters.user_id)) return false;
     if (filters.lesson_id && clean(item.lesson_id) !== clean(filters.lesson_id)) return false;
     if (filters.lop_id && clean(item.lop_id) !== clean(filters.lop_id)) return false;
@@ -690,6 +1319,8 @@ export async function saveFirebaseProgress(payload: LessonProgressRecord) {
     progress_id: progressId,
     user_id: clean(payload.user_id || me.userId),
     ownerUid: me.uid,
+    khoi: clean(me.grade || payload.khoi),
+    lop_id: clean(me.classId || payload.lop_id),
     result_state: 'valid',
     retake_allowed: true,
     result_version: resultVersion,
@@ -828,6 +1459,9 @@ export async function moderateFirebaseLearningResult(
   const targetSnap = await getDoc(targetRef);
   if (!targetSnap.exists()) throw new Error('Không tìm thấy kết quả học tập cần xử lý.');
   const target = { progress_id: targetSnap.id, ...targetSnap.data() } as any;
+  if (me.role === 'teacher' && me.adminPermission !== true) {
+    assertTeacherCanManageGrade(me, target.khoi);
+  }
   const resultGroupId = clean(target.result_group_id || target.co_learning_session_id);
   let sessionRef: DocumentReference<DocumentData> | null = null;
   let participantUserIds = [clean(target.user_id)].filter(Boolean);
@@ -1131,8 +1765,14 @@ export async function listFirebaseMembers() {
   const me = await identity();
   if (me.role === 'student') return [me];
   if (me.role === 'teacher' && me.adminPermission !== true) {
-    const snap = await getDocs(query(namedCollection('members'), where('grade', '==', clean(me.grade))));
-    return snap.docs.map(item => ({ uid: item.id, ...item.data() }));
+    const grades = await teacherQueryGrades(me);
+    if (!grades.length) return [me];
+    const snapshots = await Promise.all(grades.map(grade => getDocs(query(namedCollection('members'), where('grade', '==', grade)))));
+    const byUid = new Map<string, any>();
+    snapshots.forEach(snap => snap.docs.forEach(item => byUid.set(item.id, { uid: item.id, ...item.data() })));
+    const rows = Array.from(byUid.values());
+    if (!rows.some((item: any) => clean(item.uid) === clean(me.uid))) rows.unshift(me);
+    return rows;
   }
   const snap = await getDocs(namedCollection('members'));
   return snap.docs.map(item => ({ uid: item.id, ...item.data() }));
@@ -1142,20 +1782,36 @@ export async function listFirebaseAccountDirectory() {
   const me = await identity();
   if (me.role === 'student') return [me];
 
-  const memberQuery = me.role === 'teacher' && me.adminPermission !== true
-    ? query(namedCollection('members'), where('grade', '==', clean(me.grade)))
-    : namedCollection('members');
-  const rosterQuery = me.role === 'teacher' && me.adminPermission !== true
-    ? query(namedCollection('studentRoster'), where('grade', '==', clean(me.grade)))
-    : namedCollection('studentRoster');
-  const [memberSnapshot, rosterSnapshot] = await Promise.all([
-    getDocs(memberQuery),
-    getDocs(rosterQuery),
-  ]);
+  // Giáo viên (kể cả Tất cả khối) chỉ tải directory học sinh bằng query theo khối.
+  // Không đọc toàn members/studentRoster vì các collection còn chứa hồ sơ không có grade.
+  const teacherRestricted = me.role === 'teacher' && me.adminPermission !== true;
+  const grades = teacherRestricted ? await teacherQueryGrades(me) : [];
+  if (teacherRestricted && !grades.length) return [];
+  let memberDocs: QueryDocumentSnapshot<DocumentData>[] = [];
+  let rosterDocs: QueryDocumentSnapshot<DocumentData>[] = [];
+  if (teacherRestricted) {
+    const [memberSnapshots, rosterSnapshots] = await Promise.all([
+      Promise.all(grades.map(grade => getDocs(query(namedCollection('members'), where('grade', '==', grade))))),
+      Promise.all(grades.map(grade => getDocs(query(namedCollection('studentRoster'), where('grade', '==', grade))))),
+    ]);
+    const memberMap = new Map<string, QueryDocumentSnapshot<DocumentData>>();
+    const rosterMap = new Map<string, QueryDocumentSnapshot<DocumentData>>();
+    memberSnapshots.forEach(snap => snap.docs.forEach(item => memberMap.set(item.id, item)));
+    rosterSnapshots.forEach(snap => snap.docs.forEach(item => rosterMap.set(item.id, item)));
+    memberDocs = Array.from(memberMap.values());
+    rosterDocs = Array.from(rosterMap.values());
+  } else {
+    const [memberSnapshot, rosterSnapshot] = await Promise.all([
+      getDocs(namedCollection('members')),
+      getDocs(namedCollection('studentRoster')),
+    ]);
+    memberDocs = memberSnapshot.docs;
+    rosterDocs = rosterSnapshot.docs;
+  }
 
   const byStudentCode = new Map<string, Record<string, unknown>>();
   const accounts: Record<string, unknown>[] = [];
-  rosterSnapshot.docs.forEach(item => {
+  rosterDocs.forEach(item => {
     const data = item.data();
     const studentCode = clean(data.studentCode || item.id);
     const pending = {
@@ -1185,7 +1841,7 @@ export async function listFirebaseAccountDirectory() {
     byStudentCode.set(studentCode.toLowerCase(), pending);
   });
 
-  memberSnapshot.docs.forEach(item => {
+  memberDocs.forEach(item => {
     const member = { uid: item.id, ...item.data(), provisioningStatus: 'ready' } as Record<string, unknown>;
     const studentCode = clean(member.studentCode || member.username).toLowerCase();
     if (studentCode && byStudentCode.has(studentCode)) {
@@ -1514,341 +2170,15 @@ export async function listFirebaseClassmates() {
 export async function findFirebaseReusableCoLearningSession(lessonId: string): Promise<CoLearningSession | null> {
   const me = await identity();
   if (me.role !== 'student' || !clean(lessonId)) return null;
-  const sessions = namedCollection('coLearningSessions');
-  let snap;
-  try {
-    snap = await getDocs(query(
-      sessions,
-      where('participant_uids', 'array-contains', me.uid),
-      where('lesson_id', '==', clean(lessonId)),
-      limit(12),
-    ));
-  } catch {
-    // Tương thích trong thời gian chỉ mục V6.68.0 đang được Firebase xây dựng.
-    snap = await getDocs(query(
-      sessions,
-      where('participant_uids', 'array-contains', me.uid),
-      limit(30),
-    ));
-  }
-
+  const snap = await getAllQueryDocs(query(namedCollection('coLearningSessions'),
+    where('participant_uids', 'array-contains', me.uid), where('lesson_id', '==', clean(lessonId))));
   const candidates = snap.docs
     .map((item) => ({ co_learning_session_id: item.id, session_id: item.id, ...item.data() } as unknown as CoLearningSession))
-    .filter((item) => clean(item.lesson_id) === clean(lessonId))
+    .filter((item) => (item as any).schemaVersion === 3 && clean(item.lesson_id) === clean(lessonId))
     .filter((item) => ['active', 'completed', 'cancelled_retake'].includes(clean(item.status) || 'active'))
     .filter((item) => !clean((item as any).lop_id) || clean((item as any).lop_id) === clean(me.classId))
     .sort((a, b) => clean(b.last_active_at || b.started_at).localeCompare(clean(a.last_active_at || a.started_at)));
   return candidates[0] || null;
-}
-
-export type FirebaseAccountDeletionTarget = {
-  userId: string;
-  uid: string;
-  displayName: string;
-  username: string;
-  studentCode: string;
-  rosterId: string;
-  provisioningStatus: 'ready' | 'pending';
-};
-
-type CleanupOperation = {
-  kind: 'delete' | 'update';
-  ref: DocumentReference<DocumentData>;
-  data?: Record<string, unknown>;
-  label: string;
-  required?: boolean;
-};
-
-export type FirebaseAccountCleanupFailure = {
-  label: string;
-  path: string;
-  reason: string;
-};
-
-type CleanupCollectionRead = {
-  docs: QueryDocumentSnapshot<DocumentData>[];
-  warnings: FirebaseAccountCleanupFailure[];
-};
-
-async function readOptionalCleanupCollection(
-  label: string,
-  source: CollectionReference<DocumentData>,
-): Promise<CleanupCollectionRead> {
-  try {
-    const snapshot = await getDocs(source);
-    return { docs: snapshot.docs, warnings: [] };
-  } catch (error) {
-    return {
-      docs: [],
-      warnings: [{
-        label: `Đọc ${label}`,
-        path: source.path,
-        reason: firebaseErrorMessage(error),
-      }],
-    };
-  }
-}
-
-// Mỗi write trong batch đều phải đọc hồ sơ quản trị để Rules xác nhận isAdmin.
-// Firestore giới hạn số document-access calls của một atomic batch; 400 writes
-// vì thế có thể bị trả permission-denied dù Rules đúng. Dùng 8 để luôn nằm dưới
-// ngưỡng và tự tách đôi nếu một nhóm vẫn thất bại vì dữ liệu cũ khác schema.
-const ACCOUNT_DELETE_RULE_SAFE_BATCH_SIZE = 8;
-
-async function commitCleanupOperations(operations: CleanupOperation[]) {
-  const failures: FirebaseAccountCleanupFailure[] = [];
-
-  const commitSafely = async (items: CleanupOperation[]): Promise<void> => {
-    if (!items.length) return;
-    const batch = writeBatch(firestoreDb);
-    items.forEach(operation => {
-      if (operation.kind === 'delete') batch.delete(operation.ref);
-      else batch.update(operation.ref, operation.data || {});
-    });
-    try {
-      await batch.commit();
-    } catch (error) {
-      if (items.length > 1) {
-        const midpoint = Math.ceil(items.length / 2);
-        await commitSafely(items.slice(0, midpoint));
-        await commitSafely(items.slice(midpoint));
-        return;
-      }
-      const operation = items[0];
-      const reason = firebaseErrorMessage(error);
-      if (operation.required) {
-        throw new Error(`Không thể xóa ${operation.label}: ${reason}`);
-      }
-      failures.push({ label: operation.label, path: operation.ref.path, reason });
-    }
-  };
-
-  for (let offset = 0; offset < operations.length; offset += ACCOUNT_DELETE_RULE_SAFE_BATCH_SIZE) {
-    await commitSafely(operations.slice(offset, offset + ACCOUNT_DELETE_RULE_SAFE_BATCH_SIZE));
-  }
-  return failures;
-}
-
-export async function prepareFirebaseAccountDeletion(userIds: string[], skipCurrentUser = false): Promise<FirebaseAccountDeletionTarget[]> {
-  const me = await identity();
-  if (me.role !== 'admin' && me.adminPermission !== true) throw new Error('Bạn không có quyền xóa tài khoản.');
-  const targets = new Set(userIds.map(clean).filter(Boolean));
-  if (!targets.size) throw new Error('Chưa chọn tài khoản cần xóa.');
-  if (targets.has(clean(me.userId))) {
-    if (!skipCurrentUser) throw new Error('Không thể xóa tài khoản đang đăng nhập.');
-    targets.delete(clean(me.userId));
-  }
-
-  const [membersSnap, rosterSnap] = await Promise.all([
-    getDocs(namedCollection('members')),
-    getDocs(namedCollection('studentRoster')),
-  ]);
-  const membersByUserId = new Map<string, (typeof membersSnap.docs)[number]>();
-  const membersByStudentCode = new Map<string, (typeof membersSnap.docs)[number]>();
-  membersSnap.docs.forEach(item => {
-    const data = item.data();
-    const userId = clean(data.userId);
-    const studentCode = clean(data.studentCode || data.username).toLowerCase();
-    if (userId) membersByUserId.set(userId, item);
-    if (studentCode) membersByStudentCode.set(studentCode, item);
-  });
-
-  const rosterByUserId = new Map<string, (typeof rosterSnap.docs)[number]>();
-  const rosterByStudentCode = new Map<string, (typeof rosterSnap.docs)[number]>();
-  rosterSnap.docs.forEach(item => {
-    const data = item.data();
-    const userId = clean(data.userId) || `HS_${clean(data.studentCode || item.id)}`;
-    const studentCode = clean(data.studentCode || item.id).toLowerCase();
-    if (userId) rosterByUserId.set(userId, item);
-    if (studentCode) rosterByStudentCode.set(studentCode, item);
-  });
-
-  return Array.from(targets).map(requestedUserId => {
-    let member = membersByUserId.get(requestedUserId);
-    let roster = rosterByUserId.get(requestedUserId);
-    const requestedCode = requestedUserId.replace(/^HS_/i, '').toLowerCase();
-    if (!member) member = membersByStudentCode.get(requestedCode);
-    if (!roster) roster = rosterByStudentCode.get(requestedCode);
-
-    const memberData = member?.data() || {};
-    const memberCode = clean(memberData.studentCode || memberData.username).toLowerCase();
-    if (!roster && memberCode) roster = rosterByStudentCode.get(memberCode);
-    const rosterData = roster?.data() || {};
-    const rosterCode = clean(rosterData.studentCode || roster?.id).toLowerCase();
-    if (!member && rosterCode) member = membersByStudentCode.get(rosterCode);
-    if (!member && !roster) return null;
-
-    const resolvedMemberData = member?.data() || memberData;
-    const resolvedRosterData = roster?.data() || rosterData;
-    const studentCode = clean(
-      resolvedMemberData.studentCode
-      || resolvedRosterData.studentCode
-      || resolvedMemberData.username
-      || resolvedRosterData.username
-      || roster?.id,
-    );
-    return {
-      userId: requestedUserId,
-      uid: member?.id || '',
-      displayName: clean(resolvedMemberData.displayName || resolvedRosterData.displayName),
-      username: clean(resolvedMemberData.username || resolvedRosterData.username || studentCode),
-      studentCode,
-      rosterId: roster?.id || '',
-      provisioningStatus: member ? 'ready' : 'pending',
-    } satisfies FirebaseAccountDeletionTarget;
-  }).filter((item): item is FirebaseAccountDeletionTarget => Boolean(item));
-}
-
-export async function cascadeDeleteFirebaseAccountData(
-  userIds: string[],
-  preparedTargets: FirebaseAccountDeletionTarget[] = [],
-) {
-  const me = await identity();
-  if (me.role !== 'admin' && me.adminPermission !== true) throw new Error('Bạn không có quyền dọn dữ liệu tài khoản.');
-
-  const targetUserIds = new Set(userIds.map(clean).filter(Boolean));
-  preparedTargets.forEach(item => targetUserIds.add(clean(item.userId)));
-  if (!targetUserIds.size) return { deleted: {}, transferred: {}, totalWrites: 0, cleanupWarnings: [] };
-  if (targetUserIds.has(clean(me.userId))) throw new Error('Không thể xóa dữ liệu của tài khoản đang đăng nhập.');
-
-  const targetUids = new Set(preparedTargets.map(item => clean(item.uid)).filter(Boolean));
-  const targetRosterIds = new Set(preparedTargets.map(item => clean(item.rosterId)).filter(Boolean));
-  const deleted = { members: 0, studentRoster: 0, userAIConfigs: 0, learningProgress: 0, lessonComments: 0, reviewAttempts: 0, coLearningSessions: 0 };
-  const transferred = { lessons: 0, reviewPractices: 0, slidesPrompts: 0 };
-  const requiredOperations: CleanupOperation[] = [];
-
-  // Các tham chiếu bắt buộc đã được prepareFirebaseAccountDeletion xác minh.
-  // Xóa hồ sơ chính trước khi đọc bất kỳ collection phụ nào.
-  targetRosterIds.forEach(rosterId => {
-    requiredOperations.push({
-      kind: 'delete',
-      ref: doc(school(), 'studentRoster', rosterId),
-      label: `hồ sơ danh sách học sinh ${rosterId}`,
-      required: true,
-    });
-    deleted.studentRoster += 1;
-  });
-
-  targetUids.forEach(uid => {
-    requiredOperations.push({
-      kind: 'delete',
-      ref: doc(school(), 'members', uid),
-      label: `hồ sơ thành viên ${uid}`,
-      required: true,
-    });
-    deleted.members += 1;
-  });
-
-  await commitCleanupOperations(requiredOperations);
-
-  // Mỗi collection phụ được đọc độc lập. Một Rules cũ hoặc collection chưa có
-  // quyền đọc chỉ tạo cảnh báo, không được phép chặn việc xóa hồ sơ tài khoản.
-  const [lessonRead, progressRead, commentRead, reviewRead, attemptRead, coLearningRead, promptRead] = await Promise.all([
-    readOptionalCleanupCollection('bài học', lessons()),
-    readOptionalCleanupCollection('tiến trình học tập', namedCollection('learningProgress')),
-    readOptionalCleanupCollection('bình luận bài học', namedCollection('lessonComments')),
-    readOptionalCleanupCollection('bài ôn tập', namedCollection('reviewPractices')),
-    readOptionalCleanupCollection('kết quả ôn tập', namedCollection('reviewAttempts')),
-    readOptionalCleanupCollection('phiên học cùng', namedCollection('coLearningSessions')),
-    readOptionalCleanupCollection('prompt trình chiếu', namedCollection('slidesPrompts')),
-  ]);
-  const readWarnings = [lessonRead, progressRead, commentRead, reviewRead, attemptRead, coLearningRead, promptRead]
-    .flatMap(item => item.warnings);
-
-  const isTargetIdentity = (data: DocumentData, userIdFields: string[] = [], uidFields: string[] = []) =>
-    userIdFields.some(field => targetUserIds.has(clean(data[field])))
-    || uidFields.some(field => targetUids.has(clean(data[field])));
-  const operations: CleanupOperation[] = [];
-  const now = new Date().toISOString();
-  const replacementUserId = clean(me.userId);
-  const replacementName = clean(me.displayName || me.ho_ten) || 'Quản trị viên';
-
-  lessonRead.docs.forEach(item => {
-    if (!isTargetIdentity(item.data(), ['nguoi_tao_id'], ['createdByUid'])) return;
-    operations.push({ kind: 'update', ref: item.ref, label: 'quyền sở hữu bài học', data: {
-      nguoi_tao_id: replacementUserId,
-      createdByUid: me.uid,
-      ownershipTransferredAt: now,
-      updated_at: now,
-      updatedAt: serverTimestamp(),
-    } });
-    transferred.lessons += 1;
-  });
-
-  reviewRead.docs.forEach(item => {
-    if (!isTargetIdentity(item.data(), ['nguoi_tao_id'], ['ownerUid'])) return;
-    operations.push({ kind: 'update', ref: item.ref, label: 'quyền sở hữu bài ôn tập', data: {
-      nguoi_tao_id: replacementUserId,
-      ownerUid: me.uid,
-      ownershipTransferredAt: now,
-      updated_at: now,
-      updatedAt: serverTimestamp(),
-    } });
-    transferred.reviewPractices += 1;
-  });
-
-  promptRead.docs.forEach(item => {
-    if (!isTargetIdentity(item.data(), ['nguoi_tao_id'], ['ownerUid'])) return;
-    operations.push({ kind: 'update', ref: item.ref, label: 'quyền sở hữu prompt trình chiếu', data: {
-      nguoi_tao_id: replacementUserId,
-      ho_ten_nguoi_tao: replacementName,
-      ownerUid: me.uid,
-      ownershipTransferredAt: now,
-      updated_at: now,
-      updatedAt: serverTimestamp(),
-    } });
-    transferred.slidesPrompts += 1;
-  });
-
-  progressRead.docs.forEach(item => {
-    if (!isTargetIdentity(item.data(), ['user_id'], ['ownerUid'])) return;
-    operations.push({ kind: 'delete', ref: item.ref, label: 'tiến trình học tập' });
-    deleted.learningProgress += 1;
-  });
-
-  attemptRead.docs.forEach(item => {
-    if (!isTargetIdentity(item.data(), ['user_id'], ['ownerUid'])) return;
-    operations.push({ kind: 'delete', ref: item.ref, label: 'kết quả ôn tập' });
-    deleted.reviewAttempts += 1;
-  });
-
-  coLearningRead.docs.forEach(item => {
-    if (!isTargetIdentity(item.data(), ['host_user_id', 'partner_user_id'], ['ownerUid'])) return;
-    operations.push({ kind: 'delete', ref: item.ref, label: 'phiên học cùng' });
-    deleted.coLearningSessions += 1;
-  });
-
-  const commentIdsToDelete = new Set<string>();
-  commentRead.docs.forEach(item => {
-    if (isTargetIdentity(item.data(), ['user_id', 'replied_by'], ['ownerUid'])) commentIdsToDelete.add(item.id);
-  });
-  let commentsExpanded = true;
-  while (commentsExpanded) {
-    commentsExpanded = false;
-    commentRead.docs.forEach(item => {
-      const parentId = clean(item.data().parent_id);
-      if (parentId && commentIdsToDelete.has(parentId) && !commentIdsToDelete.has(item.id)) {
-        commentIdsToDelete.add(item.id);
-        commentsExpanded = true;
-      }
-    });
-  }
-  commentRead.docs.forEach(item => {
-    if (!commentIdsToDelete.has(item.id)) return;
-    operations.push({ kind: 'delete', ref: item.ref, label: 'bình luận bài học' });
-    deleted.lessonComments += 1;
-  });
-
-  // Admin không được đọc API key của người khác nhưng được phép xóa tài liệu
-  // riêng tư theo UID khi xóa hẳn tài khoản.
-  targetUids.forEach(uid => {
-    operations.push({ kind: 'delete', ref: doc(school(), 'userAIConfigs', uid), label: 'cấu hình AI cá nhân' });
-    deleted.userAIConfigs += 1;
-  });
-
-  const writeWarnings = await commitCleanupOperations(operations);
-  const cleanupWarnings = [...readWarnings, ...writeWarnings];
-  return { deleted, transferred, totalWrites: requiredOperations.length + operations.length, cleanupWarnings };
 }
 
 export async function moveFirebaseStudents(sourceClassId: string, targetClassId: string, userIds: string[] = [], deleteSource = false) {
@@ -2005,14 +2335,24 @@ export async function reviewFirebaseLesson(lessonId: string, approve: boolean, n
 export async function listFirebaseReviews(filters: Record<string, unknown> = {}) {
   const me = await identity();
   const base = namedCollection('reviewPractices');
-  const snapshots = me.role === 'admin' || me.role === 'teacher' || me.adminPermission === true
-    ? [await getDocs(query(base, orderBy('updated_at', 'desc'), limit(200)))]
-    : [await getDocs(query(
-        base,
-        where('pham_vi', '==', 'shared'),
-        where('trang_thai', '==', 'active'),
-        limit(250),
-      ))];
+  let snapshots: Awaited<ReturnType<typeof getAllQueryDocs>>[];
+  if (me.role === 'admin' || me.adminPermission === true) {
+    snapshots = [await getAllQueryDocs(query(base, orderBy('updated_at', 'desc')))];
+  } else if (me.role === 'teacher') {
+    const grades = await teacherQueryGrades(me);
+    if (!grades.length) return [];
+    const buildTeacherQueries = (grade: string) => [
+      getAllQueryDocs(query(base, where('khoi', '==', grade), where('pham_vi', '==', 'shared'))),
+      getAllQueryDocs(query(base, where('khoi', '==', grade), where('ownerUid', '==', me.uid))),
+    ];
+    snapshots = await Promise.all(grades.flatMap(grade => buildTeacherQueries(grade)));
+  } else {
+    snapshots = [await getAllQueryDocs(query(
+      base,
+      where('pham_vi', '==', 'shared'),
+      where('trang_thai', '==', 'active')
+    ))];
+  }
   if (me.role === 'admin' || me.adminPermission === true) {
     const legacy = snapshots.flatMap(snapshot => snapshot.docs).filter(item =>
       item.data().questions !== undefined || item.data().questions_json !== undefined || item.data().config !== undefined,
@@ -2060,6 +2400,7 @@ export async function listFirebaseReviews(filters: Record<string, unknown> = {})
     if (filters.review_id && item.review_id !== clean(filters.review_id)) return false;
     if (filters.lop_id && clean(item.lop_id) !== clean(filters.lop_id)) return false;
     if (filters.mon_id && clean(item.mon_id) !== clean(filters.mon_id)) return false;
+    if (me.role === 'teacher' && me.adminPermission !== true && !teacherCanManageGrade(me, item.khoi)) return false;
     if (me.role === 'student' && !matchesMemberAudience(item, me)) return false;
     return true;
   }).sort((left, right) => clean(right.updated_at).localeCompare(clean(left.updated_at)));
@@ -2067,6 +2408,9 @@ export async function listFirebaseReviews(filters: Record<string, unknown> = {})
 
 export async function saveFirebaseReview(payload: Record<string, unknown>) {
   const me = await identity();
+  if (me.role === 'teacher' && me.adminPermission !== true) {
+    assertTeacherCanManageGrade(me, payload.khoi);
+  }
   const reviewId = clean(payload.review_id) || id('REVIEW');
   const now = new Date().toISOString();
   const { questions, questions_json: questionsJson, config, cau_hinh: configLegacy, ...metadataPayload } = payload;
@@ -2099,13 +2443,24 @@ export async function getFirebaseReview(reviewId: string) {
 }
 
 export async function deleteFirebaseReview(reviewId: string) {
-  await identity();
+  const me = await identity();
+  const reviewRef = doc(school(), 'reviewPractices', reviewId);
+  const reviewSnap = await getDoc(reviewRef);
+  if (!reviewSnap.exists()) return false;
+  const review = reviewSnap.data() as any;
+  if (me.role === 'teacher' && me.adminPermission !== true) {
+    assertTeacherCanManageGrade(me, review.khoi);
+    if (clean(review.ownerUid) !== clean(me.uid)) {
+      throw new Error('Bạn chỉ được xóa bài ôn tập do chính mình tạo.');
+    }
+  }
   const attempts = await getDocs(query(namedCollection('reviewAttempts'), where('review_id', '==', reviewId)));
   const batch = writeBatch(firestoreDb);
   attempts.docs.forEach(item => batch.delete(item.ref));
   batch.delete(reviewContentRef(reviewId));
-  batch.delete(doc(school(), 'reviewPractices', reviewId));
+  batch.delete(reviewRef);
   await batch.commit();
+  return true;
 }
 
 export async function submitFirebaseReviewAttempt(payload: Record<string, unknown>) {
@@ -2115,16 +2470,15 @@ export async function submitFirebaseReviewAttempt(payload: Record<string, unknow
   const reviewId = clean(payload.review_id);
   const reviewSnap = reviewId ? await getDoc(doc(school(), 'reviewPractices', reviewId)) : null;
   if (!reviewSnap?.exists()) throw new Error('Không tìm thấy bài ôn tập trên Firebase.');
-  const previousSnap = await getDocs(query(
+  const previousSnap = await getAllQueryDocs(query(
     namedCollection('reviewAttempts'),
     where('ownerUid', '==', me.uid),
     where('review_id', '==', reviewId),
-    limit(20),
   ));
   const previousCount = previousSnap.size;
   const review = reviewSnap.data() as any;
   const data = withoutUndefined({ ...payload, attempt_id: attemptId, ownerUid: me.uid, user_id: clean(payload.user_id || me.userId),
-    lop_id: clean(payload.lop_id || me.classId || review.lop_id), nam_hoc: clean(payload.nam_hoc || review.nam_hoc), hoc_ky: clean(payload.hoc_ky || review.hoc_ky || 'HK1'),
+    lop_id: clean(payload.lop_id || me.classId || review.lop_id), khoi: clean(payload.khoi || me.grade || review.khoi), nam_hoc: clean(payload.nam_hoc || review.nam_hoc), hoc_ky: clean(payload.hoc_ky || review.hoc_ky || 'HK1'),
     so_lan_lam: previousCount + 1, schoolId: FIREBASE_SCHOOL_ID, schemaVersion: 1, submitted_at: clean(payload.submitted_at) || now, updatedAt: serverTimestamp() });
   assertSafeDocument(data, 'Kết quả ôn tập');
   await setDoc(doc(school(), 'reviewAttempts', attemptId), data);
@@ -2135,12 +2489,52 @@ export async function listFirebaseReviewAttempts(filters: Record<string, unknown
   const me = await identity();
   const reviewId = clean(filters.review_id);
   const base = namedCollection('reviewAttempts');
-  const snap = (me.role === 'admin' || me.role === 'teacher' || me.adminPermission === true)
-    ? await getDocs(reviewId ? query(base, where('review_id', '==', reviewId), limit(500)) : query(base, limit(500)))
-    : await getDocs(reviewId
-        ? query(base, where('ownerUid', '==', me.uid), where('review_id', '==', reviewId), limit(50))
-        : query(base, where('ownerUid', '==', me.uid), limit(200)));
+
+  if (me.role === 'admin' || me.adminPermission === true) {
+    const snap = await getAllQueryDocs(reviewId
+      ? query(base, where('review_id', '==', reviewId))
+      : query(base));
+    return snap.docs.map(item => ({ attempt_id: item.id, ...item.data() }));
+  }
+
+  if (me.role === 'teacher') {
+    // Kết quả ôn tập luôn được mở theo một bài ôn tập cụ thể. Xác minh bài đó
+    // thuộc phạm vi khối được giao trước khi query attempts để Rules không phải
+    // chấp nhận một truy vấn rộng trên toàn trường.
+    if (!reviewId) return [];
+    const reviewSnap = await getDoc(doc(school(), 'reviewPractices', reviewId));
+    if (!reviewSnap.exists()) return [];
+    const review = reviewSnap.data() as any;
+    assertTeacherCanManageGrade(me, review.khoi);
+    if (clean(review.ownerUid) !== clean(me.uid) && clean(review.pham_vi) !== 'shared') {
+      throw new Error('Bạn không có quyền xem kết quả của bài ôn tập riêng tư này.');
+    }
+    const snap = await getAllQueryDocs(query(base, where('review_id', '==', reviewId)));
+    return snap.docs.map(item => ({ attempt_id: item.id, ...item.data() }));
+  }
+
+  const snap = await getAllQueryDocs(reviewId
+    ? query(base, where('ownerUid', '==', me.uid), where('review_id', '==', reviewId))
+    : query(base, where('ownerUid', '==', me.uid)));
   return snap.docs.map(item => ({ attempt_id: item.id, ...item.data() }));
+}
+
+export async function saveFirebaseHostConsent(sessionId: string, lessonId: string) {
+  const me = await identity();
+  await setDoc(doc(school(), 'coLearningConsents', `${sessionId}_${me.uid}`), {
+    schoolId: FIREBASE_SCHOOL_ID, schemaVersion: 1, sessionId, lessonId,
+    hostUid: me.uid, ownerUid: me.uid, userId: me.userId, classId: me.classId,
+    grade: me.grade, approved: true, createdAt: serverTimestamp(),
+  });
+}
+
+export async function cleanupFirebaseCoLearningConsents(sessionId: string) {
+  const me = await identity();
+  const snap = await getDocs(query(namedCollection('coLearningConsents'),
+    where('hostUid', '==', me.uid), where('sessionId', '==', sessionId)));
+  const batch = writeBatch(firestoreDb);
+  snap.docs.forEach(item => batch.delete(item.ref));
+  if (snap.docs.length) await batch.commit();
 }
 
 // Co-learning sessions ------------------------------------------------------
@@ -2149,7 +2543,7 @@ export async function saveFirebaseCoLearningSession(data: Record<string, unknown
   const sessionId = clean(data.session_id) || id('COLEARN');
   const now = new Date().toISOString();
   const saved = withoutUndefined({ ...data, session_id: sessionId, ownerUid: me.uid, schoolId: FIREBASE_SCHOOL_ID,
-    schemaVersion: 2, started_at: clean(data.started_at) || now, verified_at: clean(data.verified_at) || now,
+    schemaVersion: 3, started_at: clean(data.started_at) || now, verified_at: clean(data.verified_at) || now,
     last_active_at: now, updatedAt: serverTimestamp() });
   await setDoc(doc(school(), 'coLearningSessions', sessionId), saved, { merge: true });
   return saved;
