@@ -871,7 +871,7 @@ function jsonpRequest<T>(payload: Record<string, unknown>): Promise<ApiResponse<
 
 async function requestViaJsonpFallback<T>(payload: Record<string, unknown>): Promise<ApiResponse<T>> {
   if (['createAccount', 'updateAccount', 'deleteAccount', 'batchDeleteAccounts', 'batchResetPasswords'].includes(String(payload.action))) {
-    return { ok: false, message: 'Chưa xác nhận được kết quả từ Apps Script. Hãy tải lại danh sách để kiểm tra, rồi thử lại nếu cần. Kiểm tra URL /exec và quyền triển khai Apps Script trong hướng dẫn V6.75.2.' };
+    return { ok: false, message: 'Chưa xác nhận được kết quả từ Apps Script. Hãy tải lại danh sách để kiểm tra, rồi thử lại nếu cần. Kiểm tra URL /exec và quyền triển khai Apps Script trong hướng dẫn V6.75.4.' };
   }
 
   try {
@@ -1683,9 +1683,12 @@ export async function deleteUserConfigApi(_token: string, model = AI_MODELS[0]):
 
 export async function listClassmatesForStudyApi(token: string, lesson_id: string) {
   try {
+    // V6.75.4: phiên học cùng cũ là dữ liệu phụ. Nếu Rules từ chối truy vấn
+    // session legacy thì vẫn phải tải được danh sách bạn và đặc biệt không được
+    // cản học sinh chọn "Học một mình" để mở nội dung bài học.
     const [members, reusableRaw] = await Promise.all([
       listFirebaseClassmates(),
-      findFirebaseReusableCoLearningSession(lesson_id),
+      findFirebaseReusableCoLearningSession(lesson_id).catch(() => null),
     ]);
     const items = members.map(firebaseMemberToAccount);
     const reusableSession = normalizeCoLearningSession(reusableRaw);

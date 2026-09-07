@@ -2251,7 +2251,7 @@ useEffect(() => {
     setIsCoLearningLoading(false);
     if (!res.ok) {
       if (handleSessionError(res.message)) return;
-      setCoLearningError(res.message || 'Không tải được danh sách bạn cùng lớp.');
+      setCoLearningError(`${res.message || 'Không tải được danh sách bạn cùng lớp.'} Em vẫn có thể chọn “Học một mình” để mở bài ngay.`);
       return;
     }
     setCoLearningClassmates(res.data?.items || []);

@@ -1,0 +1,23 @@
+EDUSMART V6.75.4 - SỬA LỖI HỌC SINH VẪN KHÔNG MỞ ĐƯỢC BÀI SAU V6.75.3
+
+Ảnh kiểm tra cho thấy Rules V6.75.3 đã được Publish thành công, vì vậy lỗi còn lại không phải do quên Publish Rules.
+
+Nguyên nhân bổ sung đã xử lý:
+1. Rules V6.75.3 có thể permission-denied nếu access_start_at/access_end_at của bài legacy không phải Firestore Timestamp.
+2. Một số hồ sơ member legacy có lop_id/khoi nhưng thiếu classId/grade canonical.
+3. Dữ liệu khối có thể là 6, "6", "6.0" (tương tự 7-9).
+4. Truy vấn phiên học cùng/danh sách bạn là dữ liệu phụ; một nhánh legacy bị từ chối không còn được phép cản chế độ “Học một mình”.
+
+TRIỂN KHAI
+Bước 1: Firebase Console > Firestore Database > Rules. Dán toàn bộ firestore_V6.75.4.rules và Publish.
+Bước 2: Chờ Firebase báo Publish thành công.
+Bước 3: Triển khai EduSmart_V6.75.4_Google_AI_Studio.zip lên Google AI Studio/GitHub/Netlify.
+Bước 4: Học sinh đăng xuất, đăng nhập lại một lần để hệ thống tự chuẩn hóa hồ sơ legacy (nếu có).
+Bước 5: Mở Bài học > chọn bài đang mở > Học một mình.
+
+Không cần sửa DATA V4.xlsx, Code.gs hoặc appsscript.json cho bản vá này.
+
+Nếu vẫn có lỗi, thông báo V6.75.4 sẽ nói rõ:
+- bị từ chối khi đọc metadata bài; hoặc
+- metadata đọc được nhưng content/main bị từ chối.
+Thông tin này giúp xác định chính xác nhánh Rules còn vướng mà không phải đoán.

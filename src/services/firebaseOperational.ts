@@ -218,7 +218,7 @@ function registryConflictLessonIds(registryData: any, lessonId: string, classId:
 }
 
 /**
- * V6.75.2: registry cũ có thể còn trỏ tới lesson đã bị xóa từ các phiên bản trước.
+ * V6.75.4: registry cũ có thể còn trỏ tới lesson đã bị xóa từ các phiên bản trước.
  * Khi reserve số bài, kiểm tra các lesson đang gây xung đột. Reference nào trỏ tới
  * document không còn tồn tại sẽ được loại khỏi registry ngay trong cùng transaction;
  * reference còn tồn tại vẫn được coi là xung đột hợp lệ.
@@ -439,11 +439,23 @@ export async function listFirebaseLessons(filters: Record<string, unknown> = {})
 
 export async function getFirebaseLesson(lessonId: string): Promise<LessonContentResponse | null> {
   const me = await identity();
-  const metadataSnap = await getDoc(doc(lessons(), lessonId));
+  let metadataSnap;
+  try {
+    metadataSnap = await getDoc(doc(lessons(), lessonId));
+  } catch (error) {
+    const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: unknown }).code || '') : '';
+    if (code === 'permission-denied' || code === 'firestore/permission-denied') {
+      throw new Error('Firestore đã cho thấy bài trong danh sách nhưng từ chối đọc metadata bài theo ID. Hãy Publish Rules V6.75.4; bản này tương thích hồ sơ legacy lop_id/khoi và khối kiểu số/chuỗi.');
+    }
+    throw error;
+  }
   if (!metadataSnap.exists()) return null;
   const data = metadataSnap.data() as any;
   const lesson = row(data, metadataSnap.id);
   if (me.role === 'student') {
+    if (!matchesMemberAudience(data, me)) {
+      throw new Error(`Bài học không khớp phạm vi tài khoản hiện tại (học sinh: khối ${clean(me.grade) || '-'}, lớp ${clean(me.classId) || '-'}; bài: khối ${clean(data.khoi) || '-'}, lớp ${clean(data.lop_id) || 'dùng chung'}).`);
+    }
     if (lesson.is_locked === true) {
       throw new Error('Bài học hiện đang được giáo viên khóa. Em hãy chờ giáo viên mở bài rồi thử lại.');
     }
@@ -452,9 +464,17 @@ export async function getFirebaseLesson(lessonId: string): Promise<LessonContent
       throw new Error(`${scheduleAccess.message} Em chưa thể tải nội dung bài học lúc này.`);
     }
   }
-  const contentSnap = await getDoc(lessonContentRef(lessonId));
-  const contentData = contentSnap.exists() ? contentSnap.data() as any : null;
-  return { lesson, content: contentData?.lesson_json ?? data.lesson_json };
+  try {
+    const contentSnap = await getDoc(lessonContentRef(lessonId));
+    const contentData = contentSnap.exists() ? contentSnap.data() as any : null;
+    return { lesson, content: contentData?.lesson_json ?? data.lesson_json };
+  } catch (error) {
+    const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: unknown }).code || '') : '';
+    if (code === 'permission-denied' || code === 'firestore/permission-denied') {
+      throw new Error('Firestore đã cho phép đọc metadata nhưng từ chối document nội dung. Hãy Publish Rules V6.75.4. Bản này xử lý access_start_at/access_end_at legacy không phải Timestamp và cờ cho phép học sau hạn dạng cũ.');
+    }
+    throw error;
+  }
 }
 
 export async function setFirebaseLessonLock(lessonId: string, locked: boolean) {
@@ -537,14 +557,14 @@ async function verifyLessonPublishRulesCapability(uid: string) {
     await setDoc(probeRef, {
       schoolId: FIREBASE_SCHOOL_ID,
       ownerUid: normalizedUid,
-      rulesVersion: '6.75.2',
+      rulesVersion: '6.75.4',
       purpose: 'lesson-publish-probe',
       updatedAt: serverTimestamp(),
     }, { merge: false });
     await deleteDoc(probeRef);
     lessonPublishRulesVerifiedUid = normalizedUid;
   } catch (error) {
-    throw new Error(`Chưa xác minh được Firestore Rules V6.75.2 trên project ${FIREBASE_SCHOOL_ID}. Hãy deploy file firestore.rules của bộ V6.75.2 trước khi xuất bản bài học. ${firebaseErrorMessage(error)}`);
+    throw new Error(`Chưa xác minh được Firestore Rules V6.75.4 trên project ${FIREBASE_SCHOOL_ID}. Hãy deploy file firestore.rules của bộ V6.75.4 trước khi xuất bản bài học. ${firebaseErrorMessage(error)}`);
   }
 }
 
@@ -552,7 +572,7 @@ async function freshLessonPublishIdentity(grade: unknown) {
   try {
     const current = firebaseAuth.currentUser;
     if (!current) throw new Error('Bạn cần đăng nhập Firebase để xuất bản bài học.');
-    // V6.75.2: luôn đọc lại member thật trước thao tác xuất bản, không dùng cache 5 phút.
+    // V6.75.4: luôn đọc lại member thật trước thao tác xuất bản, không dùng cache 5 phút.
     const member = await loadValidatedCurrentFirebaseMember();
     identityCache = { uid: current.uid, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS, value: member };
     if (member.role !== 'admin' && member.role !== 'teacher') {
@@ -792,7 +812,7 @@ export async function saveFirebaseLesson(payload: LessonComposerValues, updating
   };
 
   // UPDATE: giữ transaction nguyên tử vì parent lesson đã tồn tại và Rules có thể
-  // đối chiếu ownership trực tiếp. V6.75.2 vẫn ghi metadata bảo mật vào content.
+  // đối chiếu ownership trực tiếp. V6.75.4 vẫn ghi metadata bảo mật vào content.
   if (updating) {
     try {
       return await runTransaction(firestoreDb, async (transaction) => {
@@ -845,7 +865,7 @@ export async function saveFirebaseLesson(payload: LessonComposerValues, updating
     }
   }
 
-  // V6.75.2: reserve + metadata are atomic. A concurrent publisher never sees
+  // V6.75.4: reserve + metadata are atomic. A concurrent publisher never sees
   // a live reservation whose parent is missing. Content still reads an existing parent.
   let registryReserved = false;
   let lessonMetadataCreated = false;
@@ -899,7 +919,7 @@ export async function saveFirebaseLesson(payload: LessonComposerValues, updating
       ? error
       : lessonPublishStageError('PUBLISH_RUNTIME', error || new Error(`Lỗi không xác định tại ${currentStage}.`));
 
-    // V6.75.2: rollback không được phép che mất lỗi gốc. Theo dõi riêng metadata/content
+    // V6.75.4: rollback không được phép che mất lỗi gốc. Theo dõi riêng metadata/content
     // đã tạo để dọn theo đúng trạng thái thực của pipeline.
     if (lessonMetadataCreated) {
       if (lessonContentCreated) {
@@ -998,7 +1018,7 @@ function normalizeRegistryForWrite(data: any, uid: string, fallbackGrade = '') {
 }
 
 /**
- * V6.75.2: công cụ Admin dọn registry mồ côi từ các phiên bản cũ.
+ * V6.75.4: công cụ Admin dọn registry mồ côi từ các phiên bản cũ.
  * Chỉ loại reference trỏ tới lesson không còn tồn tại; registry còn reference
  * hợp lệ được giữ lại và chuẩn hóa schemaVersion=2/owner metadata khi có thể.
  */
@@ -1207,7 +1227,7 @@ export async function deleteFirebaseLesson(lessonId: string): Promise<LessonCasc
     }
   }
 
-  // V6.75.2: registry + content + parent lesson được finalization trong cùng transaction.
+  // V6.75.4: registry + content + parent lesson được finalization trong cùng transaction.
   // Không còn trạng thái card biến mất nhưng registry vẫn giữ số bài.
   await runTransaction(firestoreDb, async (transaction) => {
     const freshRegistrySnaps = [];
@@ -2104,25 +2124,40 @@ export async function listFirebaseClassmates() {
 
   // V6.68.0: studentRoster là nguồn danh sách lớp đầy đủ. `members` được đọc
   // song song chỉ để bổ sung UID/trạng thái kích hoạt và bao phủ hồ sơ legacy.
-  const [rosterSnap, memberSnap] = await Promise.all([
-    getDocs(query(
-      namedCollection('studentRoster'),
-      where('role', '==', 'student'),
-      where('classId', '==', classId),
-      where('grade', '==', grade),
-      where('status', '==', 'active'),
-    )),
-    getDocs(query(
-      namedCollection('members'),
-      where('role', '==', 'student'),
-      where('classId', '==', classId),
-      where('status', '==', 'active'),
-    )),
-  ]);
+  // V6.75.4: hồ sơ/roster legacy có thể lưu grade dạng number trong khi
+  // identity mới luôn chuẩn hóa thành string. Đọc cả hai kiểu để danh sách học
+  // cùng không bị rỗng và vẫn giữ query đủ chặt để Firestore Rules chứng minh.
+  const gradeVariants: Array<string | number> = [grade];
+  const numericGrade = Number(grade);
+  if (Number.isInteger(numericGrade) && String(numericGrade) === grade) gradeVariants.push(numericGrade);
+  // Mỗi nhánh directory là best-effort. Một query legacy bị permission-denied
+  // không được làm hỏng toàn bộ hộp chọn học cùng. Chỉ báo lỗi khi cả roster lẫn
+  // members đều không thể đọc.
+  const rosterResults = await Promise.allSettled(Array.from(new Set(gradeVariants)).map((gradeValue) => getDocs(query(
+    namedCollection('studentRoster'),
+    where('role', '==', 'student'),
+    where('classId', '==', classId),
+    where('grade', '==', gradeValue),
+    where('status', '==', 'active'),
+  ))));
+  const memberResult = await Promise.allSettled([getDocs(query(
+    namedCollection('members'),
+    where('role', '==', 'student'),
+    where('classId', '==', classId),
+    where('status', '==', 'active'),
+  ))]);
+  const rosterSnapshots = rosterResults
+    .filter((result): result is PromiseFulfilledResult<Awaited<ReturnType<typeof getDocs>>> => result.status === 'fulfilled')
+    .map((result) => result.value);
+  const memberSnap = memberResult[0]?.status === 'fulfilled' ? memberResult[0].value : null;
+  if (!rosterSnapshots.length && !memberSnap) {
+    const firstFailure = [...rosterResults, ...memberResult].find((result) => result.status === 'rejected') as PromiseRejectedResult | undefined;
+    throw firstFailure?.reason || new Error('Không thể tải danh sách học sinh cùng lớp.');
+  }
 
   const activatedByStudentCode = new Map<string, any>();
   const activatedByUserId = new Map<string, any>();
-  memberSnap.docs.forEach(item => {
+  memberSnap?.docs.forEach(item => {
     const data = { uid: item.id, ...item.data() } as any;
     const studentCode = clean(data.studentCode || data.username).toLowerCase();
     const userId = clean(data.userId);
@@ -2131,7 +2166,7 @@ export async function listFirebaseClassmates() {
   });
 
   const directory = new Map<string, any>();
-  rosterSnap.docs.forEach(item => {
+  rosterSnapshots.forEach((rosterSnap) => rosterSnap.docs.forEach(item => {
     const roster = item.data() as any;
     const studentCode = clean(roster.studentCode || item.id);
     const userId = clean(roster.userId) || `HS_${studentCode}`;
@@ -2148,11 +2183,11 @@ export async function listFirebaseClassmates() {
       status: 'active',
       provisioningStatus: member ? 'ready' : 'pending',
     });
-  });
+  }));
 
   // Hồ sơ legacy có member nhưng thiếu studentRoster vẫn được hiển thị để không
   // làm mất bạn cùng lớp trong giai đoạn chuyển đổi dữ liệu.
-  memberSnap.docs.forEach(item => {
+  memberSnap?.docs.forEach(item => {
     const member = { uid: item.id, ...item.data() } as any;
     const studentCode = clean(member.studentCode || member.username);
     const userId = clean(member.userId) || `HS_${studentCode}`;

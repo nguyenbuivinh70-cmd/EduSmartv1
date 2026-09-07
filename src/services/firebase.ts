@@ -208,21 +208,30 @@ function normalizeGradeScopes(value: unknown, fallbackGrade: unknown = '') {
   return normalized.sort((a, b) => Number(a) - Number(b) || a.localeCompare(b, 'vi'));
 }
 
+function normalizeStudentGrade(value: unknown) {
+  return cleanText(value).replace(/\.0+$/, '');
+}
+
 function normalizeMember(raw: Record<string, unknown>, uid: string, email: string): FirebaseMemberProfile {
+  const canonicalClassId = raw.classId === null ? '' : cleanText(raw.classId);
+  const legacyClassId = cleanText(raw.lop_id);
+  const canonicalGrade = raw.grade === null ? '' : normalizeStudentGrade(raw.grade);
+  const legacyGrade = normalizeStudentGrade(raw.khoi);
+  const resolvedGrade = canonicalGrade || legacyGrade;
   return {
     authUid: cleanText(raw.authUid),
     userId: cleanText(raw.userId),
     username: cleanText(raw.username),
     displayName: cleanText(raw.displayName),
     email: cleanText(raw.email) || email,
-    role: normalizeRole(raw.role),
-    status: cleanText(raw.status).toLowerCase(),
-    adminPermission: raw.adminPermission === true,
+    role: normalizeRole(raw.role ?? raw.vai_tro),
+    status: cleanText(raw.status ?? raw.trang_thai).toLowerCase(),
+    adminPermission: raw.adminPermission === true || cleanText(raw.quyen_admin).toLowerCase() === 'true' || cleanText(raw.quyen_admin) === '1',
     schoolId: cleanText(raw.schoolId),
-    classId: raw.classId === null ? null : cleanText(raw.classId) || null,
-    grade: raw.grade === null ? null : cleanText(raw.grade) || null,
-    gradeScopes: normalizeGradeScopes(raw.gradeScopes ?? raw.khoi_phu_trach ?? raw.grade_scope, raw.grade),
-    allGrades: raw.allGrades === true || cleanText(raw.tat_ca_khoi).toLowerCase() === 'true',
+    classId: canonicalClassId || legacyClassId || null,
+    grade: resolvedGrade || null,
+    gradeScopes: normalizeGradeScopes(raw.gradeScopes ?? raw.khoi_phu_trach ?? raw.grade_scope, resolvedGrade),
+    allGrades: raw.allGrades === true || cleanText(raw.tat_ca_khoi).toLowerCase() === 'true' || cleanText(raw.tat_ca_khoi) === '1',
   };
 }
 
@@ -248,8 +257,8 @@ export function firebaseErrorMessage(error: unknown) {
     'auth/user-disabled': 'Tài khoản Firebase đã bị vô hiệu hóa.',
     'auth/too-many-requests': 'Đăng nhập sai quá nhiều lần. Vui lòng thử lại sau.',
     'auth/network-request-failed': 'Không kết nối được Firebase. Vui lòng kiểm tra Internet.',
-    'permission-denied': 'Firestore từ chối thao tác. Hãy Publish Firestore Rules V6.75.2 và kiểm tra tài khoản giáo viên đang active, đúng trường và đúng phạm vi khối được phân công.',
-    'firestore/permission-denied': 'Firestore từ chối thao tác. Hãy Publish Firestore Rules V6.75.2 và kiểm tra tài khoản giáo viên đang active, đúng trường và đúng phạm vi khối được phân công.',
+    'permission-denied': 'Firestore từ chối thao tác. Hãy Publish Firestore Rules V6.75.4. Với học sinh, hãy kiểm tra hồ sơ đang active và thông tin lớp/khối; với giáo viên, hãy kiểm tra trường và phạm vi khối được phân công.',
+    'firestore/permission-denied': 'Firestore từ chối thao tác. Hãy Publish Firestore Rules V6.75.4. Với học sinh, hãy kiểm tra hồ sơ đang active và thông tin lớp/khối; với giáo viên, hãy kiểm tra trường và phạm vi khối được phân công.',
   };
   if (messages[code]) return messages[code];
   if (code.includes('api-key-not-valid') || (error instanceof Error && error.message.includes('api-key-not-valid'))) {
@@ -279,6 +288,10 @@ export async function loadValidatedCurrentFirebaseMember() {
   const identityRepair: Record<string, unknown> = {};
   if (!cleanText(rawMember.schoolId)) identityRepair.schoolId = FIREBASE_SCHOOL_ID;
   if (!cleanText(rawMember.authUid)) identityRepair.authUid = uid;
+  // V6.75.4: hồ sơ legacy có thể còn dùng lop_id/khoi. Tự chuẩn hóa đúng
+  // dữ liệu sẵn có của chính người dùng để Rules đọc audience ổn định.
+  if (!cleanText(rawMember.classId) && cleanText(rawMember.lop_id)) identityRepair.classId = cleanText(rawMember.lop_id);
+  if (!cleanText(rawMember.grade) && normalizeStudentGrade(rawMember.khoi)) identityRepair.grade = normalizeStudentGrade(rawMember.khoi);
   if (Object.keys(identityRepair).length) {
     try {
       await updateDoc(memberRef, { ...identityRepair, updatedAt: serverTimestamp() });
@@ -290,8 +303,8 @@ export async function loadValidatedCurrentFirebaseMember() {
   }
 
   const member = normalizeMember(memberSnapshot.data(), uid, signedInEmail);
-  if (member.authUid !== uid) throw new Error('Hồ sơ thành viên thiếu/sai authUid. Hãy Publish Firestore Rules V6.75.2 rồi đăng nhập lại.');
-  if (member.schoolId !== FIREBASE_SCHOOL_ID) throw new Error(`Hồ sơ thành viên thiếu/sai schoolId (cần ${FIREBASE_SCHOOL_ID}). Hãy Publish Firestore Rules V6.75.2 rồi đăng nhập lại.`);
+  if (member.authUid !== uid) throw new Error('Hồ sơ thành viên thiếu/sai authUid. Hãy Publish Firestore Rules V6.75.4 rồi đăng nhập lại.');
+  if (member.schoolId !== FIREBASE_SCHOOL_ID) throw new Error(`Hồ sơ thành viên thiếu/sai schoolId (cần ${FIREBASE_SCHOOL_ID}). Hãy Publish Firestore Rules V6.75.4 rồi đăng nhập lại.`);
   if (member.status !== 'active') throw new Error('Tài khoản thành viên đang bị khóa hoặc chưa kích hoạt.');
   if (!member.userId) throw new Error('Hồ sơ thành viên chưa có trường userId.');
   return { uid, ...member };
@@ -358,6 +371,9 @@ export async function signInAndLoadMember(email: string, password: string): Prom
     const identityRepair: Record<string, unknown> = {};
     if (!cleanText(rawMember.schoolId)) identityRepair.schoolId = FIREBASE_SCHOOL_ID;
     if (!cleanText(rawMember.authUid)) identityRepair.authUid = uid;
+    // V6.75.4: chuẩn hóa hồ sơ legacy ngay trong lần đăng nhập tương tác.
+    if (!cleanText(rawMember.classId) && cleanText(rawMember.lop_id)) identityRepair.classId = cleanText(rawMember.lop_id);
+    if (!cleanText(rawMember.grade) && normalizeStudentGrade(rawMember.khoi)) identityRepair.grade = normalizeStudentGrade(rawMember.khoi);
     if (Object.keys(identityRepair).length) {
       try {
         await updateDoc(memberRef, { ...identityRepair, updatedAt: serverTimestamp() });
@@ -369,8 +385,8 @@ export async function signInAndLoadMember(email: string, password: string): Prom
     }
 
     const member = normalizeMember(memberSnapshot.data(), uid, signedInEmail);
-    if (member.authUid !== uid) throw new Error('Hồ sơ thành viên thiếu/sai authUid. Hãy Publish Firestore Rules V6.75.2 rồi đăng nhập lại.');
-    if (member.schoolId !== FIREBASE_SCHOOL_ID) throw new Error(`Hồ sơ thành viên thiếu/sai schoolId (cần ${FIREBASE_SCHOOL_ID}). Hãy Publish Firestore Rules V6.75.2 rồi đăng nhập lại.`);
+    if (member.authUid !== uid) throw new Error('Hồ sơ thành viên thiếu/sai authUid. Hãy Publish Firestore Rules V6.75.4 rồi đăng nhập lại.');
+    if (member.schoolId !== FIREBASE_SCHOOL_ID) throw new Error(`Hồ sơ thành viên thiếu/sai schoolId (cần ${FIREBASE_SCHOOL_ID}). Hãy Publish Firestore Rules V6.75.4 rồi đăng nhập lại.`);
     if (member.status !== 'active') throw new Error('Tài khoản thành viên đang bị khóa hoặc chưa kích hoạt.');
     if (!member.userId) throw new Error('Hồ sơ thành viên chưa có trường userId.');
 
@@ -452,7 +468,7 @@ export async function verifyOrActivateFirebaseClassmateInIsolation(
       } catch (rosterError) {
         const rosterCode = rosterError instanceof FirebaseError ? rosterError.code : '';
         if (rosterCode === 'permission-denied' || rosterCode === 'firestore/permission-denied') {
-          throw new Error('Chưa thể kiểm tra bạn cùng lớp. Hãy triển khai Firestore Rules V6.75.2 rồi thử lại.');
+          throw new Error('Chưa thể kiểm tra bạn cùng lớp. Hãy triển khai Firestore Rules V6.75.4 rồi thử lại.');
         }
         throw rosterError;
       }
@@ -535,7 +551,7 @@ export async function verifyOrActivateFirebaseClassmateInIsolation(
 
     const member = normalizeMember(memberSnapshot.data(), uid, signedInEmail);
     if (member.authUid !== uid || member.schoolId !== FIREBASE_SCHOOL_ID) {
-      throw new Error('Hồ sơ Firebase của bạn học cùng thiếu/sai authUid hoặc schoolId. Hãy Publish Firestore Rules V6.75.2.');
+      throw new Error('Hồ sơ Firebase của bạn học cùng thiếu/sai authUid hoặc schoolId. Hãy Publish Firestore Rules V6.75.4.');
     }
     if (member.role !== 'student') throw new Error('Tài khoản được nhập không phải tài khoản học sinh.');
     if (member.status !== 'active') throw new Error('Tài khoản bạn học cùng đang bị khóa hoặc chưa kích hoạt.');

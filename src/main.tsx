@@ -2,7 +2,7 @@ import { createRoot } from 'react-dom/client';
 import './index.css';
 
 const rootElement = document.getElementById('root');
-const APP_VERSION = 'EduSmart V6.75.2 IntegratedLearningReliability';
+const APP_VERSION = 'EduSmart V6.75.4 StudentLessonAccessCompatibility';
 let hasMountedReactApp = false;
 
 function escapeHtml(value: string) {

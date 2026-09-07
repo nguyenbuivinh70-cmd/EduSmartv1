@@ -1,0 +1,961 @@
+// EduSmart V6.75.4 - Integrated learning reliability
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function memberPath(schoolId) {
+      return /databases/$(database)/documents/schools/$(schoolId)/members/$(request.auth.uid);
+    }
+
+    function hasMembership(schoolId) {
+      return signedIn() && exists(memberPath(schoolId));
+    }
+
+    function memberData(schoolId) {
+      return get(memberPath(schoolId)).data;
+    }
+
+    function memberBelongsToSchool(schoolId) {
+      // Hồ sơ nằm ngay dưới schools/{schoolId}/members nên với dữ liệu legacy
+      // chưa có field schoolId, chính path đã là ranh giới trường. Tài liệu mới
+      // vẫn bắt buộc ghi schoolId qua các hàm validate bên dưới.
+      return !memberData(schoolId).keys().hasAll(['schoolId'])
+        || memberData(schoolId).schoolId == schoolId;
+    }
+
+    function isActiveMember(schoolId) {
+      return signedIn() && activeProfile(schoolId, memberData(schoolId));
+    }
+
+    function activeProfile(schoolId, profile) {
+      return profile != null && profile.get('schoolId', schoolId) == schoolId
+        && profile.get('status', profile.get('trang_thai', '')) == 'active';
+    }
+
+    // V6.75.4: dữ liệu legacy có thể lưu khối dưới dạng number (9) trong khi
+    // hồ sơ mới dùng string ('9'). Firestore Rules so sánh kiểu nghiêm ngặt nên
+    // cần tương thích hai dạng để học sinh không bị permission-denied khi mở bài.
+    function sameGradeValue(left, right) {
+      return left == right
+        || (left == 6 && right in ['6', '6.0']) || (right == 6 && left in ['6', '6.0'])
+        || (left == 7 && right in ['7', '7.0']) || (right == 7 && left in ['7', '7.0'])
+        || (left == 8 && right in ['8', '8.0']) || (right == 8 && left in ['8', '8.0'])
+        || (left == 9 && right in ['9', '9.0']) || (right == 9 && left in ['9', '9.0'])
+        || (left == '6' && right == '6.0') || (left == '6.0' && right == '6')
+        || (left == '7' && right == '7.0') || (left == '7.0' && right == '7')
+        || (left == '8' && right == '8.0') || (left == '8.0' && right == '8')
+        || (left == '9' && right == '9.0') || (left == '9.0' && right == '9');
+    }
+
+    function memberGradeValue(schoolId) {
+      let profile = memberData(schoolId);
+      let canonical = profile.get('grade', '');
+      return canonical == null || canonical == '' ? profile.get('khoi', '') : canonical;
+    }
+
+    function memberClassValue(schoolId) {
+      let profile = memberData(schoolId);
+      let canonical = profile.get('classId', '');
+      return canonical == null || canonical == '' ? profile.get('lop_id', '') : canonical;
+    }
+
+    function lessonContentReadableStatus(data) {
+      // `preparing` là trạng thái duy nhất phải chặn. Các trạng thái legacy khác
+      // vẫn chỉ đọc được khi lesson đã approved_shared, đúng audience, mở khóa và
+      // nằm trong cửa sổ thời gian, nên không làm nới lỏng phạm vi truy cập.
+      return !data.keys().hasAny(['content_status']) || data.content_status != 'preparing';
+    }
+
+    function adminProfile(profile) {
+      return profile.get('role', profile.get('vai_tro', '')) == 'admin' || profile.get('adminPermission', profile.get('quyen_admin', false)) in [true, 'true', 1, '1'];
+    }
+
+    function teacherGradeProfile(profile, grade) {
+      let scopes = profile.get('gradeScopes', profile.get('khoi_phu_trach', []));
+      return profile.get('role', profile.get('vai_tro', '')) == 'teacher'
+        && (adminProfile(profile) || profile.get('allGrades', profile.get('tat_ca_khoi', false)) in [true, 'true']
+          || (scopes is list && scopes.size() > 0
+            ? (scopes.hasAny([grade])
+              || (grade == '6' && scopes.hasAny([6])) || (grade == 6 && scopes.hasAny(['6']))
+              || (grade == '7' && scopes.hasAny([7])) || (grade == 7 && scopes.hasAny(['7']))
+              || (grade == '8' && scopes.hasAny([8])) || (grade == 8 && scopes.hasAny(['8']))
+              || (grade == '9' && scopes.hasAny([9])) || (grade == 9 && scopes.hasAny(['9'])))
+            : sameGradeValue(profile.get('grade', profile.get('khoi', '')), grade)));
+    }
+
+    function isAdmin(schoolId) {
+      let profile = memberData(schoolId);
+      return signedIn() && activeProfile(schoolId, profile) && adminProfile(profile);
+    }
+
+    function isTeacher(schoolId) {
+      let profile = memberData(schoolId);
+      return signedIn() && activeProfile(schoolId, profile) && profile.get('role', profile.get('vai_tro', '')) == 'teacher';
+    }
+
+    function canManageLearningContent(schoolId) {
+      let profile = memberData(schoolId);
+      return signedIn() && activeProfile(schoolId, profile)
+        && (adminProfile(profile) || profile.get('role', profile.get('vai_tro', '')) == 'teacher');
+    }
+
+    function teacherManagesGrade(schoolId, grade) {
+      // V6.75.4: chấp nhận cả schema canonical mới và các trường legacy còn tồn tại
+      // trong một số member cũ. Người dùng không thể tự sửa các trường phân quyền
+      // này (member self-update chỉ cho displayName), nên fallback legacy không làm
+      // mở rộng quyền ngoài cấu hình do Admin/Apps Script cấp.
+      let profile = memberData(schoolId);
+      return signedIn() && activeProfile(schoolId, profile) && teacherGradeProfile(profile, grade);
+    }
+
+    function canManageGradeData(schoolId, data) {
+      let profile = memberData(schoolId);
+      return signedIn() && activeProfile(schoolId, profile)
+        && (adminProfile(profile) || (data.get('khoi', '') is string
+          && data.get('khoi', '') != '' && teacherGradeProfile(profile, data.khoi)));
+    }
+
+    function hasAudienceMetadata(data) {
+      return (data.keys().hasAll(['lop_id']) && data.lop_id != '')
+        || (data.keys().hasAll(['khoi']) && data.khoi != '');
+    }
+
+    function matchesAudience(schoolId, data) {
+      // Dùng trực tiếp trường khối/lớp để cả tài liệu V1 chưa có audienceKeys
+      // và tài liệu V2 đều được kiểm tra bằng cùng một quy tắc.
+      return (hasAudienceMetadata(data)
+          && (!data.keys().hasAll(['lop_id'])
+            || data.lop_id == ''
+            || (memberClassValue(schoolId) != ''
+              && data.lop_id == memberClassValue(schoolId)))
+          && (!data.keys().hasAll(['khoi'])
+            || data.khoi == ''
+            || (memberGradeValue(schoolId) != ''
+              && sameGradeValue(data.khoi, memberGradeValue(schoolId)))))
+        || (!hasAudienceMetadata(data)
+          && (!data.keys().hasAll(['audienceKeys'])
+            || (data.audienceKeys is list
+              && (data.audienceKeys.hasAny(['all'])
+                || (memberGradeValue(schoolId) != ''
+                  && (((memberGradeValue(schoolId) is string)
+                      && data.audienceKeys.hasAny(['grade:' + memberGradeValue(schoolId)]))
+                    || (sameGradeValue(memberGradeValue(schoolId), 6) && data.audienceKeys.hasAny(['grade:6']))
+                    || (sameGradeValue(memberGradeValue(schoolId), 7) && data.audienceKeys.hasAny(['grade:7']))
+                    || (sameGradeValue(memberGradeValue(schoolId), 8) && data.audienceKeys.hasAny(['grade:8']))
+                    || (sameGradeValue(memberGradeValue(schoolId), 9) && data.audienceKeys.hasAny(['grade:9']))))
+                || (memberClassValue(schoolId) is string
+                  && memberClassValue(schoolId) != ''
+                  && data.audienceKeys.hasAny(['class:' + memberClassValue(schoolId)]))))));
+    }
+
+    function canReadPublishedAudience(schoolId, data) {
+      return data.keys().hasAll(['pham_vi', 'trang_thai'])
+        && data.pham_vi == 'shared'
+        && data.trang_thai == 'approved_shared'
+        && matchesAudience(schoolId, data);
+    }
+
+    function canReadPublishedReview(schoolId, data) {
+      return data.keys().hasAll(['pham_vi', 'trang_thai'])
+        && data.pham_vi == 'shared'
+        && data.trang_thai == 'active'
+        && matchesAudience(schoolId, data);
+    }
+
+    function canReadLessonData(schoolId, data) {
+      return isActiveMember(schoolId)
+        && (isAdmin(schoolId)
+          || (data.keys().hasAll(['createdByUid'])
+            && data.createdByUid == request.auth.uid
+            && (!isTeacher(schoolId) || canManageGradeData(schoolId, data)))
+          || (canManageLearningContent(schoolId)
+            && canManageGradeData(schoolId, data)
+            && data.keys().hasAll(['pham_vi'])
+            && data.pham_vi == 'shared')
+          || canReadPublishedAudience(schoolId, data));
+    }
+
+    function isLessonLocked(data) {
+      return data.keys().hasAll(['is_locked']) && data.is_locked == true;
+    }
+
+    // V6.73.5: học sinh chỉ được đọc nội dung trong đúng cửa sổ thời gian học.
+    // access_start_at / access_end_at là Firestore Timestamp do frontend ghi khi lưu bài.
+    // Bài legacy chưa có hai trường timestamp vẫn được xử lý bởi guard frontend/service.
+    function lessonAllowsAfterEnd(data) {
+      return data.keys().hasAny(['cho_phep_hoc_sau_han'])
+        && data.cho_phep_hoc_sau_han in [true, 'true', 1, '1'];
+    }
+
+    function isLessonScheduleOpen(data) {
+      // V6.75.4: access_* chỉ là shadow Timestamp của hai trường lịch canonical.
+      // Một số bài legacy có access_* sai kiểu hoặc còn timestamp cũ dù giáo viên
+      // đã xóa thoi_gian_*. Khi đó V6.75.3 chặn content nhưng frontend lại thấy
+      // bài đang mở. Chỉ enforce shadow timestamp khi lịch canonical thực sự có giá trị.
+      let startText = data.get('thoi_gian_bat_dau', '');
+      let endText = data.get('thoi_gian_ket_thuc', '');
+      let start = data.get('access_start_at', null);
+      let end = data.get('access_end_at', null);
+      let hasStart = startText is string && startText != '';
+      let hasEnd = endText is string && endText != '';
+      return (!hasStart || start == null || !(start is timestamp) || request.time >= start)
+        && (lessonAllowsAfterEnd(data) || !hasEnd || end == null || !(end is timestamp) || request.time <= end);
+    }
+
+    function canReadLessonContent(schoolId, data) {
+      return canReadLessonData(schoolId, data)
+        && (lessonContentReadableStatus(data) || canManageLearningContent(schoolId))
+        && (memberData(schoolId).get('role', memberData(schoolId).get('vai_tro', 'student')) != 'student'
+          || (!isLessonLocked(data) && isLessonScheduleOpen(data)));
+    }
+
+    function canWriteOwnedContent(schoolId, data) {
+      return isAdmin(schoolId)
+        || (isTeacher(schoolId) && data.createdByUid == request.auth.uid);
+    }
+
+    // Cho phép dọn dữ liệu phụ khi xóa bài học. Giáo viên chỉ được dọn dữ liệu
+    // của bài do chính mình tạo; admin/adminPermission được dọn toàn trường.
+    // Lesson document phải còn tồn tại trong lúc xóa dependency và được xóa cuối.
+    function canDeleteLessonDependency(schoolId, lessonId) {
+      return isAdmin(schoolId)
+        || (isTeacher(schoolId)
+          && lessonId is string
+          && lessonId.size() > 0
+          && exists(/databases/$(database)/documents/schools/$(schoolId)/lessons/$(lessonId))
+          && get(/databases/$(database)/documents/schools/$(schoolId)/lessons/$(lessonId)).data.createdByUid == request.auth.uid
+          && canManageGradeData(
+            schoolId,
+            get(/databases/$(database)/documents/schools/$(schoolId)/lessons/$(lessonId)).data
+          ));
+    }
+
+    function canReadTeacherOwnedOrShared(schoolId, data) {
+      return isTeacher(schoolId)
+        && canManageGradeData(schoolId, data)
+        && ((data.keys().hasAll(['createdByUid']) && data.createdByUid == request.auth.uid)
+          || (data.keys().hasAll(['pham_vi']) && data.pham_vi == 'shared'));
+    }
+
+    function canReadTeacherReview(schoolId, data) {
+      return isTeacher(schoolId)
+        && canManageGradeData(schoolId, data)
+        && ((data.keys().hasAll(['ownerUid']) && data.ownerUid == request.auth.uid)
+          || (data.keys().hasAll(['pham_vi']) && data.pham_vi == 'shared'));
+    }
+
+    function canManageReviewAttempt(schoolId, reviewId) {
+      return isAdmin(schoolId)
+        || (isTeacher(schoolId)
+          && reviewId is string
+          && reviewId.size() > 0
+          && exists(/databases/$(database)/documents/schools/$(schoolId)/reviewPractices/$(reviewId))
+          && canReadTeacherReview(
+            schoolId,
+            get(/databases/$(database)/documents/schools/$(schoolId)/reviewPractices/$(reviewId)).data
+          ));
+    }
+
+    function validCatalogDocument(schoolId) {
+      return request.resource.data.schoolId == schoolId
+        && request.resource.data.schemaVersion == 1;
+    }
+
+    function validArenaLessonMetadata() {
+      return (!request.resource.data.keys().hasAny(['arena_question_count'])
+          || (request.resource.data.arena_question_count is number
+            && request.resource.data.arena_question_count >= 0
+            && request.resource.data.arena_question_count <= 5000))
+        && (!request.resource.data.keys().hasAny(['arena_ready'])
+          || request.resource.data.arena_ready is bool);
+    }
+
+    function validLessonSecurityEnvelope(schoolId, lessonId) {
+      // V6.75.4: Firestore Rules chỉ giữ các bất biến BẢO MẬT cần thiết khi tạo
+      // lesson. Các quy tắc nghiệp vụ chi tiết (bài số, tên bài, môn, năm học...)
+      // được validate ở service trước khi ghi. Điều này tránh permission-denied do
+      // khác biệt kiểu dữ liệu nhưng vẫn khóa chặt trường, chủ sở hữu và phạm vi khối.
+      return request.resource.data.keys().hasAll([
+          'lesson_id', 'schoolId', 'schemaVersion', 'createdByUid', 'khoi'
+        ])
+        && request.resource.data.lesson_id == lessonId
+        && request.resource.data.schoolId == schoolId
+        && request.resource.data.schemaVersion == 2
+        && request.resource.data.createdByUid == request.auth.uid
+        && request.resource.data.khoi is string
+        && request.resource.data.khoi.size() > 0
+        && canManageGradeData(schoolId, request.resource.data);
+    }
+
+    function validLessonUpdateSecurityEnvelope(schoolId, lessonId) {
+      return request.resource.data.keys().hasAll([
+          'lesson_id', 'schoolId', 'schemaVersion', 'createdByUid', 'khoi'
+        ])
+        && request.resource.data.lesson_id == lessonId
+        && request.resource.data.schoolId == schoolId
+        && request.resource.data.schemaVersion == 2
+        && request.resource.data.createdByUid == resource.data.createdByUid
+        && request.resource.data.khoi is string
+        && request.resource.data.khoi.size() > 0
+        && canManageGradeData(schoolId, request.resource.data);
+    }
+
+    function validStructuredLessonDocument(schoolId) {
+      return request.resource.data.keys().hasAll([
+          'lesson_number', 'lesson_name', 'lesson_key', 'tieu_de',
+          'mon_id', 'khoi', 'nam_hoc', 'hoc_ky', 'schoolId', 'schemaVersion'
+        ])
+        && request.resource.data.schoolId == schoolId
+        && request.resource.data.schemaVersion == 2
+        && request.resource.data.lesson_number is number
+        && request.resource.data.lesson_number > 0
+        && request.resource.data.lesson_number <= 999
+        && request.resource.data.lesson_name is string
+        && request.resource.data.lesson_name.size() > 0
+        && request.resource.data.lesson_key is string
+        && request.resource.data.lesson_key.size() > 0
+        && request.resource.data.tieu_de is string
+        && request.resource.data.mon_id is string
+        && request.resource.data.mon_id.size() > 0
+        && request.resource.data.khoi is string
+        && request.resource.data.khoi.size() > 0;
+    }
+
+    function lessonIdentityFieldsChanged() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasAny([
+        'lesson_number', 'lesson_name', 'lesson_key', 'tieu_de',
+        'mon_id', 'khoi', 'lop_id', 'nam_hoc', 'hoc_ky'
+      ]);
+    }
+
+    function validMemberCreate(schoolId, memberId) {
+      return request.resource.data.keys().hasAll([
+          'authUid', 'userId', 'username', 'displayName', 'email',
+          'role', 'status', 'adminPermission', 'schoolId'
+        ])
+        && request.resource.data.authUid == memberId
+        && request.resource.data.schoolId == schoolId
+        && request.resource.data.status in ['active', 'inactive', 'locked']
+        && request.resource.data.role in ['admin', 'teacher', 'student']
+        && (request.resource.data.role != 'teacher'
+          || ((!request.resource.data.keys().hasAny(['gradeScopes'])
+              || request.resource.data.gradeScopes is list)
+            && (!request.resource.data.keys().hasAny(['allGrades'])
+              || request.resource.data.allGrades is bool)));
+    }
+
+    function studentRosterPath(schoolId, studentCode) {
+      return /databases/$(database)/documents/schools/$(schoolId)/studentRoster/$(studentCode);
+    }
+
+    function validStudentRosterDocument(schoolId, studentCode) {
+      return request.resource.data.keys().hasAll([
+          'userId', 'username', 'displayName', 'email', 'role', 'status',
+          'adminPermission', 'schoolId', 'classId', 'grade', 'studentCode',
+          'schemaVersion'
+        ])
+        && request.resource.data.schoolId == schoolId
+        && request.resource.data.studentCode == studentCode
+        && request.resource.data.username == studentCode
+        && request.resource.data.email == studentCode + '@hthtv1.firebaseapp.com'
+        && request.resource.data.role == 'student'
+        && request.resource.data.adminPermission == false
+        && request.resource.data.status in ['active', 'inactive']
+        && request.resource.data.schemaVersion == 1;
+    }
+
+    function validStudentRosterClaim(schoolId, memberId) {
+      return signedIn()
+        && request.auth.uid == memberId
+        && request.resource.data.role == 'student'
+        && request.resource.data.adminPermission == false
+        && request.resource.data.authUid == memberId
+        && request.resource.data.schoolId == schoolId
+        && request.resource.data.status == 'active'
+        && request.resource.data.studentCode == request.resource.data.username
+        && request.auth.token.email == request.resource.data.email
+        && request.auth.token.email == request.resource.data.studentCode + '@hthtv1.firebaseapp.com'
+        && exists(studentRosterPath(schoolId, request.resource.data.studentCode))
+        && get(studentRosterPath(schoolId, request.resource.data.studentCode)).data.status == 'active'
+        && get(studentRosterPath(schoolId, request.resource.data.studentCode)).data.userId == request.resource.data.userId
+        && get(studentRosterPath(schoolId, request.resource.data.studentCode)).data.displayName == request.resource.data.displayName
+        && get(studentRosterPath(schoolId, request.resource.data.studentCode)).data.classId == request.resource.data.classId
+        && sameGradeValue(get(studentRosterPath(schoolId, request.resource.data.studentCode)).data.grade, request.resource.data.grade);
+    }
+
+    function validOwnMemberUpdate(schoolId, memberId) {
+      return signedIn()
+        && request.auth.uid == memberId
+        && resource.data.schoolId == schoolId
+        && request.resource.data.schoolId == resource.data.schoolId
+        && request.resource.data.authUid == resource.data.authUid
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.status == resource.data.status
+        && request.resource.data.adminPermission == resource.data.adminPermission
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['displayName', 'updatedAt']);
+    }
+
+    function validOwnLegacyMemberRepair(schoolId, memberId) {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      let classRepairOk = !changed.hasAny(['classId'])
+        || (!resource.data.keys().hasAll(['classId'])
+          && resource.data.keys().hasAll(['lop_id'])
+          && request.resource.data.classId == resource.data.lop_id);
+      let gradeRepairOk = !changed.hasAny(['grade'])
+        || (!resource.data.keys().hasAll(['grade'])
+          && resource.data.keys().hasAll(['khoi'])
+          && sameGradeValue(request.resource.data.grade, resource.data.khoi));
+      return signedIn()
+        && request.auth.uid == memberId
+        && resource.data.get('status', resource.data.get('trang_thai', '')) == 'active'
+        && (!resource.data.keys().hasAll(['schoolId']) || resource.data.schoolId == schoolId)
+        && (!resource.data.keys().hasAll(['authUid']) || resource.data.authUid == memberId)
+        && request.resource.data.schoolId == schoolId
+        && request.resource.data.authUid == memberId
+        && classRepairOk && gradeRepairOk
+        && changed.hasOnly(['schoolId', 'authUid', 'classId', 'grade', 'updatedAt']);
+    }
+
+    function validLearningResultModerationUpdate() {
+      return request.resource.data.schoolId == resource.data.schoolId
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.resource.data.user_id == resource.data.user_id
+        && request.resource.data.lesson_id == resource.data.lesson_id
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'result_state', 'retake_allowed', 'invalidated_reason', 'invalidated_at',
+          'invalidated_by_uid', 'invalidated_by_name', 'last_result_action_id',
+          'result_version', 'updated_at', 'updatedAt', 'status',
+          'completion_percent', 'completed_steps', 'last_stage', 'step_details',
+          'quiz_total', 'quiz_answered', 'quiz_correct', 'quiz_percent',
+          'assessment_score', 'study_mode', 'co_learning_session_id',
+          'co_learner_ids', 'co_learner_user_ids', 'co_learner_names',
+          'result_group_id'
+        ]);
+    }
+
+    function consentPath(schoolId, sessionId, uid) {
+      return /databases/$(database)/documents/schools/$(schoolId)/coLearningConsents/$(sessionId + '_' + uid);
+    }
+
+    function validConsent(schoolId, consentId) {
+      let data = request.resource.data;
+      let host = get(/databases/$(database)/documents/schools/$(schoolId)/members/$(data.hostUid)).data;
+      return isActiveMember(schoolId)
+        && memberData(schoolId).get('role', memberData(schoolId).get('vai_tro', 'student')) == 'student'
+        && data.keys().hasOnly(['schoolId', 'schemaVersion', 'sessionId', 'lessonId', 'hostUid', 'ownerUid', 'userId', 'classId', 'grade', 'approved', 'createdAt'])
+        && data.schoolId == schoolId && data.schemaVersion == 1
+        && data.ownerUid == request.auth.uid && data.userId == memberData(schoolId).userId
+        && consentId == data.sessionId + '_' + request.auth.uid
+        && data.classId == memberClassValue(schoolId) && sameGradeValue(data.grade, memberGradeValue(schoolId))
+        && host.role == 'student' && host.status == 'active'
+        && host.classId == data.classId && sameGradeValue(host.grade, data.grade)
+        && data.approved == true && data.createdAt == request.time
+        && canReadLessonContent(schoolId, get(/databases/$(database)/documents/schools/$(schoolId)/lessons/$(data.lessonId)).data);
+    }
+
+    function sessionConsentAt(schoolId, data, index) {
+      let uid = data.participant_uids[index];
+      let consent = get(consentPath(schoolId, data.session_id, uid)).data;
+      return consent.ownerUid == uid && consent.userId == data.participant_user_ids[index]
+        && data.participant_keys[index] == uid + '::' + consent.userId
+        && consent.hostUid == request.auth.uid && consent.lessonId == data.lesson_id
+        && consent.classId == data.lop_id && sameGradeValue(consent.grade, data.khoi)
+        && consent.approved == true && consent.createdAt > request.time - duration.value(15, 'm');
+    }
+
+    function validGroupCreate(schoolId, sessionId) {
+      let data = request.resource.data;
+      return isActiveMember(schoolId) && memberData(schoolId).get('role', memberData(schoolId).get('vai_tro', 'student')) == 'student'
+        && data.schoolId == schoolId && data.schemaVersion == 3
+        && data.session_id == sessionId && data.ownerUid == request.auth.uid
+        && data.host_uid == request.auth.uid && data.host_user_id == memberData(schoolId).userId
+        && data.status == 'active' && data.study_mode == 'co_learning'
+        && data.participant_uids is list && data.participant_user_ids is list && data.participant_keys is list
+        && data.group_size is int && data.group_size >= 2 && data.group_size <= 6
+        && data.participant_uids.size() == data.group_size
+        && data.participant_user_ids.size() == data.group_size
+        && data.participant_keys.size() == data.group_size
+        && data.participant_uids.toSet().size() == data.group_size
+        && data.participant_user_ids.toSet().size() == data.group_size
+        && data.participant_uids[0] == request.auth.uid
+        && data.lop_id == memberClassValue(schoolId) && sameGradeValue(data.khoi, memberGradeValue(schoolId))
+        && sessionConsentAt(schoolId, data, 0) && sessionConsentAt(schoolId, data, 1)
+        && (data.group_size < 3 || sessionConsentAt(schoolId, data, 2))
+        && (data.group_size < 4 || sessionConsentAt(schoolId, data, 3))
+        && (data.group_size < 5 || sessionConsentAt(schoolId, data, 4))
+        && (data.group_size < 6 || sessionConsentAt(schoolId, data, 5));
+    }
+
+    function validGroupProgress(schoolId, data) {
+      let group = get(/databases/$(database)/documents/schools/$(schoolId)/coLearningSessions/$(data.co_learning_session_id)).data;
+      let target = get(/databases/$(database)/documents/schools/$(schoolId)/members/$(data.ownerUid)).data;
+      return data.study_mode == 'co_learning' && group.schemaVersion == 3
+        && group.status in ['active', 'completed', 'cancelled_retake']
+        && group.participant_uids.hasAny([request.auth.uid])
+        && group.participant_keys.hasAny([data.ownerUid + '::' + data.user_id])
+        && group.lesson_id == data.lesson_id && data.result_group_id == group.session_id
+        && data.lop_id == group.lop_id && sameGradeValue(data.khoi, group.khoi)
+        && target.role == 'student' && target.status == 'active'
+        && target.classId == group.lop_id && sameGradeValue(target.grade, group.khoi)
+        && memberClassValue(schoolId) == group.lop_id && sameGradeValue(memberGradeValue(schoolId), group.khoi)
+        && get(consentPath(schoolId, group.session_id, request.auth.uid)).data.approved == true
+        && get(consentPath(schoolId, group.session_id, data.ownerUid)).data.approved == true;
+    }
+
+    function validProgressWrite(schoolId, progressId) {
+      let data = request.resource.data;
+      return isActiveMember(schoolId)
+        && data.schoolId == schoolId && data.schemaVersion == 2
+        && progressId == data.user_id + '_' + data.lesson_id
+        && data.result_state == 'valid'
+        && canReadLessonContent(schoolId, get(/databases/$(database)/documents/schools/$(schoolId)/lessons/$(data.lesson_id)).data)
+        && ((data.study_mode == 'co_learning' && validGroupProgress(schoolId, data))
+          || (data.study_mode == 'single' && data.ownerUid == request.auth.uid
+            && data.user_id == memberData(schoolId).userId));
+    }
+
+    function resultCanResume() {
+      return (!resource.data.keys().hasAny(['result_state']) || resource.data.result_state != 'invalid_cheating')
+        && (!resource.data.keys().hasAny(['retake_allowed']) || resource.data.retake_allowed != false);
+    }
+
+    function validRegistryLink(schoolId, lessonId) {
+      let data = request.resource.data;
+      let registry = getAfter(/databases/$(database)/documents/schools/$(schoolId)/lessonNumberRegistry/$(data.lesson_key)).data;
+      return registry.schoolId == schoolId && registry.grade == data.khoi
+        && registry.lessonNumber == data.lesson_number
+        && ((data.lop_id == '' && registry.allLessonId == lessonId)
+          || (data.lop_id != '' && registry.allLessonId == '' && registry.classLessonIds[data.lop_id] == lessonId));
+    }
+
+    match /schools/{schoolId} {
+      allow read: if isActiveMember(schoolId);
+      allow write: if false;
+
+      match /members/{memberId} {
+        allow read: if signedIn()
+          && (request.auth.uid == memberId
+            || isAdmin(schoolId)
+            || (isActiveMember(schoolId) && memberData(schoolId).get('role', memberData(schoolId).get('vai_tro', 'student')) == 'student'
+              && resource.data.role == 'student'
+              && resource.data.status == 'active'
+              && resource.data.classId == memberClassValue(schoolId))
+            || teacherManagesGrade(schoolId, resource.data.grade));
+        allow create: if (isAdmin(schoolId)
+            && validMemberCreate(schoolId, memberId))
+          || validStudentRosterClaim(schoolId, memberId);
+        allow update: if (isAdmin(schoolId) && validMemberCreate(schoolId, memberId))
+          || validOwnMemberUpdate(schoolId, memberId)
+          || validOwnLegacyMemberRepair(schoolId, memberId);
+        allow delete: if isAdmin(schoolId)
+          && request.auth.uid != memberId;
+      }
+
+      match /studentRoster/{studentCode} {
+        allow get: if isAdmin(schoolId)
+          || teacherManagesGrade(schoolId, resource.data.grade)
+          || (isActiveMember(schoolId)
+            && memberData(schoolId).get('role', memberData(schoolId).get('vai_tro', 'student')) == 'student'
+            && resource.data.role == 'student'
+            && resource.data.status == 'active'
+            && resource.data.classId == memberClassValue(schoolId)
+            && sameGradeValue(resource.data.grade, memberGradeValue(schoolId)))
+          || (signedIn() && request.auth.token.email == studentCode + '@hthtv1.firebaseapp.com');
+        allow list: if isAdmin(schoolId)
+          || teacherManagesGrade(schoolId, resource.data.grade)
+          || (isActiveMember(schoolId)
+            && memberData(schoolId).get('role', memberData(schoolId).get('vai_tro', 'student')) == 'student'
+            && resource.data.role == 'student'
+            && resource.data.status == 'active'
+            && resource.data.classId == memberClassValue(schoolId)
+            && sameGradeValue(resource.data.grade, memberGradeValue(schoolId)));
+        allow create, update: if isAdmin(schoolId)
+          && validStudentRosterDocument(schoolId, studentCode);
+        allow delete: if isAdmin(schoolId);
+      }
+
+      match /academicYears/{academicYearId} {
+        allow read: if isActiveMember(schoolId);
+        allow create, update: if isAdmin(schoolId)
+          && validCatalogDocument(schoolId);
+        allow delete: if isAdmin(schoolId);
+      }
+
+      match /classes/{classId} {
+        allow read: if isActiveMember(schoolId);
+        allow create, update: if isAdmin(schoolId)
+          && validCatalogDocument(schoolId);
+        allow delete: if isAdmin(schoolId);
+      }
+
+      match /subjects/{subjectId} {
+        allow read: if isActiveMember(schoolId);
+        allow create, update: if isAdmin(schoolId)
+          && validCatalogDocument(schoolId);
+        allow delete: if isAdmin(schoolId);
+      }
+
+      match /migrations/{migrationId} {
+        allow read: if isActiveMember(schoolId);
+        allow create, update: if isAdmin(schoolId)
+          && validCatalogDocument(schoolId);
+        allow delete: if isAdmin(schoolId);
+      }
+
+      // V6.75.4: capability probe nhỏ để frontend xác minh ĐÚNG phiên bản Rules
+      // đã được deploy trước khi giáo viên bắt đầu pipeline xuất bản. Document chỉ
+      // tồn tại trong vài mili-giây và chỉ chính UID đó được tạo/xóa.
+      match /rulesProbes/{probeId} {
+        allow get: if isActiveMember(schoolId)
+          && request.auth.uid == probeId;
+        allow list: if false;
+        allow create, update: if isActiveMember(schoolId)
+          && request.auth.uid == probeId
+          && request.resource.data.keys().hasAll(['schoolId', 'ownerUid', 'rulesVersion', 'purpose'])
+          && request.resource.data.schoolId == schoolId
+          && request.resource.data.ownerUid == request.auth.uid
+          && request.resource.data.rulesVersion == '6.75.4'
+          && request.resource.data.purpose == 'lesson-publish-probe';
+        allow delete: if isAdmin(schoolId) || (isActiveMember(schoolId)
+          && request.auth.uid == probeId
+          && resource.data.ownerUid == request.auth.uid
+          && resource.data.rulesVersion == '6.75.4');
+      }
+
+      match /lessons/{lessonId} {
+        // Truy vấn danh sách của học sinh chỉ lấy metadata bài dùng chung đã duyệt.
+        // Nội dung bài vẫn được kiểm tra audience khi đọc document cụ thể bên dưới.
+        allow list: if isActiveMember(schoolId)
+          && (isAdmin(schoolId)
+            || canReadTeacherOwnedOrShared(schoolId, resource.data)
+            || (resource.data.pham_vi == 'shared'
+              && resource.data.trang_thai == 'approved_shared'));
+
+        // V6.75.4: giáo viên active được GET metadata lesson theo ID cụ thể để
+        // xác minh reference trong lessonNumberRegistry. LIST vẫn giữ nguyên phạm vi
+        // own/shared nên không thể dùng quyền này để liệt kê bài riêng của giáo viên khác.
+        // Điều kiện isTeacher độc lập resource.data cũng cho phép xác minh document
+        // không tồn tại, cần thiết để tự dọn orphan registry.
+        allow get: if isAdmin(schoolId) || isTeacher(schoolId) || canReadLessonData(schoolId, resource.data);
+        allow create: if canManageLearningContent(schoolId)
+          && validLessonSecurityEnvelope(schoolId, lessonId)
+          && validRegistryLink(schoolId, lessonId)
+          && validArenaLessonMetadata();
+        allow update: if canWriteOwnedContent(schoolId, resource.data)
+          && validLessonUpdateSecurityEnvelope(schoolId, lessonId)
+          && (!lessonIdentityFieldsChanged() || validRegistryLink(schoolId, lessonId))
+          && validArenaLessonMetadata();
+        allow delete: if canWriteOwnedContent(schoolId, resource.data)
+          && canManageGradeData(schoolId, resource.data);
+
+        match /content/{contentId} {
+          allow read: if isAdmin(schoolId) || canReadLessonContent(
+            schoolId,
+            get(/databases/$(database)/documents/schools/$(schoolId)/lessons/$(lessonId)).data
+          );
+
+          // V6.75.4: CREATE content giữ pipeline tách bước; runtime/rollback được sửa ở frontend trong cùng
+          // commit. Pipeline đã tạo parent lesson thành công trước, nên Rules đọc
+          // parent hiện hữu bằng get() để xác thực ownership + grade một cách ổn định.
+          allow create: if canWriteOwnedContent(
+              schoolId,
+              get(/databases/$(database)/documents/schools/$(schoolId)/lessons/$(lessonId)).data
+            )
+            && canManageGradeData(
+              schoolId,
+              get(/databases/$(database)/documents/schools/$(schoolId)/lessons/$(lessonId)).data
+            )
+            && request.resource.data.schoolId == schoolId
+            && request.resource.data.schemaVersion == 2
+            && request.resource.data.keys().hasAll(['lessonId'])
+            && request.resource.data.lessonId == lessonId
+            && (isAdmin(schoolId)
+              || (isTeacher(schoolId)
+                && request.resource.data.keys().hasAll(['ownerUid', 'createdByUid', 'khoi'])
+                && request.resource.data.ownerUid == request.auth.uid
+                && request.resource.data.createdByUid == request.auth.uid
+                && request.resource.data.khoi is string
+                && request.resource.data.khoi == get(/databases/$(database)/documents/schools/$(schoolId)/lessons/$(lessonId)).data.khoi));
+
+          // UPDATE lesson đã tồn tại vẫn dựa trên parent hiện hành để giữ nguyên
+          // ownership và phạm vi khối; metadata content mới chỉ bổ sung defense-in-depth.
+          allow update: if canWriteOwnedContent(
+            schoolId,
+            getAfter(/databases/$(database)/documents/schools/$(schoolId)/lessons/$(lessonId)).data
+          )
+            && canManageGradeData(
+              schoolId,
+              getAfter(/databases/$(database)/documents/schools/$(schoolId)/lessons/$(lessonId)).data
+            )
+            && request.resource.data.schoolId == schoolId
+            && request.resource.data.schemaVersion == 2
+            && (!request.resource.data.keys().hasAny(['lessonId']) || request.resource.data.lessonId == lessonId)
+            && (!request.resource.data.keys().hasAny(['ownerUid']) || request.resource.data.ownerUid == getAfter(/databases/$(database)/documents/schools/$(schoolId)/lessons/$(lessonId)).data.createdByUid)
+            && (!request.resource.data.keys().hasAny(['createdByUid']) || request.resource.data.createdByUid == getAfter(/databases/$(database)/documents/schools/$(schoolId)/lessons/$(lessonId)).data.createdByUid)
+            && (!request.resource.data.keys().hasAny(['khoi']) || request.resource.data.khoi == getAfter(/databases/$(database)/documents/schools/$(schoolId)/lessons/$(lessonId)).data.khoi);
+
+          allow delete: if isAdmin(schoolId)
+            || (canWriteOwnedContent(
+                schoolId,
+                get(/databases/$(database)/documents/schools/$(schoolId)/lessons/$(lessonId)).data
+              )
+              && canManageGradeData(
+                schoolId,
+                get(/databases/$(database)/documents/schools/$(schoolId)/lessons/$(lessonId)).data
+              ));
+        }
+      }
+
+      // Registry giao dịch bảo đảm một số bài không bị trùng trong cùng
+      // năm học + học kỳ + môn + khối và các phạm vi lớp giao nhau.
+      match /lessonNumberRegistry/{registryId} {
+        // V6.75.4: transaction reserve luôn phải đọc đúng một registry theo
+        // khóa xác định (năm học + học kỳ + môn + khối + số bài) để kiểm tra trùng.
+        // Một số registry legacy có thể thiếu `grade` hoặc lưu grade khác kiểu dữ
+        // liệu, làm teacherManagesGrade() từ chối ngay ở bước READ dù WRITE mới đã
+        // chuẩn hóa grade. Registry chỉ chứa metadata uniqueness, không chứa nội
+        // dung bài/học sinh, nên cho phép giáo viên active GET document cụ thể.
+        // LIST vẫn bị giới hạn theo phạm vi khối và mọi CREATE/UPDATE vẫn kiểm tra
+        // request.resource.data.grade bằng teacherManagesGrade().
+        allow get: if isAdmin(schoolId) || isTeacher(schoolId);
+        allow list: if isAdmin(schoolId)
+          || (isTeacher(schoolId)
+            && resource.data.keys().hasAll(['grade'])
+            && teacherManagesGrade(schoolId, resource.data.grade));
+        allow create, update: if (isAdmin(schoolId)
+            || (isTeacher(schoolId)
+              && request.resource.data.keys().hasAll(['grade'])
+              && teacherManagesGrade(schoolId, request.resource.data.grade)))
+          && request.resource.data.schoolId == schoolId
+          && request.resource.data.schemaVersion == 2
+          && request.resource.data.updatedByUid == request.auth.uid
+          && request.resource.data.lessonNumber is int
+          && request.resource.data.lessonNumber > 0;
+        allow delete: if isAdmin(schoolId)
+          || (isTeacher(schoolId)
+            && ((resource.data.keys().hasAll(['grade'])
+                && teacherManagesGrade(schoolId, resource.data.grade))
+              || (resource.data.keys().hasAll(['updatedByUid'])
+                && resource.data.updatedByUid == request.auth.uid)));
+      }
+
+      match /learningProgress/{progressId} {
+        allow read: if isActiveMember(schoolId)
+          && (resource.data.ownerUid == request.auth.uid
+            || isAdmin(schoolId)
+            || (isTeacher(schoolId) && canManageGradeData(schoolId, resource.data)));
+        allow create: if validProgressWrite(schoolId, progressId);
+        allow update: if (resultCanResume()
+            && request.resource.data.ownerUid == resource.data.ownerUid
+            && request.resource.data.user_id == resource.data.user_id
+            && request.resource.data.lesson_id == resource.data.lesson_id
+            && validProgressWrite(schoolId, progressId))
+          || isAdmin(schoolId)
+          || (isTeacher(schoolId) && canManageGradeData(schoolId, resource.data)
+            && validLearningResultModerationUpdate());
+        allow delete: if isAdmin(schoolId)
+          || (resource.data.keys().hasAll(['lesson_id'])
+            && canDeleteLessonDependency(schoolId, resource.data.lesson_id));
+      }
+
+      match /learningResultActions/{actionId} {
+        allow read: if isAdmin(schoolId)
+          || (isTeacher(schoolId)
+            && resource.data.keys().hasAll(['khoi'])
+            && teacherManagesGrade(schoolId, resource.data.khoi));
+        allow create: if (isAdmin(schoolId)
+            || (isTeacher(schoolId)
+              && request.resource.data.keys().hasAll(['khoi'])
+              && teacherManagesGrade(schoolId, request.resource.data.khoi)))
+          && request.resource.data.schoolId == schoolId
+          && request.resource.data.schemaVersion == 1
+          && request.resource.data.actorUid == request.auth.uid
+          && request.resource.data.action in ['allow_retake', 'invalidate_cheating'];
+        // Nhật ký xử lý kết quả không cho sửa. Chỉ xóa khi cascade xóa bài học.
+        allow update: if false;
+        allow delete: if isAdmin(schoolId) || (resource.data.keys().hasAll(['lesson_id'])
+          && canDeleteLessonDependency(schoolId, resource.data.lesson_id));
+      }
+
+      match /lessonComments/{commentId} {
+        allow read: if isActiveMember(schoolId);
+        allow create: if isActiveMember(schoolId)
+          && request.resource.data.schoolId == schoolId
+          && request.resource.data.ownerUid == request.auth.uid;
+        allow update: if isAdmin(schoolId)
+          || (isActiveMember(schoolId) && resource.data.ownerUid == request.auth.uid);
+        allow delete: if isAdmin(schoolId)
+          || (resource.data.keys().hasAll(['lesson_id'])
+            && canDeleteLessonDependency(schoolId, resource.data.lesson_id));
+      }
+
+      match /reviewPractices/{reviewId} {
+        allow list: if isActiveMember(schoolId)
+          && (isAdmin(schoolId)
+            || canReadTeacherReview(schoolId, resource.data)
+            || (resource.data.pham_vi == 'shared'
+              && resource.data.trang_thai == 'active'));
+        allow get: if isActiveMember(schoolId)
+          && (canReadPublishedReview(schoolId, resource.data)
+            || isAdmin(schoolId)
+            || canReadTeacherReview(schoolId, resource.data));
+        allow create: if canManageLearningContent(schoolId)
+          && canManageGradeData(schoolId, request.resource.data)
+          && request.resource.data.schoolId == schoolId
+          && request.resource.data.schemaVersion == 2
+          && request.resource.data.ownerUid == request.auth.uid;
+        allow update, delete: if isAdmin(schoolId)
+          || (isTeacher(schoolId)
+            && resource.data.ownerUid == request.auth.uid
+            && canManageGradeData(schoolId, resource.data));
+
+        match /content/{contentId} {
+          allow read: if isActiveMember(schoolId)
+            && (canReadPublishedReview(
+                schoolId,
+                get(/databases/$(database)/documents/schools/$(schoolId)/reviewPractices/$(reviewId)).data
+              )
+              || isAdmin(schoolId)
+              || canReadTeacherReview(
+                schoolId,
+                get(/databases/$(database)/documents/schools/$(schoolId)/reviewPractices/$(reviewId)).data
+              ));
+          allow create, update: if canManageLearningContent(schoolId)
+            && canManageGradeData(
+              schoolId,
+              getAfter(/databases/$(database)/documents/schools/$(schoolId)/reviewPractices/$(reviewId)).data
+            )
+            && request.resource.data.schoolId == schoolId
+            && request.resource.data.schemaVersion == 2
+            && (isAdmin(schoolId)
+              || getAfter(/databases/$(database)/documents/schools/$(schoolId)/reviewPractices/$(reviewId)).data.ownerUid == request.auth.uid);
+          allow delete: if isAdmin(schoolId)
+            || (isTeacher(schoolId)
+              && get(/databases/$(database)/documents/schools/$(schoolId)/reviewPractices/$(reviewId)).data.ownerUid == request.auth.uid
+              && canManageGradeData(
+                schoolId,
+                get(/databases/$(database)/documents/schools/$(schoolId)/reviewPractices/$(reviewId)).data
+              ));
+        }
+      }
+
+      match /reviewAttempts/{attemptId} {
+        allow read: if isActiveMember(schoolId)
+          && (resource.data.ownerUid == request.auth.uid
+            || isAdmin(schoolId)
+            || (resource.data.keys().hasAll(['review_id'])
+              && canManageReviewAttempt(schoolId, resource.data.review_id)));
+        allow create: if isActiveMember(schoolId)
+          && request.resource.data.schoolId == schoolId
+          && request.resource.data.ownerUid == request.auth.uid;
+        allow update: if false;
+        allow delete: if isAdmin(schoolId)
+          || (isTeacher(schoolId)
+            && resource.data.keys().hasAll(['review_id'])
+            && get(/databases/$(database)/documents/schools/$(schoolId)/reviewPractices/$(resource.data.review_id)).data.ownerUid == request.auth.uid
+            && canManageReviewAttempt(schoolId, resource.data.review_id));
+      }
+
+      match /coLearningConsents/{consentId} {
+        allow read: if isActiveMember(schoolId)
+          && (resource.data.ownerUid == request.auth.uid || resource.data.hostUid == request.auth.uid || isAdmin(schoolId)
+            || canDeleteLessonDependency(schoolId, resource.data.lessonId));
+        allow create: if validConsent(schoolId, consentId);
+        allow update: if false;
+        allow delete: if isActiveMember(schoolId)
+          && (resource.data.ownerUid == request.auth.uid || resource.data.hostUid == request.auth.uid || isAdmin(schoolId)
+            || canDeleteLessonDependency(schoolId, resource.data.lessonId));
+      }
+
+      match /coLearningSessions/{sessionId} {
+        allow read: if isActiveMember(schoolId)
+          && (isAdmin(schoolId) || canManageGradeData(schoolId, resource.data)
+            || resource.data.participant_uids.hasAny([request.auth.uid])
+            || canDeleteLessonDependency(schoolId, resource.data.lesson_id));
+        allow create: if validGroupCreate(schoolId, sessionId);
+        allow update: if isActiveMember(schoolId)
+          && ((resource.data.schemaVersion == 3
+              && resource.data.status in ['active', 'completed', 'cancelled_retake']
+              && resource.data.participant_uids.hasAny([request.auth.uid])
+              && request.resource.data.status in ['active', 'completed']
+              && request.resource.data.last_active_by_uid == request.auth.uid
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                'status', 'result_group_id', 'result_version', 'assessment_score', 'completion_percent',
+                'last_active_by_uid', 'last_active_at', 'updatedAt']))
+            || (canManageGradeData(schoolId, resource.data)
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                'status', 'last_result_action_id', 'invalidated_at', 'invalidated_by_uid', 'updatedAt'])));
+        allow delete: if isAdmin(schoolId)
+          || (resource.data.keys().hasAll(['lesson_id'])
+            && canDeleteLessonDependency(schoolId, resource.data.lesson_id));
+      }
+
+      match /accountDeletionJobs/{jobId} {
+        allow read: if isAdmin(schoolId);
+        // The original architecture authenticates Apps Script with the caller's
+        // Firebase token, so the same active-admin Rules govern resumable jobs.
+        allow create, update: if isAdmin(schoolId)
+          && request.resource.data.schoolId == schoolId
+          && request.resource.data.schemaVersion == 1
+          && request.resource.data.target is map
+          && request.resource.data.target.userId == jobId
+          && request.resource.data.target.uid != request.auth.uid
+          && request.resource.data.lessonIds is list
+          && request.resource.data.reviewIds is list
+          && request.resource.data.status in ['deleting', 'retryable']
+          && request.resource.data.identityStatus in ['', 'deleted_with_credentials', 'confirmed_in_console']
+          && request.resource.data.keys().hasOnly(['schoolId', 'schemaVersion', 'target', 'lessonIds', 'reviewIds', 'status', 'identityStatus', 'updated_at', 'lastError']);
+        allow delete: if isAdmin(schoolId);
+      }
+
+      match /appConfig/{configId} {
+        allow read: if isActiveMember(schoolId);
+        allow create, update, delete: if isAdmin(schoolId);
+      }
+
+      // API key AI là dữ liệu riêng của từng người dùng. Kể cả quản trị viên
+      // cũng không được đọc khóa của tài khoản khác.
+      match /userAIConfigs/{memberId} {
+        allow read: if isActiveMember(schoolId)
+          && request.auth.uid == memberId;
+        allow create: if isActiveMember(schoolId)
+          && request.auth.uid == memberId
+          && request.resource.data.ownerUid == request.auth.uid
+          && request.resource.data.schoolId == schoolId
+          && request.resource.data.schemaVersion == 1;
+        allow update: if isActiveMember(schoolId)
+          && request.auth.uid == memberId
+          && resource.data.ownerUid == request.auth.uid
+          && request.resource.data.ownerUid == resource.data.ownerUid
+          && request.resource.data.schoolId == resource.data.schoolId
+          && request.resource.data.schemaVersion == 1;
+        allow delete: if isActiveMember(schoolId)
+          && (request.auth.uid == memberId
+            || (isAdmin(schoolId) && request.auth.uid != memberId));
+      }
+
+      match /slidesPrompts/{promptId} {
+        allow read: if isActiveMember(schoolId)
+          && (resource.data.ownerUid == request.auth.uid || isAdmin(schoolId));
+        allow create: if canManageLearningContent(schoolId)
+          && request.resource.data.schoolId == schoolId
+          && request.resource.data.ownerUid == request.auth.uid;
+        allow update: if isAdmin(schoolId)
+          || (isTeacher(schoolId) && resource.data.ownerUid == request.auth.uid);
+        allow delete: if isAdmin(schoolId)
+          || (isTeacher(schoolId) && resource.data.ownerUid == request.auth.uid)
+          || (resource.data.keys().hasAll(['lesson_id'])
+            && canDeleteLessonDependency(schoolId, resource.data.lesson_id));
+      }
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
