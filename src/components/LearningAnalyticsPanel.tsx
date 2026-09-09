@@ -146,6 +146,23 @@ function getLearningResultLabel(row?: StudentLearningAnalyticsRow) {
   return STATUS_LABELS[row?.status || 'not_started'] || row?.status || 'Chưa học';
 }
 
+function hasStartedMainLesson(row?: StudentLearningAnalyticsRow) {
+  if (!row) return false;
+  return row.status === 'in_progress' || row.status === 'completed'
+    || Number(row.completion_percent || 0) > 0
+    || Number(row.completed_steps || 0) > 0
+    || Boolean(row.last_stage)
+    || Number(row.quiz_total || 0) > 0;
+}
+
+function getPreLessonStatusLabel(row?: StudentLearningAnalyticsRow) {
+  if (row?.pre_lesson_preparation_status === 'prepared') return 'Có chuẩn bị';
+  if (row?.pre_lesson_preparation_status === 'late_completed') return 'Chưa chuẩn bị • Đã xem muộn';
+  if (row?.pre_lesson_preparation_status === 'in_progress' || row?.pre_lesson_status === 'in_progress' || Number(row?.pre_lesson_watch_percent || 0) > 0) return `Chưa chuẩn bị • Đang xem ${Math.round(Number(row?.pre_lesson_watch_percent || 0))}%`;
+  if (row?.pre_lesson_status === 'completed') return row.pre_lesson_completed_before_deadline === false ? 'Chưa chuẩn bị • Đã xem muộn' : 'Có chuẩn bị';
+  return 'Chưa chuẩn bị';
+}
+
 function average(values: number[]) {
   const valid = values.filter((item) => typeof item === 'number' && !Number.isNaN(item));
   if (!valid.length) return undefined;
@@ -321,14 +338,15 @@ export default function LearningAnalyticsPanel({
     const mapped = lessonReportLessons.map((lesson) => {
       const targetStudents = visibleStudents.filter((student) => lessonAppliesToStudent(lesson, student));
       const progressItems = targetStudents.map((student) => progressMap.get(`${student.user_id}__${lesson.lesson_id}`)).filter((item): item is StudentLearningAnalyticsRow => Boolean(item));
+      const participatedItems = progressItems.filter((item) => hasStartedMainLesson(item));
       const completedCount = progressItems.filter((item) => item.status === 'completed' && item.result_state !== 'invalid_cheating' && item.result_state !== 'cancelled_retake').length;
       const inProgressCount = progressItems.filter((item) => item.status === 'in_progress').length;
       const avgScore = average(progressItems.map((item) => getLessonScore(item)).filter((item): item is number => item !== undefined));
       return {
         lesson,
         total: targetStudents.length,
-        participated: progressItems.length,
-        notStarted: Math.max(0, targetStudents.length - progressItems.length),
+        participated: participatedItems.length,
+        notStarted: Math.max(0, targetStudents.length - participatedItems.length),
         inProgressCount,
         completedCount,
         avgScore,
@@ -350,10 +368,15 @@ export default function LearningAnalyticsPanel({
     if (!selectedLesson) return null;
     const allStudentsForLesson = visibleStudents.filter((student) => lessonAppliesToStudent(selectedLesson, student));
     const progressItems = allStudentsForLesson.map((student) => progressMap.get(`${student.user_id}__${selectedLesson.lesson_id}`)).filter((item): item is StudentLearningAnalyticsRow => Boolean(item));
+    const participatedItems = progressItems.filter((item) => hasStartedMainLesson(item));
     const completedCount = progressItems.filter((item) => item.status === 'completed' && item.result_state !== 'invalid_cheating' && item.result_state !== 'cancelled_retake').length;
     const inProgressCount = progressItems.filter((item) => item.status === 'in_progress').length;
     const avg = average(progressItems.map((item) => getLessonScore(item)).filter((item): item is number => item !== undefined));
-    return { participated: progressItems.length, notStarted: Math.max(0, allStudentsForLesson.length - progressItems.length), completedCount, inProgressCount, avg, total: allStudentsForLesson.length };
+    const preLessonCompletedOnTime = progressItems.filter((item) => item.pre_lesson_preparation_status === 'prepared' || (item.pre_lesson_status === 'completed' && item.pre_lesson_completed_before_deadline !== false)).length;
+    const preLessonCompletedLate = progressItems.filter((item) => item.pre_lesson_preparation_status === 'late_completed' || (item.pre_lesson_status === 'completed' && item.pre_lesson_completed_before_deadline === false)).length;
+    const preLessonInProgress = progressItems.filter((item) => item.pre_lesson_preparation_status === 'in_progress' || item.pre_lesson_status === 'in_progress' || (item.pre_lesson_status !== 'completed' && Number(item.pre_lesson_watch_percent || 0) > 0)).length;
+    const preLessonNotStarted = Math.max(0, allStudentsForLesson.length - preLessonCompletedOnTime - preLessonCompletedLate - preLessonInProgress);
+    return { participated: participatedItems.length, notStarted: Math.max(0, allStudentsForLesson.length - participatedItems.length), completedCount, inProgressCount, avg, total: allStudentsForLesson.length, preLessonCompletedOnTime, preLessonCompletedLate, preLessonInProgress, preLessonNotStarted };
   }, [selectedLesson, visibleStudents, progressMap]);
 
   const gradeSummaryRows = useMemo(() => {
@@ -374,7 +397,7 @@ export default function LearningAnalyticsPanel({
           classItem,
           studentCount: classStudents.length,
           lessonCount: classLessons.length,
-          participatedAssignments: progressItems.length,
+          participatedAssignments: progressItems.filter((item) => hasStartedMainLesson(item)).length,
           completedAssignments,
           inProgressAssignments,
           expectedAssignments,
@@ -829,7 +852,7 @@ function SelectedLessonReport({
   onModerateResult,
 }: {
   selectedLesson: Lesson;
-  selectedLessonStats: { participated: number; notStarted: number; completedCount: number; inProgressCount: number; avg: number | undefined; total: number };
+  selectedLessonStats: { participated: number; notStarted: number; completedCount: number; inProgressCount: number; avg: number | undefined; total: number; preLessonCompletedOnTime: number; preLessonCompletedLate: number; preLessonInProgress: number; preLessonNotStarted: number };
   selectedLessonStudentRows: Array<{ index: number; student: Account; progress?: StudentLearningAnalyticsRow; score?: number; status: string }>;
   onModerateResult?: (student: Account, progress: StudentLearningAnalyticsRow) => void;
 }) {
@@ -856,6 +879,17 @@ function SelectedLessonReport({
           <LessonReportStat icon={<CheckCircle2 className="h-4 w-4" />} label="Hoàn thành" value={selectedLessonStats.completedCount} tone="indigo" />
           <LessonReportStat icon={<Trophy className="h-4 w-4" />} label="Điểm TB" value={selectedLessonStats.avg === undefined ? '-' : cleanScore(selectedLessonStats.avg)} tone="amber" />
         </div>
+        {selectedLesson.pre_lesson_enabled ? (
+          <div className="mt-4 rounded-[24px] bg-white/90 p-4 shadow-sm ring-1 ring-fuchsia-100">
+            <div className="flex flex-wrap items-center justify-between gap-2"><p className="text-sm font-black text-slate-900">Chuẩn bị trước bài • Video</p><span className="rounded-full bg-fuchsia-50 px-3 py-1 text-xs font-black text-fuchsia-700">Ngưỡng {selectedLesson.pre_lesson_completion_threshold || 80}%</span></div>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              <LessonReportStat icon={<CheckCircle2 className="h-4 w-4" />} label="Có chuẩn bị" value={selectedLessonStats.preLessonCompletedOnTime} tone="emerald" />
+              <LessonReportStat icon={<CalendarDays className="h-4 w-4" />} label="Đã xem muộn" value={selectedLessonStats.preLessonCompletedLate} tone="amber" />
+              <LessonReportStat icon={<RefreshCw className="h-4 w-4" />} label="Đang xem" value={selectedLessonStats.preLessonInProgress} tone="sky" />
+              <LessonReportStat icon={<UserX className="h-4 w-4" />} label="Chưa chuẩn bị" value={selectedLessonStats.preLessonNotStarted} tone="rose" />
+            </div>
+          </div>
+        ) : null}
       </div>
 
       <div className="p-5">
@@ -865,7 +899,7 @@ function SelectedLessonReport({
             <table className="min-w-full text-sm">
               <thead className="bg-slate-50 text-left text-slate-500">
                 <tr>
-                  {['STT', 'Học sinh', 'Lớp', 'Trạng thái', 'Tiến trình', 'Luyện tập', 'Điểm', 'Cập nhật', 'Thao tác'].map((column) => <th key={column} className="px-4 py-3 font-semibold">{column}</th>)}
+                  {['STT', 'Học sinh', 'Lớp', 'Video trước bài', 'Trạng thái', 'Tiến trình', 'Luyện tập', 'Điểm', 'Cập nhật', 'Thao tác'].map((column) => <th key={column} className="px-4 py-3 font-semibold">{column}</th>)}
                 </tr>
               </thead>
               <tbody>
@@ -877,6 +911,9 @@ function SelectedLessonReport({
                       <p className="text-xs text-slate-500">{item.student.ma_hoc_sinh || item.student.user_id}</p>
                     </td>
                     <td className="px-4 py-3 text-slate-600">{getStudentClassName(item.student)}</td>
+                    <td className="px-4 py-3">
+                      {selectedLesson.pre_lesson_enabled ? <div className="min-w-[135px]"><span className={`inline-flex rounded-full px-2.5 py-1 text-[11px] font-black ${item.progress?.pre_lesson_preparation_status === 'prepared' || (item.progress?.pre_lesson_status === 'completed' && item.progress.pre_lesson_completed_before_deadline !== false) ? 'bg-emerald-50 text-emerald-700' : item.progress?.pre_lesson_preparation_status === 'late_completed' || (item.progress?.pre_lesson_status === 'completed' && item.progress.pre_lesson_completed_before_deadline === false) ? 'bg-amber-50 text-amber-700' : Number(item.progress?.pre_lesson_watch_percent || 0) > 0 ? 'bg-sky-50 text-sky-700' : 'bg-slate-100 text-slate-500'}`}>{getPreLessonStatusLabel(item.progress)}</span>{Number(item.progress?.pre_lesson_watch_percent || 0) > 0 ? <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-slate-100"><div className="h-full rounded-full bg-fuchsia-500" style={{ width: `${Math.min(100, Number(item.progress?.pre_lesson_watch_percent || 0))}%` }} /></div> : null}{Number(item.progress?.preparation_weight || selectedLesson.pre_lesson_score_weight || 0) > 0 ? <p className="mt-1.5 text-[11px] font-semibold text-slate-500">Điểm chuẩn bị: <span className="font-black text-indigo-700">{Number(item.progress?.preparation_score ?? 0).toFixed(1)}/10</span> • {Number(item.progress?.preparation_weight || selectedLesson.pre_lesson_score_weight || 0)}%</p> : null}</div> : <span className="text-slate-300">-</span>}
+                    </td>
                     <td className="px-4 py-3"><StatusPill status={item.status} resultState={item.progress?.result_state} /></td>
                     <td className="px-4 py-3 text-slate-600">{item.progress ? `${item.progress.completed_steps}/${item.progress.total_steps} • ${item.progress.completion_percent}%` : '-'}</td>
                     <td className="px-4 py-3 text-slate-600">{item.progress?.quiz_total ? `${item.progress.quiz_correct || 0}/${item.progress.quiz_total} • ${item.progress.quiz_percent || 0}%` : '-'}</td>

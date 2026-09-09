@@ -1,11 +1,14 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { AlertTriangle, BookOpen, Bot, CheckCircle2, ChevronLeft, ChevronRight, Clock, EyeOff, HelpCircle, Lightbulb, ListChecks, LockKeyhole, Menu, MessageCircleMore, MessageSquareText, PlayCircle, Reply, RotateCcw, Send, ShieldCheck, Sparkles, Target, TimerReset, X } from 'lucide-react';
-import { AIConfig, Lesson, LessonComment, LessonContent, LessonContentBlock, LessonProgressRecord, LessonQuestionAnswerState, LessonStageKey, LessonSectionV2, QuizQuestion, SectionLearningProgress } from '../types';
+import { AlertTriangle, BookOpen, Bot, CheckCircle2, ChevronLeft, ChevronRight, Clock, EyeOff, HelpCircle, Lightbulb, ListChecks, LockKeyhole, Menu, MessageCircleMore, MessageSquareText, PlayCircle, Reply, RotateCcw, Send, ShieldCheck, Sparkles, Target, TimerReset, UnlockKeyhole, Users, X } from 'lucide-react';
+import { AIConfig, CatalogClass, Lesson, LessonCloseSnapshot, LessonComment, LessonContent, LessonContentBlock, LessonProgressRecord, LessonQuestionAnswerState, LessonStageKey, LessonSectionV2, QuizQuestion, SectionLearningProgress, TeachingSession, User } from '../types';
 import InteractiveQuestionCard from './InteractiveQuestionCard';
 import YoutubeEmbedBlock from './YoutubeEmbedBlock';
 import LessonResultSummary from './LessonResultSummary';
 import LearningChatPanel from './LearningChatPanel';
+import { getLessonContentApi, getTeachingSessionApi, saveTeachingSessionApi, setTeachingActivityAccessApi } from '../services/api';
+import { calculateLearningProcessScore, calculateSectionProgress, calculateWeightedAssessmentScore, preparationScoreFromStatus } from '../utils/learningScoreEngine';
+import { subscribeFirebaseTeachingSession } from '../services/firebaseOperational';
 
 interface LessonViewerProps {
   isOpen: boolean;
@@ -13,15 +16,20 @@ interface LessonViewerProps {
   content: LessonContent | null;
   aiConfig: AIConfig;
   onOpenConfig: () => void;
-  onClose: () => void;
+  onClose: (snapshot?: LessonCloseSnapshot) => void | Promise<void>;
   onStageChange?: (stage: LessonStageKey) => void;
   progress?: LessonProgressRecord | null;
   onStepOpened?: (stage: LessonStageKey) => void;
   onStepViewedComplete?: (stage: LessonStageKey) => void;
   onQuizMetricsChange?: (stage: LessonStageKey, metrics: { answered: number; correct: number; total: number; answers?: Record<string, LessonQuestionAnswerState>; sectionProgress?: Record<string, SectionLearningProgress>; finalExam?: any }) => void;
+  coLearningGroupSize?: number;
+  onManageCoLearning?: () => void;
+  onOpenPreLessonVideo?: () => void;
   comments?: LessonComment[];
   isCommentsLoading?: boolean;
   currentUserRole?: string;
+  currentUser?: User | null;
+  classes?: CatalogClass[];
   onAddComment?: (payload: { lesson_id: string; noi_dung: string; parent_id?: string; loai?: string }) => Promise<boolean>;
   onUpdateComment?: (payload: { comment_id: string; trang_thai?: string; noi_dung?: string }) => Promise<boolean>;
 }
@@ -158,6 +166,15 @@ function normalizeSection(section: LessonSectionV2, index: number): LessonSectio
     source_note: cleanText(section.source_note || section.summary || ''),
     examples: (section.examples || []).map((item) => cleanText(item)).filter(Boolean),
     interactive_questions: (section.interactive_questions || []).map((question, qIndex) => normalizeQuestion(question, `IQ${index + 1}_${qIndex + 1}`)).filter((question) => question.question),
+    pages: Array.isArray(section.pages) ? section.pages.map((page, pageIndex) => ({
+      ...page,
+      page_id: page.page_id || `${section.section_id || `S${index + 1}`}_P${pageIndex + 1}`,
+      title: cleanText(page.title || `Trang ${pageIndex + 1}`),
+      subtitle: cleanText(page.subtitle || ''),
+      blocks: Array.isArray(page.blocks) ? page.blocks.map((block) => ({ ...block, title: cleanText(block.title || ''), text: cleanText(block.text || '') })).filter((block) => block.title || block.text) : [],
+      teacher_notes: cleanText(page.teacher_notes || ''),
+      student_prompt: cleanText(page.student_prompt || ''),
+    })) : undefined,
   };
 }
 
@@ -167,6 +184,28 @@ function getQuestionKey(question: QuizQuestion, index: number) {
 
 function toV2Sections(content: LessonContent | null): LessonSectionV2[] {
   if (!content) return [];
+  if (content.activities?.length) {
+    return content.activities.map((activity, index) => {
+      const pages = Array.isArray(activity.pages) ? activity.pages : [];
+      const contentBlocks = pages.flatMap((page) => page.blocks || []);
+      const text = contentBlocks.map((block) => cleanText(block.text)).filter(Boolean).join('\n\n');
+      return normalizeSection({
+        section_id: activity.activity_id || `A${index + 1}`,
+        title: activity.title || `Hoạt động ${index + 1}`,
+        content: text,
+        content_blocks: contentBlocks,
+        summary: activity.summary || activity.objective || '',
+        source_note: activity.summary || activity.objective || '',
+        interactive_questions: activity.interactions || [],
+        pages,
+        activity_type: activity.activity_type,
+        objective: activity.objective,
+        estimated_minutes: activity.estimated_minutes,
+        released: activity.released,
+        locked: activity.locked,
+      }, index);
+    });
+  }
   if (content.sections?.length) return content.sections.map(normalizeSection);
   return (content.hinh_thanh_kien_thuc || []).map((item, index) => normalizeSection({
     section_id: item.id || `S${index + 1}`,
@@ -180,12 +219,9 @@ function toV2Sections(content: LessonContent | null): LessonSectionV2[] {
       id: `IQ${index + 1}_${qIndex + 1}`,
       type: 'fill_in_blank',
       question,
-      sentence: `${question.replace(/\?+$/, '')}: _____.`,
-      choices: ['dữ liệu', 'thông tin', 'vật mang tin', 'xử lí thông tin'],
-      correctAnswers: ['thông tin'],
-      explanation: 'Chọn từ/cụm từ phù hợp với nội dung vừa học.',
-      level: 'nhan_biet',
-      source: 'from_lesson',
+      sentence: question,
+      choices: [],
+      correctAnswers: [],
     }, `IQ${index + 1}_${qIndex + 1}`)),
   }, index));
 }
@@ -534,15 +570,27 @@ export default function LessonViewer({
   onStepOpened,
   onStepViewedComplete,
   onQuizMetricsChange,
+  coLearningGroupSize = 1,
+  onManageCoLearning,
+  onOpenPreLessonVideo,
   comments = [],
   isCommentsLoading = false,
   currentUserRole = 'student',
+  currentUser = null,
+  classes = [],
   onAddComment,
   onUpdateComment,
 }: LessonViewerProps) {
-  const sections = useMemo(() => toV2Sections(content), [content]);
-  const finalQuiz = useMemo(() => toFinalQuiz(content), [content]);
+  const [liveContent, setLiveContent] = useState<LessonContent | null>(content);
+  const effectiveContent = liveContent || content;
+  const sections = useMemo(() => toV2Sections(effectiveContent), [effectiveContent]);
+  const finalQuiz = useMemo(() => toFinalQuiz(effectiveContent), [effectiveContent]);
   const [activeStep, setActiveStep] = useState<string>('intro');
+  const [teachingClassId, setTeachingClassId] = useState('');
+  const [teachingSession, setTeachingSession] = useState<TeachingSession | null>(null);
+  const [teachingSessionBusy, setTeachingSessionBusy] = useState(false);
+  const [teachingSessionError, setTeachingSessionError] = useState('');
+  const releasedSignatureRef = useRef('');
   const [answerStates, setAnswerStates] = useState<Record<string, LessonQuestionAnswerState>>({});
   const [sectionProgress, setSectionProgress] = useState<Record<string, SectionLearningProgress>>({});
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -564,6 +612,63 @@ export default function LessonViewer({
   const [commentInput, setCommentInput] = useState('');
   const [replyInputs, setReplyInputs] = useState<Record<string, string>>({});
   const [submittingCommentId, setSubmittingCommentId] = useState<string | null>(null);
+  const [closingLesson, setClosingLesson] = useState(false);
+
+  useEffect(() => {
+    setLiveContent(content);
+  }, [content, lesson?.lesson_id]);
+
+  const isTeachingMode = currentUserRole !== 'student';
+
+  const teachingClassOptions = useMemo(() => {
+    const grade = String(lesson?.khoi || '').trim();
+    const scoped = classes.filter((item) => !grade || String(item.khoi || '').trim() === grade);
+    if (lesson?.lop_id) return scoped.filter((item) => item.lop_id === lesson.lop_id);
+    return scoped;
+  }, [classes, lesson?.khoi, lesson?.lop_id]);
+
+  useEffect(() => {
+    if (!isOpen || !lesson) return;
+    if (currentUserRole === 'student') {
+      setTeachingClassId(String(currentUser?.lop_id || lesson.lop_id || ''));
+      return;
+    }
+    const preferred = String(lesson.lop_id || teachingClassId || teachingClassOptions[0]?.lop_id || '');
+    setTeachingClassId(preferred);
+  }, [isOpen, lesson?.lesson_id, lesson?.lop_id, currentUserRole, currentUser?.lop_id, teachingClassOptions]);
+
+  useEffect(() => {
+    if (!isOpen || !lesson?.lesson_id || !teachingClassId || !currentUser) return;
+    if (currentUserRole === 'student') {
+      releasedSignatureRef.current = '';
+      const unsubscribe = subscribeFirebaseTeachingSession(lesson.lesson_id, teachingClassId, (session) => {
+        const nextReleased = (session?.released_activity_ids || []).map((item) => String(item)).sort().join('|');
+        setTeachingSession(session);
+        if (releasedSignatureRef.current !== nextReleased) {
+          releasedSignatureRef.current = nextReleased;
+          void getLessonContentApi(currentUser.token, lesson.lesson_id).then(async (res) => {
+            if (!res.ok || !res.data?.content) return;
+            const { normalizeLessonContent } = await import('../services/gemini');
+            setLiveContent(normalizeLessonContent(res.data.content));
+          });
+        }
+        const currentActivity = String(session?.current_activity_id || '');
+        if (currentActivity && (session?.released_activity_ids || []).includes(currentActivity)) {
+          // Khi giáo viên chuyển sang hoạt động khác, học sinh tự đi tới hoạt động
+          // đang được trình bày. Các hoạt động cũ vẫn có thể mở lại thủ công sau đó.
+          setActiveStep(currentActivity);
+        }
+      }, () => setTeachingSessionError('Mất kết nối trạng thái tiết học. Hệ thống sẽ tự đồng bộ lại khi có kết nối.'));
+      return unsubscribe;
+    }
+    setTeachingSessionBusy(true);
+    setTeachingSessionError('');
+    void getTeachingSessionApi(currentUser.token, lesson.lesson_id, teachingClassId).then((res) => {
+      setTeachingSessionBusy(false);
+      if (res.ok) setTeachingSession(res.data || null);
+      else setTeachingSessionError(res.message || 'Không tải được trạng thái tiết học.');
+    });
+  }, [isOpen, lesson?.lesson_id, teachingClassId, currentUserRole, currentUser?.user_id]);
 
   useEffect(() => {
     if (isOpen) {
@@ -598,7 +703,7 @@ export default function LessonViewer({
     }
   }, [isOpen, lesson?.lesson_id, sections, progress?.progress_id]);
 
-  const settings = content?.settings || {} as any;
+  const settings = effectiveContent?.settings || {} as any;
   const finalExamTimeMinutes = Math.max(1, Number(settings.final_exam_time_minutes || 15));
   const lessonTimeMinutes = Math.max(1, Number(settings.lesson_time_minutes || 45));
   const lessonTimeLimitSeconds = lessonTimeMinutes * 60;
@@ -615,19 +720,24 @@ export default function LessonViewer({
       const base = { ...createSectionProgress(section), ...(sectionProgress[section.section_id] || {}) };
       const questionIds = getSectionQuestionIds(section);
       const answeredQuestionIds = questionIds.filter((questionId) => answerStates[questionId]?.submitted);
-      const interactionCount = answeredQuestionIds.length;
-      const completed = isSectionCompleted({ ...base, interactionCount, answeredQuestionIds }, questionIds.length);
-      let status: SectionLearningProgress['status'] = 'not_started';
-      if (completed) status = 'completed';
-      else if (base.opened && (Number(base.timeSpentSeconds || 0) > 0 || interactionCount > 0)) status = 'need_interaction';
-      else if (base.opened) status = 'viewing';
+      const correctCount = questionIds.filter((questionId) => answerStates[questionId]?.submitted && answerStates[questionId]?.isCorrect).length;
+      const calculated = calculateSectionProgress({
+        sectionId: section.section_id,
+        timeSpentSeconds: Number(base.timeSpentSeconds || 0),
+        requiredSeconds: Number(base.requiredSeconds || requiredSecondsForSection(section)),
+        answeredCount: answeredQuestionIds.length,
+        correctCount,
+        questionTotal: questionIds.length,
+        previous: { ...base, answeredQuestionIds },
+      });
       acc[section.section_id] = {
         ...base,
-        opened: Boolean(base.opened),
-        status,
-        interactionCount,
+        ...calculated,
         answeredQuestionIds,
-        completedAt: completed ? base.completedAt || new Date().toISOString() : '',
+        interactionCount: answeredQuestionIds.length,
+        correctCount,
+        questionTotal: questionIds.length,
+        lastVisitedAt: base.lastVisitedAt || calculated.lastVisitedAt,
       };
       return acc;
     }, {});
@@ -639,6 +749,7 @@ export default function LessonViewer({
   useEffect(() => {
     if (!isOpen || !activeStep || !sections.some((section) => section.section_id === activeStep)) return;
     const section = sections.find((item) => item.section_id === activeStep)!;
+    if (section.locked && currentUserRole === 'student') return;
     setSectionProgress((prev) => {
       const current = prev[section.section_id] || createSectionProgress(section);
       return {
@@ -758,20 +869,41 @@ export default function LessonViewer({
   const finalExamWeight = Number(assessmentConfig.final_quiz_weight || 60);
 
   const learningProcessScore = useMemo(() => {
-    const sectionCompletionRatio = sections.length ? completedSectionsCount / sections.length : 1;
-    const interactiveRatio = metrics.interactiveTotal ? metrics.interactiveCorrect / metrics.interactiveTotal : 1;
-    return Math.min(10, Math.max(0, (sectionCompletionRatio * 0.6 + interactiveRatio * 0.4) * 10));
-  }, [sections.length, completedSectionsCount, metrics.interactiveCorrect, metrics.interactiveTotal]);
+    return calculateLearningProcessScore(computedSectionProgress);
+  }, [computedSectionProgress]);
 
   const finalExamScore = useMemo(() => {
     if (!metrics.finalTotal) return 10;
     return Math.min(10, Math.max(0, (metrics.finalCorrect / metrics.finalTotal) * 10));
   }, [metrics.finalCorrect, metrics.finalTotal]);
 
-  const score = useMemo(() => {
-    const normalizedWeight = Math.max(1, learningProcessWeight + finalExamWeight);
-    return ((learningProcessScore * learningProcessWeight) + (finalExamScore * finalExamWeight)) / normalizedWeight;
-  }, [learningProcessScore, finalExamScore, learningProcessWeight, finalExamWeight]);
+  const hasPreparationVideo = Boolean(
+    String(lesson?.intro_video_url || '').trim()
+    || String(lesson?.intro_video_embed_url || '').trim()
+    || String(effectiveContent?.intro_video_url || '').trim()
+    || String(effectiveContent?.intro_video_embed_url || '').trim()
+  );
+  const preparationScoreEnabled = hasPreparationVideo
+    && lesson?.pre_lesson_enabled !== false
+    && lesson?.pre_lesson_score_enabled !== false;
+  const preparationWeight = preparationScoreEnabled
+    ? Math.max(0, Math.min(30, Number(lesson?.pre_lesson_score_weight ?? 10)))
+    : 0;
+  const preparationStatus = String(progress?.pre_lesson_preparation_status || '').trim()
+    || (progress?.pre_lesson_completed_before_deadline === true ? 'prepared'
+      : progress?.pre_lesson_status === 'completed' ? 'late_completed'
+        : Number(progress?.pre_lesson_watch_percent || 0) > 0 ? 'in_progress' : 'not_started');
+  const preparationScore = preparationScoreEnabled ? preparationScoreFromStatus(preparationStatus) : 0;
+  const weightedAssessment = useMemo(() => calculateWeightedAssessmentScore({
+    learningProcessScore,
+    finalQuizScore: finalExamScore,
+    finalSubmitted: examSubmitted,
+    learningWeight: learningProcessWeight,
+    finalWeight: finalExamWeight,
+    preparationWeight,
+    preparationScore,
+  }), [learningProcessScore, finalExamScore, examSubmitted, learningProcessWeight, finalExamWeight, preparationWeight, preparationScore]);
+  const score = weightedAssessment.score;
 
   useEffect(() => {
     if (!allQuestions.length && !sections.length) return;
@@ -805,7 +937,44 @@ export default function LessonViewer({
     }
   }, [sections.length, completedSectionsCount, onStepViewedComplete]);
 
+  const isStudentView = currentUserRole === 'student';
+  const releasedActivityIds = useMemo<Set<string>>(() => new Set((teachingSession?.released_activity_ids || []).map((item) => String(item))), [teachingSession?.released_activity_ids]);
+  const toggleActivityAccessForClass = async (section: LessonSectionV2, open: boolean, pageId?: string) => {
+    if (!lesson?.lesson_id || !currentUser || currentUserRole === 'student' || !teachingClassId) return;
+    setTeachingSessionBusy(true);
+    setTeachingSessionError('');
+    const res = await setTeachingActivityAccessApi(currentUser.token, lesson.lesson_id, teachingClassId, section.section_id, open, pageId || section.pages?.[0]?.page_id || '');
+    setTeachingSessionBusy(false);
+    if (res.ok && res.data) setTeachingSession(res.data);
+    else setTeachingSessionError(res.message || (open ? 'Không mở được mục cho lớp.' : 'Không khóa được mục đối với lớp.'));
+  };
+
+  const presentActivityForClass = async (section: LessonSectionV2, pageId?: string) => {
+    if (!lesson?.lesson_id || !currentUser || currentUserRole === 'student' || !teachingClassId) return;
+    const released: string[] = Array.from(releasedActivityIds);
+    if (!released.includes(section.section_id)) {
+      await toggleActivityAccessForClass(section, true, pageId);
+      return;
+    }
+    setTeachingSessionBusy(true);
+    setTeachingSessionError('');
+    const res = await saveTeachingSessionApi(currentUser.token, lesson.lesson_id, teachingClassId, {
+      status: 'live',
+      current_activity_id: section.section_id,
+      current_page_id: pageId || section.pages?.[0]?.page_id || '',
+      released_activity_ids: released,
+    });
+    setTeachingSessionBusy(false);
+    if (res.ok && res.data) setTeachingSession(res.data);
+    else setTeachingSessionError(res.message || 'Không chuyển được mục đang trình bày.');
+  };
+
   const selectStep = (step: string) => {
+    const targetSection = sections.find((section) => section.section_id === step);
+    if (targetSection?.locked && isStudentView) {
+      setMobileMenuOpen(false);
+      return;
+    }
     setActiveStep(step);
     setMobileMenuOpen(false);
     if (step === 'final_quiz') {
@@ -829,7 +998,7 @@ export default function LessonViewer({
   };
 
   const currentSection = sections.find((section) => section.section_id === activeStep) || null;
-  const lessonNavigationSteps = useMemo(() => ['intro', ...sections.map((section) => section.section_id), 'final_quiz', 'comments', 'result'], [sections]);
+  const lessonNavigationSteps = useMemo(() => ['intro', ...sections.filter((section) => !isStudentView || !section.locked).map((section) => section.section_id), 'final_quiz', 'comments', 'result'], [sections, isStudentView]);
   const activeNavigationIndex = Math.max(0, lessonNavigationSteps.indexOf(activeStep));
   const previousNavigationStep = activeNavigationIndex > 0 ? lessonNavigationSteps[activeNavigationIndex - 1] : null;
   const nextNavigationStep = activeNavigationIndex < lessonNavigationSteps.length - 1 ? lessonNavigationSteps[activeNavigationIndex + 1] : null;
@@ -1004,10 +1173,10 @@ Gợi ý: nêu 1 gợi ý suy nghĩ, chưa cho đáp án trực tiếp.
 Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu hỏi tương đương.`, `Tự kiểm tra: ${blockTitle}`);
   };
 
-  const passScore = Number(content?.assessment?.pass_score || content?.settings?.pass_score || 5);
-  const objectives = content?.metadata?.muc_tieu_bai_hoc || [];
-  const lessonTitle = content?.metadata?.tieu_de || lesson?.tieu_de || 'Bài học';
-  const lessonSummary = cleanText(content?.metadata?.tom_tat || lesson?.mo_ta || '');
+  const passScore = Number(effectiveContent?.assessment?.pass_score || effectiveContent?.settings?.pass_score || 5);
+  const objectives = effectiveContent?.metadata?.muc_tieu_bai_hoc || [];
+  const lessonTitle = effectiveContent?.metadata?.tieu_de || lesson?.tieu_de || 'Bài học';
+  const lessonSummary = cleanText(effectiveContent?.metadata?.tom_tat || lesson?.mo_ta || '');
 
 
   const goToFirstIncompleteSection = () => {
@@ -1053,21 +1222,41 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
           <h3 className="mt-4 text-2xl font-black text-slate-900">{lessonTitle}</h3>
           {lessonSummary && <p className="mt-3 whitespace-pre-line text-sm leading-7 text-slate-700">{lessonSummary}</p>}
           <div className="mt-5 grid gap-3 md:grid-cols-4">
-            <div className="rounded-2xl bg-white px-4 py-3 text-indigo-800 shadow-sm"><p className="text-xs font-bold uppercase">Mục học</p><p className="mt-1 text-xl font-black">{sections.length}</p></div>
+            <div className="rounded-2xl bg-white px-4 py-3 text-indigo-800 shadow-sm"><p className="text-xs font-bold uppercase">Hoạt động</p><p className="mt-1 text-xl font-black">{sections.length}</p></div>
             <div className="rounded-2xl bg-white px-4 py-3 text-fuchsia-800 shadow-sm"><p className="text-xs font-bold uppercase">Tương tác</p><p className="mt-1 text-xl font-black">{allInteractiveQuestions.length}</p></div>
             <div className="rounded-2xl bg-white px-4 py-3 text-emerald-800 shadow-sm"><p className="text-xs font-bold uppercase">Cuối bài</p><p className="mt-1 text-xl font-black">{finalQuiz.length}</p></div>
             <div className="rounded-2xl bg-white px-4 py-3 text-amber-800 shadow-sm"><p className="text-xs font-bold uppercase">Điểm đạt</p><p className="mt-1 text-xl font-black">{passScore}/10</p></div>
           </div>
         </div>
       </section>
-      {(content.intro_video_embed_url || content.intro_video_url) ? (
-        <section className="rounded-[28px] border border-red-100 bg-gradient-to-br from-red-50 via-white to-amber-50 p-5 shadow-sm">
-          <div className="mb-4">
-            <p className="inline-flex items-center gap-2 rounded-full bg-red-100 px-3 py-1 text-xs font-black uppercase tracking-[0.12em] text-red-700"><PlayCircle className="h-4 w-4" /> Video bài học</p>
-            <h4 className="mt-3 text-lg font-black text-slate-900">Xem video trước khi thực hiện hoạt động tương tác</h4>
-            <p className="mt-1 text-sm leading-6 text-slate-600">Video giúp em hình dung nội dung chính. Sau khi xem, hãy lần lượt mở các mục học và hoàn thành câu hỏi tương tác.</p>
+      {hasPreparationVideo ? (
+        <section className="rounded-[28px] border border-indigo-100 bg-gradient-to-br from-indigo-50 via-white to-fuchsia-50 p-5 shadow-sm">
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+            <div className="min-w-0">
+              <p className="inline-flex items-center gap-2 rounded-full bg-indigo-100 px-3 py-1 text-xs font-black uppercase tracking-[0.12em] text-indigo-700"><PlayCircle className="h-4 w-4" /> Nhiệm vụ chuẩn bị bài</p>
+              <h4 className="mt-3 text-lg font-black text-slate-900">Video chuẩn bị được tích hợp trong bài học</h4>
+              <p className="mt-1 text-sm leading-6 text-slate-600">Tiến độ video được theo dõi chung trước và trong khi học bài. Xem lại đoạn đã xem không cộng trùng tiến độ.</p>
+            </div>
+            <div className="grid min-w-[260px] gap-2 sm:grid-cols-2 lg:min-w-[360px]">
+              <div className={`rounded-2xl px-4 py-3 ${preparationStatus === 'prepared' ? 'bg-emerald-50 text-emerald-800' : preparationStatus === 'late_completed' ? 'bg-amber-50 text-amber-800' : 'bg-white text-indigo-800 ring-1 ring-indigo-100'}`}>
+                <p className="text-[11px] font-black uppercase tracking-[0.12em]">Chuẩn bị bài</p>
+                <p className="mt-1 text-lg font-black">{Math.round(Number(progress?.pre_lesson_watch_percent || 0))}%</p>
+                <p className="mt-1 text-xs font-semibold">{preparationStatus === 'prepared' ? 'Có chuẩn bị bài' : preparationStatus === 'late_completed' ? 'Đã xem đủ nhưng hoàn thành muộn' : Number(progress?.pre_lesson_watch_percent || 0) > 0 ? 'Đang chuẩn bị' : 'Chưa chuẩn bị'}</p>
+              </div>
+              <div className="rounded-2xl bg-white px-4 py-3 text-fuchsia-800 ring-1 ring-fuchsia-100">
+                <p className="text-[11px] font-black uppercase tracking-[0.12em]">Điểm chuẩn bị</p>
+                <p className="mt-1 text-lg font-black">{preparationScoreEnabled ? `${preparationScore.toFixed(1)}/10` : 'Không tính'}</p>
+                <p className="mt-1 text-xs font-semibold">{preparationScoreEnabled ? `Trọng số ${preparationWeight}%` : 'Giáo viên chưa bật tính điểm'}</p>
+              </div>
+            </div>
           </div>
-          <YoutubeEmbedBlock url={content.intro_video_embed_url || content.intro_video_url} title={`Video bài học: ${lessonTitle}`} />
+          {currentUserRole === 'student' && onOpenPreLessonVideo ? (
+            <button type="button" onClick={onOpenPreLessonVideo} className="mt-4 inline-flex items-center gap-2 rounded-2xl bg-indigo-600 px-5 py-3 text-sm font-black text-white shadow-lg shadow-indigo-200 hover:bg-indigo-700">
+              <PlayCircle className="h-5 w-5" /> {Number(progress?.pre_lesson_watch_percent || 0) > 0 ? 'Tiếp tục xem video chuẩn bị' : 'Xem video chuẩn bị'}
+            </button>
+          ) : (
+            <YoutubeEmbedBlock url={effectiveContent?.intro_video_embed_url || effectiveContent?.intro_video_url || lesson?.intro_video_embed_url || lesson?.intro_video_url || ''} title={`Video bài học: ${lessonTitle}`} />
+          )}
         </section>
       ) : null}
       <section className="rounded-[22px] bg-white p-4 shadow-sm ring-1 ring-slate-100 sm:rounded-[28px] sm:p-6">
@@ -1077,12 +1266,13 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
         </ul>
       </section>
       <section className="rounded-[22px] bg-white p-4 shadow-sm ring-1 ring-slate-100 sm:rounded-[28px] sm:p-6">
-        <h4 className="flex items-center gap-2 font-black text-slate-900"><Clock className="h-5 w-5 text-amber-500" /> Tiến trình nội dung</h4>
+        <h4 className="flex items-center gap-2 font-black text-slate-900"><Clock className="h-5 w-5 text-amber-500" /> Tiến trình hoạt động dạy học</h4>
         <div className="mt-4 grid gap-3 md:grid-cols-2">
           {sections.map((section) => {
             const sp = computedSectionProgress[section.section_id] || createSectionProgress(section);
             const done = sp.status === 'completed';
-            return <div key={section.section_id} className={`rounded-2xl px-4 py-3 text-sm ${done ? 'bg-emerald-50 text-emerald-800' : 'bg-rose-50 text-rose-800'}`}>{done ? '✓' : '!' } {section.title} • {sp.timeSpentSeconds}/{sp.requiredSeconds}s • {sp.interactionCount}/{section.interactive_questions?.length || 0} câu</div>;
+            if (section.locked && currentUserRole === 'student') return <div key={section.section_id} className="rounded-2xl bg-slate-100 px-4 py-3 text-sm font-semibold text-slate-500"><LockKeyhole className="mr-2 inline h-4 w-4" /> {section.title} • Giáo viên chưa mở</div>;
+            return <div key={section.section_id} className={`rounded-2xl px-4 py-3 text-sm ${done ? 'bg-emerald-50 text-emerald-800' : 'bg-rose-50 text-rose-800'}`}>{done ? '✓' : '!' } {section.title} • {sp.timeSpentSeconds}/{sp.requiredSeconds}s • {sp.interactionCount}/{section.interactive_questions?.length || 0} câu{done && Number.isFinite(Number(sp.section_score)) ? ` • ${Number(sp.section_score).toFixed(1)}/10` : ''}</div>;
           })}
         </div>
       </section>
@@ -1098,27 +1288,57 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
     const timePercent = Math.min(100, Math.round((Number(sp.timeSpentSeconds || 0) / Math.max(1, Number(sp.requiredSeconds || MIN_SECTION_SECONDS))) * 100));
     const questionTotal = section.interactive_questions?.length || 0;
     const interactionPercent = questionTotal ? Math.min(100, Math.round((Number(sp.interactionCount || 0) / questionTotal) * 100)) : 100;
-    const sectionPercent = Math.round((timePercent + interactionPercent) / 2);
+    const sectionPercent = Math.max(0, Math.min(100, Number(sp.completionPercent ?? Math.round(timePercent * 0.4 + interactionPercent * 0.6))));
+    const pages = section.pages || [];
+    const firstPage = pages[0] || null;
+    const classLabel = teachingClassOptions.find((item) => item.lop_id === teachingClassId)?.ten_lop || teachingClassId;
+    const releasedForClass = releasedActivityIds.has(section.section_id);
+    if (section.locked && currentUserRole === 'student') {
+      return <section className="rounded-[28px] bg-white p-8 text-center shadow-sm ring-1 ring-slate-100"><LockKeyhole className="mx-auto h-10 w-10 text-slate-400" /><h3 className="mt-4 text-xl font-black text-slate-900">Hoạt động chưa được mở</h3><p className="mt-2 text-sm text-slate-500">Giáo viên sẽ mở hoạt động này khi lớp học đến nội dung tương ứng.</p></section>;
+    }
     return (
       <div className="space-y-5">
+        {currentUserRole !== 'student' && isTeachingMode ? (
+          <section className="rounded-[22px] bg-white p-4 shadow-sm ring-1 ring-slate-100">
+            <div className="flex flex-wrap items-end gap-3">
+              <label className="min-w-[190px] flex-1 text-[11px] font-black uppercase tracking-[0.14em] text-slate-500">Lớp đang dạy
+                <select value={teachingClassId} onChange={(event) => setTeachingClassId(event.target.value)} disabled={Boolean(lesson?.lop_id)} className="mt-1.5 block w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm font-bold normal-case tracking-normal text-slate-800 outline-none focus:border-indigo-400 disabled:bg-slate-100">
+                  {teachingClassOptions.map((item) => <option key={item.lop_id} value={item.lop_id}>{item.ten_lop || item.lop_id} • {item.lop_id}</option>)}
+                </select>
+              </label>
+              <button type="button" disabled={!teachingClassId || teachingSessionBusy} onClick={() => void toggleActivityAccessForClass(section, !releasedForClass, firstPage?.page_id)} className={`inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-black text-white shadow-sm disabled:opacity-50 ${releasedForClass ? 'bg-rose-600 hover:bg-rose-700' : 'bg-emerald-600 hover:bg-emerald-700'}`}>{releasedForClass ? <LockKeyhole className="h-4 w-4" /> : <UnlockKeyhole className="h-4 w-4" />}{releasedForClass ? `Khóa mục đối với ${classLabel || 'lớp'}` : `Mở mục cho ${classLabel || 'lớp'}`}</button>
+              {releasedForClass ? <button type="button" disabled={teachingSessionBusy} onClick={() => void presentActivityForClass(section, firstPage?.page_id)} className="rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-black text-white shadow-sm hover:bg-indigo-700 disabled:opacity-50">Trình bày mục này</button> : null}
+              <span className={`rounded-xl px-3 py-2.5 text-xs font-bold ${releasedForClass ? 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-100' : 'bg-slate-100 text-slate-600 ring-1 ring-slate-200'}`}>{releasedForClass ? 'Học sinh được phép mở' : 'Đang khóa đối với học sinh'}</span>
+            </div>
+            {teachingSessionError ? <p className="mt-2 text-xs font-bold text-rose-700">{teachingSessionError}</p> : null}
+          </section>
+        ) : null}
         <section className="overflow-hidden rounded-[22px] bg-white shadow-sm ring-1 ring-slate-100 sm:rounded-[30px]">
           <div className="bg-gradient-to-br from-white via-indigo-50/70 to-fuchsia-50/70 p-4 sm:p-6">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <p className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1 text-xs font-bold text-indigo-700 shadow-sm"><Sparkles className="h-4 w-4" /> Mục học {index + 1}</p>
-              <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-bold ${isComplete ? 'bg-emerald-100 text-emerald-700' : needsWork ? 'bg-rose-100 text-rose-700' : 'bg-amber-100 text-amber-700'}`}>
-                {isComplete ? <CheckCircle2 className="h-4 w-4" /> : <AlertTriangle className="h-4 w-4" />}
-                {isComplete ? 'Đã hoàn thành' : needsWork ? 'Chưa hoàn thành' : 'Đang học'}
-              </span>
+              {currentUserRole === 'student' ? (
+                <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-bold ${isComplete ? 'bg-emerald-100 text-emerald-700' : needsWork ? 'bg-rose-100 text-rose-700' : 'bg-amber-100 text-amber-700'}`}>
+                  {isComplete ? <CheckCircle2 className="h-4 w-4" /> : <AlertTriangle className="h-4 w-4" />}
+                  {isComplete ? `Đã hoàn thành • ${Number(sp.section_score || 0).toFixed(1)}/10` : needsWork ? 'Chưa hoàn thành' : 'Đang học'}
+                </span>
+              ) : (
+                <span className="rounded-full bg-white px-3 py-1 text-xs font-bold text-slate-600 shadow-sm ring-1 ring-slate-200">Giảng dạy</span>
+              )}
             </div>
             <h3 className="mt-3 text-xl font-black leading-tight text-slate-900 sm:mt-4 sm:text-2xl">{section.title}</h3>
-            <p className="mt-2 text-[10px] font-semibold uppercase leading-5 tracking-[0.11em] text-slate-500 sm:mt-3 sm:text-xs sm:tracking-[0.15em]">Thời gian học: {sp.timeSpentSeconds}/{sp.requiredSeconds} giây • Tương tác: {sp.interactionCount}/{section.interactive_questions?.length || 0} câu</p>
-            <div className="mt-3 overflow-hidden rounded-full bg-white/80 shadow-inner"><div className={`h-2.5 rounded-full transition-all ${isComplete ? 'bg-emerald-500' : needsWork ? 'bg-rose-500' : 'bg-amber-400'}`} style={{ width: `${sectionPercent}%` }} /></div>
-            {renderSectionCompletionGuide(section, sp, timePercent, interactionPercent)}
-            <div className="mt-3 flex gap-2 overflow-x-auto pb-1 sm:mt-4 sm:flex-wrap sm:overflow-visible sm:pb-0">
-              <button type="button" onClick={() => handleQuickAskCurrentSection('summary')} className="shrink-0 rounded-full bg-white px-3 py-2 text-xs font-bold text-indigo-700 shadow-sm ring-1 ring-indigo-100 hover:bg-indigo-50">Tóm tắt phần này</button>
-              <button type="button" onClick={() => handleQuickAskCurrentSection('explain')} className="shrink-0 rounded-full bg-white px-3 py-2 text-xs font-bold text-fuchsia-700 shadow-sm ring-1 ring-fuchsia-100 hover:bg-fuchsia-50">Giải thích dễ hiểu</button>
-              <button type="button" onClick={() => handleQuickAskCurrentSection('example')} className="shrink-0 rounded-full bg-white px-3 py-2 text-xs font-bold text-amber-700 shadow-sm ring-1 ring-amber-100 hover:bg-amber-50">Cho ví dụ thêm</button>
-            </div>
+            {currentUserRole === 'student' ? (
+              <>
+                <p className="mt-2 text-[10px] font-semibold uppercase leading-5 tracking-[0.11em] text-slate-500 sm:mt-3 sm:text-xs sm:tracking-[0.15em]">Thời gian học: {sp.timeSpentSeconds}/{sp.requiredSeconds} giây • Tương tác: {sp.interactionCount}/{section.interactive_questions?.length || 0} câu</p>
+                <div className="mt-3 overflow-hidden rounded-full bg-white/80 shadow-inner"><div className={`h-2.5 rounded-full transition-all ${isComplete ? 'bg-emerald-500' : needsWork ? 'bg-rose-500' : 'bg-amber-400'}`} style={{ width: `${sectionPercent}%` }} /></div>
+                {renderSectionCompletionGuide(section, sp, timePercent, interactionPercent)}
+                <div className="mt-3 flex gap-2 overflow-x-auto pb-1 sm:mt-4 sm:flex-wrap sm:overflow-visible sm:pb-0">
+                  <button type="button" onClick={() => handleQuickAskCurrentSection('summary')} className="shrink-0 rounded-full bg-white px-3 py-2 text-xs font-bold text-indigo-700 shadow-sm ring-1 ring-indigo-100 hover:bg-indigo-50">Tóm tắt phần này</button>
+                  <button type="button" onClick={() => handleQuickAskCurrentSection('explain')} className="shrink-0 rounded-full bg-white px-3 py-2 text-xs font-bold text-fuchsia-700 shadow-sm ring-1 ring-fuchsia-100 hover:bg-fuchsia-50">Giải thích dễ hiểu</button>
+                  <button type="button" onClick={() => handleQuickAskCurrentSection('example')} className="shrink-0 rounded-full bg-white px-3 py-2 text-xs font-bold text-amber-700 shadow-sm ring-1 ring-amber-100 hover:bg-amber-50">Cho ví dụ thêm</button>
+                </div>
+              </>
+            ) : null}
           </div>
           <div className="space-y-4 p-3 sm:p-5 lg:p-6">
             {blocks.length ? (
@@ -1414,7 +1634,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
   };
 
 
-  const renderResult = () => <LessonResultSummary score={score} passScore={passScore} correct={metrics.correct} total={metrics.total} interactiveCorrect={metrics.interactiveCorrect} interactiveTotal={metrics.interactiveTotal} finalCorrect={metrics.finalCorrect} finalTotal={metrics.finalTotal} completedSections={completedSectionsCount} totalSections={sections.length} incompleteSections={incompleteSectionTitles} learningProcessScore={learningProcessScore} finalExamScore={finalExamScore} learningWeight={learningProcessWeight} finalWeight={finalExamWeight} onReviewIncomplete={goToFirstIncompleteSection} onRetry={content?.settings?.allow_retry !== false ? () => setAnswerStates({}) : undefined} />;
+  const renderResult = () => <LessonResultSummary score={score} passScore={passScore} correct={metrics.correct} total={metrics.total} interactiveCorrect={metrics.interactiveCorrect} interactiveTotal={metrics.interactiveTotal} finalCorrect={metrics.finalCorrect} finalTotal={metrics.finalTotal} completedSections={completedSectionsCount} totalSections={sections.length} incompleteSections={incompleteSectionTitles} learningProcessScore={learningProcessScore} finalExamScore={finalExamScore} learningWeight={weightedAssessment.learningComponentWeight} finalWeight={weightedAssessment.finalComponentWeight} preparationScore={preparationScore} preparationWeight={weightedAssessment.preparationWeight} preparationStatus={preparationStatus} onReviewIncomplete={goToFirstIncompleteSection} onRetry={content?.settings?.allow_retry !== false ? () => setAnswerStates({}) : undefined} />;
 
 
   const renderSubmitConfirmDialog = () => {
@@ -1584,11 +1804,43 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
 
   if (!isOpen || !lesson || !content) return null;
 
+  const requestClose = async () => {
+    if (closingLesson) return;
+    setClosingLesson(true);
+    try {
+      const snapshot: LessonCloseSnapshot = {
+        answered: metrics.answered,
+        correct: metrics.correct,
+        total: metrics.total,
+        answers: answerStates,
+        sectionProgress: computedSectionProgress,
+        finalExam: {
+          started_at: examStarted ? new Date(Date.now() - examElapsedSeconds * 1000).toISOString() : '',
+          submitted_at: examSubmitted ? new Date().toISOString() : '',
+          time_limit_minutes: finalExamTimeMinutes,
+          time_spent_seconds: examElapsedSeconds,
+          status: examSubmitted ? (examAutoSubmitted ? 'auto_submitted' : 'submitted') : examStarted ? 'in_progress' : 'not_started',
+          score: finalExamScore,
+          total_score: score,
+          learning_process_score: learningProcessScore,
+          correct_count: metrics.finalCorrect,
+          total_count: metrics.finalTotal,
+          unanswered_count: activeFinalQuiz.filter((question, index) => !answerStates[getQuestionKey(question, index + allInteractiveQuestions.length)]?.submitted).length,
+          attempt_number: examAttemptNumber,
+          security_events: examSecurityEvents,
+        },
+      };
+      await onClose(snapshot);
+    } finally {
+      setClosingLesson(false);
+    }
+  };
+
   return (
     <AnimatePresence>
       <div className="notranslate fixed inset-0 z-[12000] flex items-center justify-center p-1 sm:p-2" translate="no">
-        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose} className="absolute inset-0 bg-slate-950/55 backdrop-blur-sm" />
-        <motion.div initial={{ opacity: 0, scale: 0.97, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.97, y: 16 }} className="notranslate relative z-10 flex h-[100dvh] w-screen max-w-none flex-col overflow-hidden rounded-none bg-white shadow-[0_40px_100px_rgba(15,23,42,0.32)] sm:h-[calc(100dvh-16px)] sm:w-[calc(100vw-16px)] sm:rounded-[22px]" translate="no">
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => void requestClose()} className="absolute inset-0 bg-slate-950/55 backdrop-blur-sm" />
+        <motion.div initial={{ opacity: 0, scale: 0.97, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.97, y: 16 }} className="notranslate relative z-10 flex h-[100dvh] w-screen max-w-none flex-col overflow-hidden rounded-none bg-white shadow-[0_40px_100px_rgba(15,23,42,0.32)] sm:h-[calc(100dvh-16px)] sm:w-[calc(100vw-16px)] sm:rounded-[22px]" translate="no" style={{ fontFamily: 'Inter, "Segoe UI", Arial, sans-serif' }}>
           <div className="lesson-viewer-header bg-gradient-to-r from-indigo-600 via-violet-600 to-fuchsia-600 px-3 py-2.5 text-white sm:px-4 sm:py-3 lg:px-6">
             <div className="flex min-h-[52px] items-center justify-between gap-2 sm:min-h-[58px] sm:gap-3">
               <div className="min-w-0 flex-1">
@@ -1603,6 +1855,11 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                 </div>
               </div>
               <div className="flex shrink-0 items-center gap-1.5 sm:gap-3">
+                {currentUserRole === 'student' && coLearningGroupSize > 1 && onManageCoLearning && !(activeStep === 'final_quiz' && examStarted) ? (
+                  <button type="button" onClick={onManageCoLearning} className="hidden min-h-10 items-center gap-2 rounded-xl bg-white/15 px-3 py-2 text-xs font-black text-white ring-1 ring-white/15 hover:bg-white/20 sm:inline-flex" title="Thêm hoặc bỏ bạn học cùng">
+                    <Users className="h-4 w-4" /> Nhóm {coLearningGroupSize}
+                  </button>
+                ) : null}
                 {!(activeStep === 'final_quiz' && examStarted) ? (
                   <div className={`flex min-h-10 items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-black shadow-lg ring-1 sm:gap-2 sm:rounded-2xl sm:px-4 sm:py-2 ${lessonRemainingSeconds <= 300 ? 'bg-amber-400 text-white ring-white/30' : 'bg-white/20 text-white ring-white/20'}`}>
                     <TimerReset className="h-4 w-4 sm:h-5 sm:w-5" />
@@ -1613,7 +1870,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                   </div>
                 ) : null}
                 {!(activeStep === 'final_quiz' && examStarted) ? <button onClick={() => setMobileMenuOpen(true)} className="flex h-10 w-10 items-center justify-center rounded-xl bg-white/15 hover:bg-white/20 xl:hidden" title="Mở cấu trúc bài học" aria-label="Mở cấu trúc bài học"><Menu className="h-5 w-5" /></button> : null}
-                <button onClick={onClose} className="flex h-10 w-10 items-center justify-center rounded-xl bg-white/15 hover:bg-white/20" title="Đóng bài học" aria-label="Đóng bài học"><X className="h-5 w-5" /></button>
+                <button disabled={closingLesson} onClick={() => void requestClose()} className="flex h-10 w-10 items-center justify-center rounded-xl bg-white/15 hover:bg-white/20 disabled:cursor-wait disabled:opacity-60" title={closingLesson ? "Đang lưu kết quả..." : "Đóng bài học"} aria-label="Đóng bài học"><X className="h-5 w-5" /></button>
               </div>
             </div>
           </div>
@@ -1626,11 +1883,12 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                   {sections.map((section, index) => {
                     const sp = computedSectionProgress[section.section_id] || createSectionProgress(section);
                     const active = activeStep === section.section_id;
+                    const locked = currentUserRole === 'student' && section.locked;
                     return (
-                      <button key={section.section_id || index} onClick={() => selectStep(section.section_id)} className={`flex w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold transition ${statusClasses(sp.status, active)}`}>
-                        <span className="shrink-0">{sp.status === 'completed' ? '✓' : sp.status === 'need_interaction' ? '!' : sp.status === 'viewing' ? '…' : '○'}</span>
+                      <button key={section.section_id || index} disabled={locked} onClick={() => selectStep(section.section_id)} className={`flex w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold transition ${locked ? 'cursor-not-allowed bg-slate-100 text-slate-400' : statusClasses(sp.status, active)}`}>
+                        <span className="shrink-0">{locked ? <LockKeyhole className="h-4 w-4" /> : sp.status === 'completed' ? '✓' : sp.status === 'need_interaction' ? '!' : sp.status === 'viewing' ? '…' : '○'}</span>
                         <span className="line-clamp-2 flex-1">{section.title}</span>
-                        <span className="ml-auto shrink-0 text-xs opacity-80">{sp.status === 'completed' ? 'xong' : `${sp.interactionCount}/${section.interactive_questions?.length || 0}`}</span>
+                        <span className="ml-auto shrink-0 text-xs opacity-80">{locked ? 'chưa mở' : sp.status === 'completed' ? `${Number(sp.section_score || 0).toFixed(1)}/10` : `${sp.interactionCount}/${section.interactive_questions?.length || 0}`}</span>
                       </button>
                     );
                   })}
@@ -1671,11 +1929,12 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                       {sections.map((section, index) => {
                         const sp = computedSectionProgress[section.section_id] || createSectionProgress(section);
                         const active = activeStep === section.section_id;
+                        const locked = currentUserRole === 'student' && section.locked;
                         return (
-                          <button key={section.section_id || index} onClick={() => selectStep(section.section_id)} className={`flex min-h-12 w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold transition ${statusClasses(sp.status, active)}`}>
-                            <span className="shrink-0">{sp.status === 'completed' ? '✓' : sp.status === 'need_interaction' ? '!' : sp.status === 'viewing' ? '…' : '○'}</span>
+                          <button key={section.section_id || index} disabled={locked} onClick={() => selectStep(section.section_id)} className={`flex min-h-12 w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold transition ${locked ? 'cursor-not-allowed bg-slate-100 text-slate-400' : statusClasses(sp.status, active)}`}>
+                            <span className="shrink-0">{locked ? <LockKeyhole className="h-4 w-4" /> : sp.status === 'completed' ? '✓' : sp.status === 'need_interaction' ? '!' : sp.status === 'viewing' ? '…' : '○'}</span>
                             <span className="line-clamp-2 flex-1">{section.title}</span>
-                            <span className="ml-auto shrink-0 text-xs opacity-80">{sp.status === 'completed' ? 'xong' : `${sp.interactionCount}/${section.interactive_questions?.length || 0}`}</span>
+                            <span className="ml-auto shrink-0 text-xs opacity-80">{locked ? 'chưa mở' : sp.status === 'completed' ? `${Number(sp.section_score || 0).toFixed(1)}/10` : `${sp.interactionCount}/${section.interactive_questions?.length || 0}`}</span>
                           </button>
                         );
                       })}
@@ -1712,7 +1971,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                   <LearningChatPanel
                     config={aiConfig}
                     lesson={lesson}
-                    content={content}
+                    content={effectiveContent}
                     stage={activeStep === 'final_quiz' ? 'luyen_tap' : activeStep === 'result' ? 'tong_ket' : activeStep === 'intro' ? 'khoi_dong' : 'hinh_thanh_kien_thuc'}
                     stageLabel={currentSection?.title || (activeStep === 'final_quiz' ? 'Kiểm tra cuối bài' : activeStep === 'result' ? 'Kết quả' : activeStep === 'intro' ? 'Tổng quan' : 'Nội dung bài học')}
                     currentSection={currentSection}

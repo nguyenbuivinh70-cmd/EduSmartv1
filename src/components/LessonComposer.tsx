@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { AlertTriangle, BookOpenCheck, CheckCircle2, ChevronLeft, ChevronRight, Edit3, Eye, FileText, Link2, Loader2, PlayCircle, Presentation, Rocket, Save, Settings2, Sparkles, Upload, Users, X, Youtube } from 'lucide-react';
+import { AlertTriangle, BookOpenCheck, CheckCircle2, ChevronLeft, ChevronRight, Edit3, FileText, Link2, Loader2, PlayCircle, Presentation, Rocket, Save, Settings2, Sparkles, Upload, Users, X, Youtube } from 'lucide-react';
 import {
   AIConfig,
   CatalogClass,
@@ -11,13 +11,12 @@ import {
   Subject,
   User,
 } from '../types';
-import { analyzeLessonMaterial, fileToUploadedSourceFile, reviseLessonWithAI } from '../services/gemini';
+import { analyzeLessonMaterial, fileToUploadedSourceFile, reviseLessonWithAI, upgradeLessonToV3 } from '../services/gemini';
 import { getLessonBuilderDefaultsApi, resetLessonBuilderDefaultsApi, saveLessonBuilderDefaultsApi } from '../services/api';
 import { DEFAULT_ACTIVE_GRADES, sortGrades } from '../constants';
 import { buildLessonTitle, normalizeLessonName, normalizeLessonNumber, resolveLessonIdentity } from '../utils/lessonCatalog';
 import { getManagedGradeScope, teacherManagesAllGrades } from '../utils/gradeScope';
 import LessonBuilderSettingsPanel, { DEFAULT_LESSON_BUILDER_SETTINGS } from './LessonBuilderSettingsPanel';
-import LessonPreviewModal from './LessonPreviewModal';
 import AIRevisionPanel from './AIRevisionPanel';
 import GoogleSlidesPromptModal from './GoogleSlidesPromptModal';
 import LessonContentEditorWindow from './LessonContentEditorWindow';
@@ -146,13 +145,19 @@ function formatDefaultUpdatedAt(value?: string) {
 }
 
 function buildInitialValues(user: User, lesson?: Lesson | null, content?: LessonContent | null, systemSchoolYear?: string, defaultBuilderSettings?: LessonBuilderSettings | null): LessonComposerValues {
-  const settings = mergeLessonBuilderSettings(content?.settings || (!lesson ? defaultBuilderSettings : null));
+  const savedBuilderSettings = (lesson?.raw as any)?.builder_settings as LessonBuilderSettings | undefined;
+  const settings = mergeLessonBuilderSettings(savedBuilderSettings || content?.settings || (!lesson ? defaultBuilderSettings : null));
   const sectionVideoLinks = (content?.sections || []).map((section) => section.youtube_url || section.youtube_embed_url || '').join('\n');
   const identity = resolveLessonIdentity({
     lesson_number: lesson?.lesson_number ?? content?.metadata?.lesson_number,
     lesson_name: lesson?.lesson_name ?? content?.metadata?.lesson_name,
     tieu_de: lesson?.tieu_de || content?.metadata?.tieu_de || '',
   });
+  const metadataIntroVideoUrl = lesson?.intro_video_url || lesson?.raw?.intro_video_url || lesson?.intro_video_embed_url || lesson?.raw?.intro_video_embed_url || '';
+  const introVideoUrl = metadataIntroVideoUrl || content?.intro_video_url || content?.intro_video_embed_url || '';
+  const preLessonEnabled = metadataIntroVideoUrl
+    ? (lesson?.pre_lesson_enabled ?? lesson?.raw?.pre_lesson_enabled ?? true) !== false
+    : Boolean(introVideoUrl) || !lesson;
   return {
     lesson_id: lesson?.lesson_id,
     tieu_de: identity.title,
@@ -168,7 +173,14 @@ function buildInitialValues(user: User, lesson?: Lesson | null, content?: Lesson
     tu_khoa: content?.metadata?.tu_khoa?.join(', ') || '',
     lesson_json: content || null,
     builder_settings: settings,
-    intro_video_url: content?.intro_video_url || content?.intro_video_embed_url || '',
+    intro_video_url: introVideoUrl,
+    pre_lesson_enabled: preLessonEnabled,
+    pre_lesson_allow_when_locked: lesson?.pre_lesson_allow_when_locked ?? lesson?.raw?.pre_lesson_allow_when_locked ?? true,
+    pre_lesson_required: lesson?.pre_lesson_required ?? lesson?.raw?.pre_lesson_required ?? false,
+    pre_lesson_completion_threshold: Number(lesson?.pre_lesson_completion_threshold ?? lesson?.raw?.pre_lesson_completion_threshold ?? 80),
+    pre_lesson_deadline: toDatetimeLocalValue(lesson?.pre_lesson_deadline || lesson?.raw?.pre_lesson_deadline || lesson?.thoi_gian_bat_dau || ''),
+    pre_lesson_score_enabled: lesson?.pre_lesson_score_enabled ?? lesson?.raw?.pre_lesson_score_enabled ?? preLessonEnabled,
+    pre_lesson_score_weight: Math.max(0, Math.min(30, Number(lesson?.pre_lesson_score_weight ?? lesson?.raw?.pre_lesson_score_weight ?? 10))),
     section_video_links: sectionVideoLinks,
     ai_revision_request: '',
     source_text: '',
@@ -194,6 +206,11 @@ function lessonSaveDisplayError(error: unknown) {
   return raw;
 }
 
+function lessonEditSnapshot(values: LessonComposerValues) {
+  const { source_file: _sourceFile, ai_revision_request: _revision, keep_editor_open: _keepOpen, ...rest } = values;
+  return JSON.stringify(rest);
+}
+
 export default function LessonComposer({ isOpen, user, aiConfig, subjects, classes, existingLessons = [], initialLesson, initialContent, currentSchoolYear: systemSchoolYear, onClose, onSave, onOpenConfig }: LessonComposerProps) {
   const [lessonBuilderDefaults, setLessonBuilderDefaults] = useState<LessonBuilderSettings | null>(null);
   const [lessonBuilderDefaultsUpdatedAt, setLessonBuilderDefaultsUpdatedAt] = useState('');
@@ -206,19 +223,25 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
   const [isRevising, setIsRevising] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
-  const [previewOpen, setPreviewOpen] = useState(false);
   const [contentEditorOpen, setContentEditorOpen] = useState(false);
   const [slidesPromptOpen, setSlidesPromptOpen] = useState(false);
   const [activeStep, setActiveStep] = useState<ComposerStep>(initialContent ? 'content' : 'info');
   const [configurationConfirmed, setConfigurationConfirmed] = useState(Boolean(initialContent));
   const [contentNeedsRegeneration, setContentNeedsRegeneration] = useState(false);
+  const [savedStatusMessage, setSavedStatusMessage] = useState('');
+  const savedSnapshotRef = useRef('');
+  const isEditMode = Boolean(initialLesson?.lesson_id);
+  const currentSnapshot = useMemo(() => lessonEditSnapshot(values), [values]);
+  const hasUnsavedChanges = isEditMode && Boolean(savedSnapshotRef.current) && savedSnapshotRef.current !== currentSnapshot;
   const gradeOptions = useMemo(() => getAvailableLessonGrades(classes, user), [classes, user]);
 
   useEffect(() => {
     if (isOpen) {
-      setValues(buildInitialValues(user, initialLesson, initialContent, systemSchoolYear, lessonBuilderDefaults));
+      const initialValues = buildInitialValues(user, initialLesson, initialContent, systemSchoolYear, lessonBuilderDefaults);
+      setValues(initialValues);
+      savedSnapshotRef.current = lessonEditSnapshot(initialValues);
       setErrorMessage('');
-      setPreviewOpen(false);
+      setSavedStatusMessage('');
       setContentEditorOpen(false);
       setSlidesPromptOpen(false);
       setActiveStep(initialContent ? 'content' : 'info');
@@ -227,6 +250,12 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
       setDefaultStatusMessage('');
     }
   }, [isOpen, user, initialLesson, initialContent, systemSchoolYear]);
+
+  useEffect(() => {
+    if (isEditMode && savedSnapshotRef.current && savedSnapshotRef.current !== currentSnapshot) {
+      setSavedStatusMessage('');
+    }
+  }, [currentSnapshot, isEditMode]);
 
   useEffect(() => {
     if (!isOpen || !user.token || user.vai_tro === 'student') return;
@@ -344,12 +373,15 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
   const canAnalyze = Boolean(normalizeLessonNumber(values.lesson_number) && normalizeLessonName(values.lesson_name) && values.mon_id && values.khoi && (values.source_file || values.source_text.trim()));
   const introVideoEmbedUrl = getYoutubeEmbedUrl(values.intro_video_url);
   const introVideoInvalid = Boolean(values.intro_video_url?.trim() && !introVideoEmbedUrl);
-  const totalSectionQuestions = values.lesson_json?.sections?.reduce((sum, section) => sum + (section.interactive_questions?.length || 0), 0) || 0;
+  const isLessonV3 = values.lesson_json?.schema_version === 'lesson_v3' || Boolean(values.lesson_json?.activities?.length);
+  const totalSectionQuestions = isLessonV3
+    ? (values.lesson_json?.activities || []).reduce((sum, activity) => sum + (activity.interactions?.length || 0), 0)
+    : (values.lesson_json?.sections || []).reduce((sum, section) => sum + (section.interactive_questions?.length || 0), 0);
   const finalQuizCount = values.lesson_json?.final_quiz?.length || 0;
-  const invalidSectionVideoCount = values.lesson_json?.sections?.filter((section) => {
+  const invalidSectionVideoCount = isLessonV3 ? 0 : (values.lesson_json?.sections || []).filter((section) => {
     const url = section.youtube_url || section.youtube_embed_url || '';
     return Boolean(url.trim() && !getYoutubeEmbedUrl(url));
-  }).length || 0;
+  }).length;
 
   const handleSaveDefaultSettings = async () => {
     if (!user.token) return;
@@ -408,7 +440,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
       setErrorMessage('Hãy chọn môn, khối, nhập bài số, tên bài và tải file hoặc dán nội dung nguồn trước khi phân tích.');
       return;
     }
-    if (!configurationConfirmed) {
+    if (!configurationConfirmed && !isEditMode) {
       setErrorMessage('Hãy xác nhận cấu hình thiết kế bài học trước khi phân tích học liệu.');
       setActiveStep('settings');
       return;
@@ -473,7 +505,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
       setErrorMessage('Bạn cần phân tích học liệu để tạo nội dung trước khi lưu.');
       return;
     }
-    if (contentNeedsRegeneration) {
+    if (contentNeedsRegeneration && !isEditMode) {
       setErrorMessage('Thông tin, cấu hình hoặc học liệu đã thay đổi. Hãy tạo lại nội dung trước khi lưu.');
       setActiveStep('material');
       return;
@@ -497,24 +529,45 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
     setIsSaving(true);
     setErrorMessage('');
     try {
-      await onSave({
+      const savedValues: LessonComposerValues = {
         ...values,
         tieu_de: buildLessonTitle(values.lesson_number, values.lesson_name),
         lesson_number: normalizeLessonNumber(values.lesson_number),
         lesson_name: normalizeLessonName(values.lesson_name),
         save_mode: saveMode,
+        keep_editor_open: isEditMode,
         share_now: saveMode === 'publish' && values.pham_vi === 'shared',
         pham_vi: saveMode === 'draft' ? 'private' : values.pham_vi,
         lesson_json: finalJson,
         tom_tat: values.tom_tat.trim(),
         tu_khoa: values.tu_khoa.trim(),
-      });
-      onClose();
+      };
+      await onSave(savedValues);
+      setValues(savedValues);
+      savedSnapshotRef.current = lessonEditSnapshot(savedValues);
+      setSavedStatusMessage(contentNeedsRegeneration
+        ? 'Đã lưu cấu hình. Nội dung AI hiện tại được giữ nguyên; hãy tạo lại khi bạn muốn áp dụng cấu hình sinh nội dung mới.'
+        : 'Đã lưu thay đổi.');
+      if (!isEditMode) onClose();
     } catch (error) {
       setErrorMessage(lessonSaveDisplayError(error));
     } finally {
       setIsSaving(false);
     }
+  };
+
+  const upgradeExistingLessonToActivities = () => {
+    if (!values.lesson_json || isLessonV3) return;
+    const upgraded = upgradeLessonToV3(values.lesson_json);
+    setValues((prev) => ({
+      ...prev,
+      lesson_json: upgraded,
+      section_video_links: '',
+      tom_tat: upgraded.metadata?.tom_tat || prev.tom_tat,
+      tu_khoa: upgraded.metadata?.tu_khoa?.join(', ') || prev.tu_khoa,
+    }));
+    setContentNeedsRegeneration(false);
+    setErrorMessage('');
   };
 
   const updateSectionVideo = (sectionIndex: number, url: string) => {
@@ -538,6 +591,16 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
 
   const selectStep = (step: ComposerStep) => {
     if (isAnalyzing || isSaving || isRevising) return;
+    if (isEditMode) {
+      if ((step === 'content' || step === 'publish') && !values.lesson_json) {
+        setActiveStep('material');
+        setErrorMessage('Bài học chưa có nội dung. Hãy bổ sung học liệu hoặc tạo nội dung trước.');
+        return;
+      }
+      setActiveStep(step);
+      setErrorMessage('');
+      return;
+    }
     if (step !== 'info' && !infoReady) {
       setActiveStep('info');
       setErrorMessage(duplicateLesson ? 'Bài số đã trùng trong phạm vi đã chọn. Hãy đổi bài số hoặc chỉnh sửa bài hiện có.' : 'Hãy hoàn thành môn học, khối, bài số và tên bài trước.');
@@ -592,10 +655,19 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
     setActiveStep(previous.id);
   };
 
-  const sectionVideoCount = values.lesson_json?.sections?.filter((section) => getYoutubeEmbedUrl(section.youtube_url || section.youtube_embed_url)).length || 0;
+  const requestClose = () => {
+    if (isSaving) return;
+    if (isEditMode && hasUnsavedChanges) {
+      const discard = window.confirm('Bạn có thay đổi chưa được lưu. Bỏ các thay đổi và đóng cửa sổ chỉnh sửa?');
+      if (!discard) return;
+    }
+    onClose();
+  };
+
+  const sectionVideoCount = isLessonV3 ? 0 : (values.lesson_json?.sections || []).filter((section) => getYoutubeEmbedUrl(section.youtube_url || section.youtube_embed_url)).length;
   const stepReady: Record<ComposerStep, boolean> = {
     info: infoReady,
-    settings: configurationConfirmed,
+    settings: isEditMode ? true : configurationConfirmed,
     material: materialReady,
     content: contentReady,
     publish: false,
@@ -605,16 +677,16 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
     <AnimatePresence>
       {isOpen && (
         <div className="fixed inset-0 z-[10002] flex items-center justify-center p-4 lg:p-8">
-          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm" onClick={onClose} />
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm" onClick={requestClose} />
           <motion.div initial={{ opacity: 0, y: 24, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 16, scale: 0.98 }} className="relative z-10 flex h-[100dvh] w-full max-w-[1480px] flex-col overflow-hidden rounded-none bg-white shadow-[0_35px_90px_rgba(15,23,42,0.25)] sm:h-[94dvh] sm:rounded-[30px]">
             <div className="bg-gradient-to-r from-indigo-600 via-violet-600 to-fuchsia-600 px-6 py-4 text-white lg:px-8">
               <div className="flex items-start justify-between gap-4">
                 <div>
                   <p className="mb-1.5 inline-flex items-center gap-2 rounded-full bg-white/15 px-3 py-1 text-xs font-semibold"><BookOpenCheck className="h-4 w-4" /> {initialLesson ? 'Chỉnh sửa bài học' : 'Tạo bài học mới'}</p>
-                  <h2 className="text-2xl font-bold">Trình tạo bài học theo từng bước</h2>
-                  <p className="mt-1 text-sm text-white/75">Hoàn thành từng nhóm thông tin, xem trước rồi mới lưu và giao cho học sinh.</p>
+                  <h2 className="text-2xl font-bold">{isEditMode ? 'Chỉnh sửa bài học' : 'Trình tạo bài học theo từng bước'}</h2>
+                  <p className="mt-1 text-sm text-white/75">{isEditMode ? 'Chọn trực tiếp phần cần thay đổi và lưu ngay, không cần hoàn thành lại toàn bộ 5 bước.' : 'Hoàn thành từng nhóm thông tin, rà soát rồi mới lưu và giao cho học sinh.'}</p>
                 </div>
-                <button type="button" onClick={onClose} className="rounded-full bg-white/12 p-2 hover:bg-white/20" aria-label="Đóng trình tạo bài học"><X className="h-5 w-5" /></button>
+                <button type="button" onClick={requestClose} className="rounded-full bg-white/12 p-2 hover:bg-white/20" aria-label="Đóng trình tạo bài học"><X className="h-5 w-5" /></button>
               </div>
             </div>
 
@@ -634,6 +706,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
                 })}
               </div>
               {errorMessage && <p className="mt-3 rounded-2xl border border-rose-100 bg-rose-50 px-4 py-3 text-sm font-medium text-rose-700">{errorMessage}</p>}
+              {savedStatusMessage && !errorMessage ? <p className="mt-3 rounded-2xl border border-emerald-100 bg-emerald-50 px-4 py-3 text-sm font-semibold text-emerald-700">{savedStatusMessage}</p> : null}
             </div>
 
             <div className="flex-1 overflow-y-auto bg-slate-50/80">
@@ -649,14 +722,14 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
                         <div><label className="mb-2 block text-sm font-semibold text-slate-700">Tên bài <span className="text-rose-500">*</span></label><input value={values.lesson_name || ''} onChange={(e) => updateLessonName(e.target.value)} className={fieldClass} placeholder="Ví dụ: Thông tin và dữ liệu" /></div>
                         <div className={`md:col-span-2 rounded-2xl border px-4 py-3 ${duplicateLesson ? 'border-rose-200 bg-rose-50' : 'border-indigo-100 bg-indigo-50/70'}`}><p className="text-xs font-bold uppercase tracking-[0.14em] text-indigo-600">Tên bài hoàn chỉnh</p><p className="mt-1 text-base font-extrabold text-slate-900">{values.tieu_de || 'Nhập bài số và tên bài để tạo tiêu đề'}</p>{duplicateLesson ? <p className="mt-2 flex items-start gap-2 text-sm font-semibold text-rose-700"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /> Bài số này đã tồn tại trong phạm vi đang chọn: {duplicateLesson.tieu_de}. Hãy chọn số bài khác hoặc chỉnh sửa bài hiện có.</p> : null}</div>
                       </div>
-                      {contentNeedsRegeneration ? <div className="flex items-start gap-3 rounded-3xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" /><div><p className="font-bold">Thông tin tạo bài đã thay đổi</p><p className="mt-1">Sau khi xác nhận lại thiết kế và học liệu, bạn cần tạo lại nội dung để các thay đổi được áp dụng.</p></div></div> : null}
+                      {contentNeedsRegeneration ? <div className="flex items-start gap-3 rounded-3xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" /><div><p className="font-bold">Thông tin tạo bài đã thay đổi</p><p className="mt-1">{isEditMode ? 'Bạn có thể lưu thay đổi ngay. Nội dung hiện tại sẽ được giữ nguyên cho đến khi bạn chủ động tạo lại bằng AI.' : 'Sau khi xác nhận lại thiết kế và học liệu, bạn cần tạo lại nội dung để các thay đổi được áp dụng.'}</p></div></div> : null}
                     </div>
                   ) : null}
 
                   {activeStep === 'settings' ? (
                     <div className="space-y-5">
                       <div><p className="text-xs font-bold uppercase tracking-[0.18em] text-indigo-600">Bước 2</p><h3 className="mt-1 text-xl font-black text-slate-900">Thiết kế bài học trước khi phân tích</h3><p className="mt-1 text-sm text-slate-500">Chốt cấu trúc, câu hỏi, đánh giá và bài ôn tập trước khi tải học liệu để AI tạo đúng ngay từ lần đầu.</p></div>
-                      <div className={`flex items-start gap-3 rounded-3xl border p-4 text-sm ${configurationConfirmed ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-indigo-200 bg-indigo-50 text-indigo-800'}`}><CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0" /><div><p className="font-bold">{configurationConfirmed ? 'Cấu hình đã được xác nhận' : 'Cần xác nhận cấu hình'}</p><p className="mt-1">{configurationConfirmed ? 'AI sẽ sử dụng cấu hình này cho lần tạo nội dung tiếp theo.' : 'Bạn có thể dùng cấu hình mặc định hoặc điều chỉnh rồi bấm “Xác nhận cấu hình”.'}</p></div></div>
+                      <div className={`flex items-start gap-3 rounded-3xl border p-4 text-sm ${isEditMode || configurationConfirmed ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-indigo-200 bg-indigo-50 text-indigo-800'}`}><CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0" /><div><p className="font-bold">{isEditMode ? 'Chế độ chỉnh sửa thông minh' : configurationConfirmed ? 'Cấu hình đã được xác nhận' : 'Cần xác nhận cấu hình'}</p><p className="mt-1">{isEditMode ? 'Bạn có thể thay đổi cấu hình tại đây và bấm “Lưu thay đổi” ngay. Cấu hình vận hành video được lưu mà không yêu cầu tạo lại nội dung; cấu hình sinh AI sẽ được lưu kèm cảnh báo nếu nội dung hiện tại chưa được tạo lại.' : configurationConfirmed ? 'AI sẽ sử dụng cấu hình này cho lần tạo nội dung tiếp theo.' : 'Bạn có thể dùng cấu hình mặc định hoặc điều chỉnh rồi bấm “Xác nhận cấu hình”.'}</p></div></div>
                       <LessonBuilderSettingsPanel
                         value={settings}
                         onChange={(next) => { setValues((prev) => ({ ...prev, builder_settings: next })); markGenerationInputChanged(); }}
@@ -667,41 +740,95 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
                         defaultUpdatedAt={lessonBuilderDefaultsUpdatedAt}
                         defaultStatusMessage={defaultStatusMessage}
                       />
+
+                      <div className="rounded-3xl border border-violet-200 bg-gradient-to-br from-violet-50 via-white to-indigo-50 p-5">
+                        <div className="flex items-start gap-3">
+                          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-violet-600 text-white"><PlayCircle className="h-5 w-5" /></span>
+                          <div>
+                            <h4 className="font-black text-slate-900">Cấu hình video chuẩn bị trước bài</h4>
+                            <p className="mt-1 text-sm leading-6 text-slate-600">Thiết lập quyền xem và cách đánh giá trước khi nhập link video ở Bước 3. Khi bài bị khóa hoặc chưa đến giờ học, học sinh chỉ xem video một mình và không truy cập nội dung bài.</p>
+                          </div>
+                        </div>
+                        <div className="mt-4 grid gap-3 md:grid-cols-2">
+                          <label className="flex items-start gap-3 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700">
+                            <input type="checkbox" className="mt-1" checked={values.pre_lesson_enabled !== false} onChange={(e) => setValues((prev) => ({ ...prev, pre_lesson_enabled: e.target.checked }))} />
+                            <span><b>Bật nhiệm vụ video trước bài</b><small className="mt-1 block font-normal leading-5 text-slate-500">Khi có link video, hệ thống theo dõi % đã xem để đánh giá chuẩn bị bài.</small></span>
+                          </label>
+                          <label className="flex items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-semibold text-amber-900">
+                            <input type="checkbox" className="mt-1" checked={values.pre_lesson_allow_when_locked !== false} onChange={(e) => setValues((prev) => ({ ...prev, pre_lesson_allow_when_locked: e.target.checked }))} />
+                            <span><b>Cho phép xem video khi bài đang khóa / chưa đến giờ</b><small className="mt-1 block font-normal leading-5 text-amber-700">Chỉ mở video trước bài; không mở hoạt động, không cho chọn học cùng.</small></span>
+                          </label>
+                          <label className="flex items-start gap-3 rounded-2xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm font-semibold text-indigo-900">
+                            <input type="checkbox" className="mt-1" checked={Boolean(values.pre_lesson_required)} onChange={(e) => setValues((prev) => ({ ...prev, pre_lesson_required: e.target.checked }))} />
+                            <span><b>Yêu cầu hoàn thành trước bài</b><small className="mt-1 block font-normal leading-5 text-indigo-700">Dùng để thống kê Có chuẩn bị / Chưa chuẩn bị và có thể tính thành một thành phần điểm riêng của bài học.</small></span>
+                          </label>
+                          <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3">
+                            <label className="text-sm font-bold text-emerald-900">Ngưỡng hoàn thành: {Math.max(50, Math.min(100, Number(values.pre_lesson_completion_threshold || 80)))}%</label>
+                            <input type="range" min="50" max="100" step="5" value={Math.max(50, Math.min(100, Number(values.pre_lesson_completion_threshold || 80)))} onChange={(e) => setValues((prev) => ({ ...prev, pre_lesson_completion_threshold: Number(e.target.value) }))} className="mt-2 w-full" />
+                            <p className="mt-1 text-xs leading-5 text-emerald-700">Mặc định 80%. Học sinh đạt ngưỡng trước hạn sẽ được ghi nhận Có chuẩn bị bài.</p>
+                          </div>
+                          <label className="flex items-start gap-3 rounded-2xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-sm font-semibold text-cyan-900">
+                            <input type="checkbox" className="mt-1" checked={values.pre_lesson_score_enabled !== false} onChange={(e) => setValues((prev) => ({ ...prev, pre_lesson_score_enabled: e.target.checked }))} />
+                            <span><b>Tính điểm chuẩn bị vào điểm bài học</b><small className="mt-1 block font-normal leading-5 text-cyan-700">Có chuẩn bị đúng hạn = 10/10 thành phần chuẩn bị; chưa chuẩn bị hoặc hoàn thành muộn = 0/10. Khi học nhóm, điểm này áp dụng riêng từng học sinh.</small></span>
+                          </label>
+                          <div className={`rounded-2xl border px-4 py-3 ${values.pre_lesson_score_enabled !== false ? 'border-fuchsia-200 bg-fuchsia-50' : 'border-slate-200 bg-slate-50 opacity-60'}`}>
+                            <label className="text-sm font-bold text-fuchsia-900">Trọng số điểm chuẩn bị: {Math.max(0, Math.min(30, Number(values.pre_lesson_score_weight ?? 10)))}%</label>
+                            <input type="range" min="0" max="30" step="5" disabled={values.pre_lesson_score_enabled === false} value={Math.max(0, Math.min(30, Number(values.pre_lesson_score_weight ?? 10)))} onChange={(e) => setValues((prev) => ({ ...prev, pre_lesson_score_weight: Number(e.target.value) }))} className="mt-2 w-full" />
+                            <p className="mt-1 text-xs leading-5 text-fuchsia-700">Mặc định 10%. Phần còn lại vẫn giữ tỷ lệ tương đối giữa điểm quá trình và kiểm tra cuối bài.</p>
+                          </div>
+                        </div>
+                      </div>
                     </div>
                   ) : null}
 
                   {activeStep === 'material' ? (
                     <div className="space-y-6">
-                      <div><p className="text-xs font-bold uppercase tracking-[0.18em] text-indigo-600">Bước 3</p><h3 className="mt-1 text-xl font-black text-slate-900">Học liệu và video mở đầu</h3><p className="mt-1 text-sm text-slate-500">Cấu hình đã được chốt. Bây giờ hãy thêm nguồn để AI phân tích và video học sinh sẽ xem trước hoạt động.</p></div>
+                      <div><p className="text-xs font-bold uppercase tracking-[0.18em] text-indigo-600">Bước 3</p><h3 className="mt-1 text-xl font-black text-slate-900">Học liệu và nhiệm vụ xem trước</h3><p className="mt-1 text-sm text-slate-500">AI sẽ phân tích học liệu thành các hoạt động dạy học. Có thể giao video chuẩn bị trước bài ngay cả khi bài học đang khóa.</p></div>
                       <div className="grid gap-4 md:grid-cols-2">
                         <div><label className="mb-2 block text-sm font-semibold text-slate-700">Tải file bài học</label><label className={`flex min-h-28 flex-col items-center justify-center rounded-3xl border border-dashed border-indigo-300 bg-indigo-50/40 px-5 py-4 text-center text-sm text-slate-600 ${isAnalyzing ? 'cursor-not-allowed opacity-60' : 'cursor-pointer hover:border-indigo-500'}`}><Upload className="mb-2 h-6 w-6 text-indigo-600" /><p className="font-bold text-slate-800">PDF, DOCX, TXT hoặc Markdown</p><p className="mt-1 text-xs text-slate-500">Bấm để chọn tệp học liệu</p><input type="file" disabled={isAnalyzing} className="hidden" accept=".pdf,.doc,.docx,.txt,.md" onChange={(e) => void handleFileChange(e.target.files?.[0] || null)} /></label>{values.source_file && <p className="mt-2 rounded-xl bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-700">{values.source_file.name} • {Math.round((values.source_file.size || 0) / 1024)} KB</p>}</div>
                         <div><label className="mb-2 block text-sm font-semibold text-slate-700">Nguồn văn bản bổ sung</label><textarea value={values.source_text} disabled={isAnalyzing} onChange={(e) => updateGenerationField('source_text', e.target.value)} rows={7} className="w-full rounded-3xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 disabled:cursor-not-allowed disabled:opacity-60" placeholder="Dán nội dung bài học, yêu cầu chuyên môn hoặc ghi chú sư phạm..." /></div>
                       </div>
 
                       <div className="rounded-3xl border border-red-100 bg-gradient-to-br from-red-50 to-white p-5">
-                        <div className="flex items-start gap-3"><span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-red-600 text-white"><Youtube className="h-6 w-6" /></span><div><h4 className="font-extrabold text-slate-900">Video mở đầu bài học</h4><p className="mt-1 text-sm text-slate-600">Hỗ trợ link <span className="font-semibold">youtube.com/watch</span>, <span className="font-semibold">youtu.be</span>, Shorts, Live và Embed.</p></div></div>
+                        <div className="flex items-start gap-3"><span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-red-600 text-white"><Youtube className="h-6 w-6" /></span><div><h4 className="font-extrabold text-slate-900">Video chuẩn bị trước bài học</h4><p className="mt-1 text-sm text-slate-600">Hỗ trợ link <span className="font-semibold">youtube.com/watch</span>, <span className="font-semibold">youtu.be</span>, Shorts, Live và Embed.</p></div></div>
                         <div className="mt-4"><label className="mb-2 block text-sm font-semibold text-slate-700">Link video YouTube</label><div className="relative"><Link2 className="absolute left-4 top-3.5 h-4 w-4 text-slate-400" /><input value={values.intro_video_url || ''} disabled={isAnalyzing} onChange={(e) => setValues((prev) => ({ ...prev, intro_video_url: e.target.value }))} className={`${fieldClass} pl-11 disabled:cursor-not-allowed disabled:opacity-60 ${introVideoInvalid ? 'border-rose-300 focus:border-rose-400 focus:ring-rose-100' : ''}`} placeholder="https://www.youtube.com/watch?v=..." /></div>{introVideoInvalid ? <p className="mt-2 text-sm font-semibold text-rose-600">Liên kết chưa đúng định dạng YouTube.</p> : values.intro_video_url?.trim() ? <p className="mt-2 inline-flex items-center gap-1.5 text-sm font-semibold text-emerald-700"><CheckCircle2 className="h-4 w-4" /> Liên kết hợp lệ, video đã sẵn sàng.</p> : <p className="mt-2 text-xs text-slate-500">Có thể để trống nếu bài học không cần video mở đầu.</p>}</div>
-                        {introVideoEmbedUrl ? <div className="mt-4 overflow-hidden rounded-2xl border border-slate-200 bg-black"><YoutubeEmbedBlock url={introVideoEmbedUrl} title={`Video mở đầu: ${values.tieu_de || 'Bài học'}`} /></div> : null}
+                        {values.intro_video_url?.trim() ? <div className="mt-4 rounded-2xl border border-red-100 bg-white p-4">
+                          <div className="flex flex-wrap items-center justify-between gap-2"><p className="text-sm font-bold text-slate-800">Chính sách video</p><button type="button" onClick={() => setActiveStep('settings')} className="rounded-xl bg-violet-50 px-3 py-2 text-xs font-bold text-violet-700 hover:bg-violet-100">Chỉnh ở Bước 2 Thiết kế</button></div>
+                          <div className="mt-3 flex flex-wrap gap-2 text-xs font-semibold"><span className={`rounded-full px-3 py-1.5 ${values.pre_lesson_enabled !== false ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600'}`}>{values.pre_lesson_enabled !== false ? 'Theo dõi chuẩn bị bài' : 'Không theo dõi tiến độ'}</span><span className={`rounded-full px-3 py-1.5 ${values.pre_lesson_allow_when_locked !== false ? 'bg-amber-50 text-amber-700' : 'bg-slate-100 text-slate-600'}`}>{values.pre_lesson_allow_when_locked !== false ? 'Cho xem khi khóa/chưa đến giờ' : 'Chỉ xem khi bài đã mở'}</span></div>
+                          <div className="mt-4"><label className="mb-2 block text-sm font-semibold text-slate-700">Hạn hoàn thành video (không bắt buộc)</label><input type="datetime-local" value={values.pre_lesson_deadline || ''} onChange={(e) => setValues((prev) => ({ ...prev, pre_lesson_deadline: e.target.value }))} className={fieldClass} /><p className="mt-1 text-xs text-slate-500">Nếu để trống, hệ thống dùng thời điểm bắt đầu mở bài làm mốc đúng hạn.</p></div>
+                        </div> : null}
+                        {introVideoEmbedUrl ? <div className="mt-4 overflow-hidden rounded-2xl border border-slate-200 bg-black"><YoutubeEmbedBlock url={introVideoEmbedUrl} title={`Video chuẩn bị: ${values.tieu_de || 'Bài học'}`} /></div> : null}
                       </div>
 
-                      {contentNeedsRegeneration ? <div className="flex items-start gap-3 rounded-3xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" /><div><p className="font-bold">Nội dung cần được tạo lại</p><p className="mt-1">Đầu vào đã thay đổi. Bấm nút tạo ở cuối cửa sổ để đồng bộ nội dung với thông tin và cấu hình mới.</p></div></div> : null}
+                      {contentNeedsRegeneration ? <div className="flex items-start gap-3 rounded-3xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" /><div><p className="font-bold">Đầu vào sinh nội dung đã thay đổi</p><p className="mt-1">{isEditMode ? 'Bạn vẫn có thể lưu cấu hình/học liệu hiện tại. Chỉ bấm “Tạo lại nội dung” khi muốn AI áp dụng các thay đổi này vào nội dung bài.' : 'Bấm nút tạo ở cuối cửa sổ để đồng bộ nội dung với thông tin và cấu hình mới.'}</p></div></div> : null}
                       {isAnalyzing ? <div className="flex min-h-32 flex-col items-center justify-center rounded-3xl border border-indigo-200 bg-indigo-50 px-6 text-center"><Loader2 className="h-8 w-8 animate-spin text-indigo-600" /><p className="mt-3 font-bold text-indigo-900">AI đang đọc học liệu và tạo cấu trúc bài học…</p><p className="mt-1 text-sm text-indigo-700">Vui lòng giữ nguyên cửa sổ; cấu hình và học liệu đang được khóa tạm thời.</p></div> : null}
                     </div>
                   ) : null}
 
                   {activeStep === 'content' ? (
                     <div className="space-y-5">
-                      <div><p className="text-xs font-bold uppercase tracking-[0.18em] text-indigo-600">Bước 4</p><h3 className="mt-1 text-xl font-black text-slate-900">Tạo và biên tập nội dung</h3><p className="mt-1 text-sm text-slate-500">Xem lại cấu trúc AI đã tạo, điều chỉnh nội dung và gắn video đúng cho từng mục.</p></div>
+                      <div><p className="text-xs font-bold uppercase tracking-[0.18em] text-indigo-600">Bước 4</p><h3 className="mt-1 text-xl font-black text-slate-900">Tạo và biên tập hoạt động dạy học</h3><p className="mt-1 text-sm text-slate-500">AI đã chia bài thành hoạt động, các trang trình bày và tương tác. Giáo viên có thể rà soát trước khi xuất bản.</p></div>
                       {values.lesson_json ? <>
-                        {contentNeedsRegeneration ? <div className="flex items-start justify-between gap-4 rounded-3xl border border-amber-200 bg-amber-50 p-5 text-sm text-amber-900"><div className="flex items-start gap-3"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" /><div><p className="font-black">Nội dung hiện tại không còn khớp</p><p className="mt-1">Thông tin, thiết kế hoặc học liệu đã thay đổi sau lần tạo gần nhất. Không thể giao bài cho đến khi tạo lại.</p></div></div><button type="button" onClick={() => setActiveStep('material')} className="shrink-0 rounded-xl bg-amber-600 px-3 py-2 text-xs font-bold text-white">Tạo lại</button></div> : null}
+                        {contentNeedsRegeneration ? <div className="flex items-start justify-between gap-4 rounded-3xl border border-amber-200 bg-amber-50 p-5 text-sm text-amber-900"><div className="flex items-start gap-3"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" /><div><p className="font-black">Nội dung hiện tại không còn khớp</p><p className="mt-1">{isEditMode ? 'Cấu hình sinh nội dung đã thay đổi. Bạn có thể lưu cấu hình ngay và giữ nguyên nội dung hiện tại, hoặc tạo lại nội dung khi cần.' : 'Thông tin, thiết kế hoặc học liệu đã thay đổi sau lần tạo gần nhất. Không thể giao bài cho đến khi tạo lại.'}</p></div></div><button type="button" onClick={() => setActiveStep('material')} className="shrink-0 rounded-xl bg-amber-600 px-3 py-2 text-xs font-bold text-white">Tạo lại</button></div> : null}
                         <div className="grid gap-4 md:grid-cols-2"><div className="md:col-span-2"><label className="mb-2 block text-sm font-semibold text-slate-700">Tóm tắt bài học</label><textarea value={values.tom_tat} onChange={(e) => setValues((prev) => ({ ...prev, tom_tat: e.target.value }))} rows={3} className="w-full rounded-3xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100" /></div><div className="md:col-span-2"><label className="mb-2 block text-sm font-semibold text-slate-700">Từ khóa</label><input value={values.tu_khoa} onChange={(e) => setValues((prev) => ({ ...prev, tu_khoa: e.target.value }))} className={fieldClass} placeholder="Ví dụ: bộ xử lí, máy tính, công nghệ thông tin" /></div></div>
                         <AIRevisionPanel value={values.ai_revision_request || ''} onChange={(next) => setValues((prev) => ({ ...prev, ai_revision_request: next }))} onRevise={() => void handleRevise()} disabled={!values.lesson_json || contentNeedsRegeneration} loading={isRevising} />
+                        {!isLessonV3 ? <div className="flex flex-wrap items-center justify-between gap-3 rounded-3xl border border-cyan-200 bg-cyan-50 p-5"><div><h4 className="font-black text-slate-900">Nâng cấp bài cũ sang Hoạt động dạy học</h4><p className="mt-1 text-sm text-slate-600">Chuyển section hiện tại thành lesson_v3, giữ câu hỏi và kiểm tra cuối bài. Có thể dùng AI chỉnh sửa tiếp sau khi chuyển.</p></div><button type="button" onClick={upgradeExistingLessonToActivities} className="inline-flex items-center gap-2 rounded-2xl bg-cyan-600 px-4 py-3 text-sm font-bold text-white hover:bg-cyan-700"><Sparkles className="h-4 w-4" /> Nâng cấp sang lesson_v3</button></div> : null}
                         <div className="rounded-3xl border border-violet-100 bg-violet-50/70 p-5"><div className="flex flex-wrap items-center justify-between gap-3"><div><h4 className="font-black text-slate-900">Biên tập chi tiết</h4><p className="mt-1 text-sm text-slate-600">Sửa nội dung, video, ghi nhớ, câu hỏi tương tác và kiểm tra cuối bài.</p></div><button type="button" onClick={() => setContentEditorOpen(true)} className="inline-flex items-center gap-2 rounded-2xl bg-violet-600 px-4 py-3 text-sm font-bold text-white shadow-lg shadow-violet-600/20 hover:bg-violet-700"><Edit3 className="h-4 w-4" /> Mở cửa sổ chỉnh sửa</button></div></div>
-                        <div className="rounded-3xl border border-red-100 bg-red-50/40 p-5">
-                          <div className="flex flex-wrap items-center justify-between gap-2"><div><h4 className="font-extrabold text-slate-900">Video theo từng nội dung</h4><p className="mt-1 text-sm text-slate-600">Các mục đã được tạo nên mỗi liên kết luôn gắn đúng nội dung.</p></div><span className="rounded-full bg-white px-3 py-1 text-xs font-bold text-red-700">{sectionVideoCount}/{values.lesson_json.sections?.length || 0} mục có video</span></div>
+                        {!isLessonV3 ? <div className="rounded-3xl border border-red-100 bg-red-50/40 p-5">
+                          <div className="flex flex-wrap items-center justify-between gap-2"><div><h4 className="font-extrabold text-slate-900">Video theo từng nội dung</h4><p className="mt-1 text-sm text-slate-600">Tính năng tương thích cho bài lesson_v2. Bài lesson_v3 dùng trang trình bày và video chuẩn bị trước bài.</p></div><span className="rounded-full bg-white px-3 py-1 text-xs font-bold text-red-700">{sectionVideoCount}/{values.lesson_json.sections?.length || 0} mục có video</span></div>
                           <div className="mt-4 space-y-3">{(values.lesson_json.sections || []).map((section, index) => { const sectionUrl = section.youtube_url || section.youtube_embed_url || ''; const invalid = Boolean(sectionUrl.trim() && !getYoutubeEmbedUrl(sectionUrl)); return <div key={section.section_id || index} className="rounded-2xl border border-red-100 bg-white p-4"><div className="flex items-center justify-between gap-3"><p className="min-w-0 truncate text-sm font-bold text-slate-800">{cleanSectionTitle(section.title, index)}</p>{sectionUrl && !invalid ? <span className="shrink-0 text-xs font-bold text-emerald-600">Hợp lệ</span> : null}</div><input value={sectionUrl} onChange={(e) => updateSectionVideo(index, e.target.value)} className={`${fieldClass} mt-3 ${invalid ? 'border-rose-300' : ''}`} placeholder="Link YouTube cho nội dung này (không bắt buộc)" />{invalid ? <p className="mt-1.5 text-xs font-semibold text-rose-600">Liên kết YouTube chưa hợp lệ.</p> : null}</div>; })}</div>
+                        </div> : null}
+                        <div className="rounded-3xl border border-slate-200 p-5">
+                          <div className="flex items-center justify-between gap-3"><h4 className="font-black text-slate-900">Hoạt động dạy học</h4><span className="text-xs font-bold text-slate-500">{values.lesson_json.activities?.length || values.lesson_json.sections?.length || 0} hoạt động</span></div>
+                          <div className="mt-3 space-y-3">
+                            {values.lesson_json.activities?.length ? values.lesson_json.activities.map((activity, index) => (
+                              <div key={activity.activity_id || index} className="rounded-2xl bg-slate-50 px-4 py-3 ring-1 ring-slate-100">
+                                <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="font-black text-slate-800">Hoạt động {index + 1}: {cleanSectionTitle(activity.title, index)}</p>{activity.objective ? <p className="mt-1 text-xs font-semibold text-indigo-600">Mục tiêu: {cleanInlineText(activity.objective)}</p> : null}</div><span className="shrink-0 rounded-full bg-violet-50 px-2 py-1 text-[11px] font-bold text-violet-700">{activity.estimated_minutes || '-'} phút</span></div>
+                                <div className="mt-3 grid grid-cols-2 gap-2 text-xs font-bold text-slate-600 sm:grid-cols-3"><span className="rounded-xl bg-white px-3 py-2 ring-1 ring-slate-100">{activity.pages?.length || 0} trang trình bày</span><span className="rounded-xl bg-white px-3 py-2 ring-1 ring-slate-100">{activity.interactions?.length || 0} tương tác</span><span className="rounded-xl bg-white px-3 py-2 ring-1 ring-slate-100">{activity.activity_type || 'knowledge'}</span></div>
+                              </div>
+                            )) : (values.lesson_json.sections || []).map((section, index) => <div key={section.section_id || index} className="rounded-2xl bg-slate-50 px-4 py-3"><p className="font-semibold text-slate-800">{cleanSectionTitle(section.title, index)}</p><p className="mt-1 line-clamp-2 text-sm text-slate-600">{cleanInlineText(section.content)}</p><p className="mt-2 text-xs font-semibold text-indigo-600">{section.interactive_questions?.length || 0} câu hỏi tương tác</p></div>)}
+                          </div>
                         </div>
-                        <div className="rounded-3xl border border-slate-200 p-5"><div className="flex items-center justify-between gap-3"><h4 className="font-black text-slate-900">Cấu trúc nội dung</h4><span className="text-xs font-bold text-slate-500">{values.lesson_json.sections?.length || 0} mục</span></div><div className="mt-3 space-y-3">{(values.lesson_json.sections || []).map((section, index) => <div key={section.section_id || index} className="rounded-2xl bg-slate-50 px-4 py-3"><div className="flex items-start justify-between gap-3"><p className="font-semibold text-slate-800">{cleanSectionTitle(section.title, index)}</p>{section.youtube_url || section.youtube_embed_url ? <span className="shrink-0 rounded-full bg-red-50 px-2 py-1 text-[11px] font-bold text-red-600">Có video</span> : null}</div><p className="mt-1 line-clamp-2 text-sm text-slate-600">{cleanInlineText(section.content)}</p><p className="mt-2 text-xs font-semibold text-indigo-600">{section.interactive_questions?.length || 0} câu hỏi tương tác</p></div>)}</div></div>
                       </> : <div className="flex min-h-[360px] flex-col items-center justify-center rounded-3xl border border-dashed border-slate-200 bg-slate-50 px-8 text-center"><div className="flex h-16 w-16 items-center justify-center rounded-full bg-indigo-100 text-indigo-600"><Sparkles className="h-8 w-8" /></div><h3 className="mt-5 text-xl font-bold text-slate-900">Chưa có nội dung được tạo</h3><p className="mt-2 max-w-md text-sm text-slate-500">Quay lại bước Học liệu, thêm nguồn bài rồi phân tích và tạo nội dung.</p><button type="button" onClick={() => setActiveStep('material')} className="mt-5 rounded-2xl bg-indigo-600 px-4 py-3 text-sm font-bold text-white">Đến bước học liệu</button></div>}
                     </div>
                   ) : null}
@@ -724,7 +851,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
                       </div>
 
                       <div className="rounded-3xl border border-slate-200 bg-white p-5">
-                        <div className="flex flex-wrap items-center justify-between gap-3"><div><h4 className="font-black text-slate-900">Kiểm tra lần cuối như học sinh</h4><p className="mt-1 text-sm text-slate-600">Video mở đầu, các mục kiến thức và câu hỏi sẽ được hiển thị đúng theo bản xem trước.</p></div><button type="button" onClick={() => setPreviewOpen(true)} disabled={!contentReady} className="inline-flex items-center gap-2 rounded-2xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm font-bold text-indigo-700 disabled:opacity-40"><Eye className="h-4 w-4" /> Xem trước bài học</button></div>
+                        <div className="flex flex-wrap items-center justify-between gap-3"><div><h4 className="font-black text-slate-900">Rà soát nội dung bài học</h4><p className="mt-1 text-sm text-slate-600">Kiểm tra cấu trúc, nội dung, câu hỏi và video trong trình biên tập trước khi lưu hoặc xuất bản.</p></div><button type="button" onClick={() => setContentEditorOpen(true)} disabled={!contentReady} className="inline-flex items-center gap-2 rounded-2xl border border-violet-200 bg-violet-50 px-4 py-3 text-sm font-bold text-violet-700 disabled:opacity-40"><Edit3 className="h-4 w-4" /> Mở trình biên tập</button></div>
                       </div>
                     </div>
                   ) : null}
@@ -735,15 +862,15 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
                     <p className="text-xs font-bold uppercase tracking-[0.18em] text-indigo-600">Trạng thái bài học</p>
                     <h3 className="mt-2 line-clamp-2 text-lg font-black text-slate-900">{values.lesson_json?.metadata?.tieu_de || values.tieu_de || 'Bài học chưa đặt tên'}</h3>
                     <p className="mt-2 line-clamp-3 text-sm text-slate-600">{values.lesson_json?.metadata?.tom_tat || values.tom_tat || 'Hoàn thành thông tin và thêm học liệu để tạo nội dung.'}</p>
-                    <div className="mt-4 grid grid-cols-2 gap-2 text-sm"><div className="rounded-2xl bg-white p-3"><span className="text-xs text-slate-500">Nội dung</span><p className="font-black text-slate-900">{values.lesson_json?.sections?.length || 0} mục</p></div><div className="rounded-2xl bg-white p-3"><span className="text-xs text-slate-500">Tương tác</span><p className="font-black text-slate-900">{totalSectionQuestions} câu</p></div><div className="rounded-2xl bg-white p-3"><span className="text-xs text-slate-500">Cuối bài</span><p className="font-black text-slate-900">{finalQuizCount} câu</p></div><div className="rounded-2xl bg-white p-3"><span className="text-xs text-slate-500">Video</span><p className="font-black text-slate-900">{introVideoEmbedUrl ? 1 : 0} mở đầu · {sectionVideoCount} mục</p></div></div>
-                    {contentNeedsRegeneration ? <div className="mt-4 flex items-start gap-2 rounded-2xl border border-amber-200 bg-amber-50 p-3 text-xs font-semibold text-amber-800"><AlertTriangle className="h-4 w-4 shrink-0" /> Cần tạo lại nội dung vì đầu vào đã thay đổi.</div> : null}
+                    <div className="mt-4 grid grid-cols-2 gap-2 text-sm"><div className="rounded-2xl bg-white p-3"><span className="text-xs text-slate-500">Nội dung</span><p className="font-black text-slate-900">{isLessonV3 ? `${values.lesson_json?.activities?.length || 0} hoạt động` : `${values.lesson_json?.sections?.length || 0} mục`}</p></div><div className="rounded-2xl bg-white p-3"><span className="text-xs text-slate-500">Tương tác</span><p className="font-black text-slate-900">{totalSectionQuestions} câu</p></div><div className="rounded-2xl bg-white p-3"><span className="text-xs text-slate-500">Cuối bài</span><p className="font-black text-slate-900">{finalQuizCount} câu</p></div><div className="rounded-2xl bg-white p-3"><span className="text-xs text-slate-500">Video</span><p className="font-black text-slate-900">{introVideoEmbedUrl ? 1 : 0} video trước bài{!isLessonV3 ? ` · ${sectionVideoCount} mục` : ''}</p></div></div>
+                    {contentNeedsRegeneration ? <div className="mt-4 flex items-start gap-2 rounded-2xl border border-amber-200 bg-amber-50 p-3 text-xs font-semibold text-amber-800"><AlertTriangle className="h-4 w-4 shrink-0" /> {isEditMode ? 'Cấu hình đã thay đổi; có thể lưu ngay và tạo lại nội dung sau.' : 'Cần tạo lại nội dung vì đầu vào đã thay đổi.'}</div> : null}
                     <div className="mt-4 space-y-2 text-xs font-semibold"><p className={`flex items-center gap-2 ${stepReady.info ? 'text-emerald-700' : 'text-slate-400'}`}><CheckCircle2 className="h-4 w-4" /> Thông tin cơ bản</p><p className={`flex items-center gap-2 ${stepReady.settings ? 'text-emerald-700' : 'text-slate-400'}`}><CheckCircle2 className="h-4 w-4" /> Thiết kế đã xác nhận</p><p className={`flex items-center gap-2 ${stepReady.material ? 'text-emerald-700' : 'text-slate-400'}`}><CheckCircle2 className="h-4 w-4" /> Học liệu và video mở đầu</p><p className={`flex items-center gap-2 ${stepReady.content ? 'text-emerald-700' : 'text-slate-400'}`}><CheckCircle2 className="h-4 w-4" /> Nội dung đã đồng bộ</p></div>
                   </div>
 
                   {values.lesson_json ? <div className="rounded-[28px] border border-slate-200 bg-white p-4 shadow-sm">
                     <p className="mb-3 text-xs font-bold uppercase tracking-[0.14em] text-slate-500">Công cụ kiểm tra</p>
                     <div className="grid gap-2">
-                      <div className="grid grid-cols-2 gap-2"><button type="button" onClick={() => setPreviewOpen(true)} disabled={!values.lesson_json} className="inline-flex items-center justify-center gap-2 rounded-2xl border border-slate-200 px-3 py-2.5 text-sm font-bold text-slate-700 disabled:opacity-40"><Eye className="h-4 w-4" /> Xem trước</button><button type="button" onClick={() => setContentEditorOpen(true)} disabled={!values.lesson_json} className="inline-flex items-center justify-center gap-2 rounded-2xl border border-violet-200 bg-violet-50 px-3 py-2.5 text-sm font-bold text-violet-700 disabled:opacity-40"><Edit3 className="h-4 w-4" /> Biên tập</button></div>
+                      <button type="button" onClick={() => setContentEditorOpen(true)} disabled={!values.lesson_json} className="inline-flex w-full items-center justify-center gap-2 rounded-2xl border border-violet-200 bg-violet-50 px-3 py-2.5 text-sm font-bold text-violet-700 disabled:opacity-40"><Edit3 className="h-4 w-4" /> Biên tập nội dung</button>
                       <button type="button" onClick={() => setSlidesPromptOpen(true)} disabled={!values.lesson_json} className="inline-flex items-center justify-center gap-2 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm font-bold text-amber-700 disabled:opacity-40"><Presentation className="h-4 w-4" /> Prompt Google Slides</button>
                     </div>
                   </div> : null}
@@ -753,13 +880,18 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
 
             <div className="flex items-center justify-between gap-3 border-t border-slate-200 bg-white px-5 py-3 lg:px-8">
               <button type="button" onClick={goToPreviousStep} disabled={activeStepIndex === 0 || isAnalyzing || isSaving || isRevising} className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 px-4 py-2.5 text-sm font-bold text-slate-700 disabled:opacity-30"><ChevronLeft className="h-4 w-4" /> Quay lại</button>
-              <p className="hidden text-sm font-semibold text-slate-500 sm:block">Bước {activeStepIndex + 1}/{COMPOSER_STEPS.length} · {COMPOSER_STEPS[activeStepIndex]?.label}</p>
+              <p className="hidden text-sm font-semibold text-slate-500 sm:block">{isEditMode ? `Đang chỉnh: ${COMPOSER_STEPS[activeStepIndex]?.label}` : `Bước ${activeStepIndex + 1}/${COMPOSER_STEPS.length} · ${COMPOSER_STEPS[activeStepIndex]?.label}`}</p>
               <div className="flex items-center gap-2">
-                {activeStep === 'info' ? <button type="button" onClick={goToNextStep} className="inline-flex items-center gap-2 rounded-2xl bg-indigo-600 px-5 py-2.5 text-sm font-bold text-white">Tiếp tục thiết kế <ChevronRight className="h-4 w-4" /></button> : null}
-                {activeStep === 'settings' ? <button type="button" onClick={goToNextStep} className="inline-flex items-center gap-2 rounded-2xl bg-indigo-600 px-5 py-2.5 text-sm font-bold text-white"><CheckCircle2 className="h-4 w-4" /> Xác nhận cấu hình</button> : null}
-                {activeStep === 'material' ? <button type="button" onClick={() => void handleAnalyze()} disabled={isAnalyzing || !canAnalyze || introVideoInvalid || !configurationConfirmed} className="inline-flex items-center gap-2 rounded-2xl bg-indigo-600 px-5 py-2.5 text-sm font-bold text-white disabled:cursor-not-allowed disabled:opacity-40">{isAnalyzing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}{isAnalyzing ? 'Đang phân tích và tạo…' : values.lesson_json ? 'Tạo lại nội dung' : 'Phân tích & tạo bài học'}</button> : null}
-                {activeStep === 'content' ? <button type="button" onClick={goToNextStep} disabled={!contentReady || isRevising} className="inline-flex items-center gap-2 rounded-2xl bg-indigo-600 px-5 py-2.5 text-sm font-bold text-white disabled:opacity-40">Tiếp tục giao bài <ChevronRight className="h-4 w-4" /></button> : null}
-                {activeStep === 'publish' ? <><button type="button" onClick={() => void handleSave('draft')} disabled={isSaving || !contentReady || introVideoInvalid} className="inline-flex items-center gap-2 rounded-2xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-bold text-slate-700 disabled:opacity-40"><Save className="h-4 w-4" /> Lưu bản nháp</button><button type="button" onClick={() => void handleSave('publish')} disabled={isSaving || !contentReady || introVideoInvalid} className="inline-flex items-center gap-2 rounded-2xl bg-emerald-600 px-5 py-2.5 text-sm font-bold text-white disabled:opacity-40">{isSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Rocket className="h-4 w-4" />}{isSaving ? 'Đang lưu…' : 'Xuất bản bài học'}</button></> : null}
+                {isEditMode ? <>
+                  <span className={`hidden rounded-full px-3 py-1.5 text-xs font-bold sm:inline-flex ${hasUnsavedChanges ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700'}`}>{hasUnsavedChanges ? 'Có thay đổi chưa lưu' : 'Đã lưu'}</span>
+                  {activeStep === 'material' ? <button type="button" onClick={() => void handleAnalyze()} disabled={isAnalyzing || !canAnalyze || introVideoInvalid} className="inline-flex items-center gap-2 rounded-2xl border border-indigo-200 bg-indigo-50 px-4 py-2.5 text-sm font-bold text-indigo-700 disabled:opacity-40">{isAnalyzing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}{isAnalyzing ? 'Đang tạo…' : 'Tạo lại nội dung'}</button> : null}
+                  <button type="button" onClick={() => void handleSave(values.save_mode === 'draft' ? 'draft' : 'publish')} disabled={isSaving || !values.lesson_json || introVideoInvalid || invalidSectionVideoCount > 0 || Boolean(duplicateLesson)} className="inline-flex items-center gap-2 rounded-2xl bg-emerald-600 px-5 py-2.5 text-sm font-bold text-white disabled:opacity-40">{isSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}{isSaving ? 'Đang lưu…' : 'Lưu thay đổi'}</button>
+                </> : null}
+                {!isEditMode && activeStep === 'info' ? <button type="button" onClick={goToNextStep} className="inline-flex items-center gap-2 rounded-2xl bg-indigo-600 px-5 py-2.5 text-sm font-bold text-white">Tiếp tục thiết kế <ChevronRight className="h-4 w-4" /></button> : null}
+                {!isEditMode && activeStep === 'settings' ? <button type="button" onClick={goToNextStep} className="inline-flex items-center gap-2 rounded-2xl bg-indigo-600 px-5 py-2.5 text-sm font-bold text-white"><CheckCircle2 className="h-4 w-4" /> Xác nhận cấu hình</button> : null}
+                {!isEditMode && activeStep === 'material' ? <button type="button" onClick={() => void handleAnalyze()} disabled={isAnalyzing || !canAnalyze || introVideoInvalid || !configurationConfirmed} className="inline-flex items-center gap-2 rounded-2xl bg-indigo-600 px-5 py-2.5 text-sm font-bold text-white disabled:cursor-not-allowed disabled:opacity-40">{isAnalyzing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}{isAnalyzing ? 'Đang phân tích và tạo…' : values.lesson_json ? 'Tạo lại nội dung' : 'Phân tích & tạo bài học'}</button> : null}
+                {!isEditMode && activeStep === 'content' ? <button type="button" onClick={goToNextStep} disabled={!contentReady || isRevising} className="inline-flex items-center gap-2 rounded-2xl bg-indigo-600 px-5 py-2.5 text-sm font-bold text-white disabled:opacity-40">Tiếp tục giao bài <ChevronRight className="h-4 w-4" /></button> : null}
+                {!isEditMode && activeStep === 'publish' ? <><button type="button" onClick={() => void handleSave('draft')} disabled={isSaving || !contentReady || introVideoInvalid} className="inline-flex items-center gap-2 rounded-2xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-bold text-slate-700 disabled:opacity-40"><Save className="h-4 w-4" /> Lưu bản nháp</button><button type="button" onClick={() => void handleSave('publish')} disabled={isSaving || !contentReady || introVideoInvalid} className="inline-flex items-center gap-2 rounded-2xl bg-emerald-600 px-5 py-2.5 text-sm font-bold text-white disabled:opacity-40">{isSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Rocket className="h-4 w-4" />}{isSaving ? 'Đang lưu…' : 'Xuất bản bài học'}</button></> : null}
               </div>
             </div>
           </motion.div>
@@ -793,7 +925,6 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
               })}
             />
           ) : null}
-          <LessonPreviewModal isOpen={previewOpen} content={values.lesson_json ? mergeVideoLinks(values.lesson_json, values.section_video_links || '', values.intro_video_url || '') : null} aiConfig={aiConfig} onOpenConfig={onOpenConfig} onClose={() => setPreviewOpen(false)} />
           <GoogleSlidesPromptModal
             isOpen={slidesPromptOpen}
             content={values.lesson_json ? mergeVideoLinks(values.lesson_json, values.section_video_links || '', values.intro_video_url || '') : null}

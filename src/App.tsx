@@ -5,11 +5,13 @@ import {
   BookOpen,
   BookOpenCheck,
   CheckSquare,
+  Database,
   Eye,
   Filter,
   FolderKanban,
   GraduationCap,
   Download,
+  MonitorPlay,
   LayoutDashboard,
   LayoutGrid,
   List,
@@ -39,6 +41,7 @@ import {
   LessonComposerValues,
   LessonContent,
   LessonContentResponse,
+  LessonCloseSnapshot,
   LessonComment,
   LessonRow,
   ReviewPracticeAttempt,
@@ -66,7 +69,8 @@ import {
 } from './types';
 import { AI_MODELS, DEFAULT_ACTIVE_GRADES, DEFAULT_VIDEO_POPUP_CONFIG, VIDEO_POPUP_VIEW_STORAGE_KEY, sortGrades } from './constants';
 import { compareStructuredLessons, resolveLessonIdentity } from './utils/lessonCatalog';
-import { getLessonScheduleAccess } from './utils/lessonAccess';
+import { getLessonScheduleAccess, getPreLessonVideoAccess } from './utils/lessonAccess';
+import { calculateLearningProcessScore, deriveSectionScores, finalizeProgressScore, preparationScoreFromStatus } from './utils/learningScoreEngine';
 import { canManageGrade, formatManagedGrades, getManagedGradeScope, teacherManagesAllGrades } from './utils/gradeScope';
 import {
   createAccountApi,
@@ -117,6 +121,7 @@ import {
   maskApiKey,
   moderateLearningResultApi,
   startCoLearningSessionApi,
+  updateCoLearningSessionApi,
   submitLessonReviewApi,
   submitReviewPracticeApi,
   updateAccountApi,
@@ -156,6 +161,7 @@ import SchoolYearTransferModal from './components/SchoolYearTransferModal';
 const AIConfigModal = lazy(() => import('./components/AIConfigModal'));
 const AIAssistant = lazy(() => import('./components/AIAssistant'));
 const LessonViewer = lazy(() => import('./components/LessonViewer'));
+const PreLessonVideoModal = lazy(() => import('./components/PreLessonVideoModal'));
 const LessonComposer = lazy(() => import('./components/LessonComposer'));
 const ReviewPracticeModal = lazy(() => import('./components/ReviewPracticeModal'));
 const ReviewPracticeViewer = lazy(() => import('./components/ReviewPracticeViewer'));
@@ -209,6 +215,16 @@ function mapLessonRow(
     locked_at: row.locked_at || '',
     locked_by_uid: row.locked_by_uid || '',
     locked_by_name: row.locked_by_name || '',
+    intro_video_url: row.intro_video_url || '',
+    intro_video_embed_url: row.intro_video_embed_url || '',
+    pre_lesson_enabled: row.pre_lesson_enabled !== false && Boolean(row.intro_video_url || row.intro_video_embed_url),
+    pre_lesson_allow_when_locked: row.pre_lesson_allow_when_locked !== false,
+    pre_lesson_required: row.pre_lesson_required === true,
+    pre_lesson_completion_threshold: Number(row.pre_lesson_completion_threshold || 80),
+    pre_lesson_deadline: row.pre_lesson_deadline || '',
+    pre_lesson_score_enabled: row.pre_lesson_score_enabled !== false && row.pre_lesson_enabled !== false,
+    pre_lesson_score_weight: Math.max(0, Math.min(30, Number(row.pre_lesson_score_weight ?? 10))),
+    content_schema_version: row.content_schema_version || undefined,
     raw: row,
   };
 }
@@ -275,13 +291,15 @@ function getComputedSchoolYear() {
 function sanitizeStoredUser(raw: unknown): User | null {
   if (!raw || typeof raw !== 'object') return null;
   const user = raw as Partial<User>;
-  if (!user.token || !user.user_id || !user.ten_dang_nhap || !user.ho_ten || !user.vai_tro) return null;
+  if (!user.user_id || !user.ten_dang_nhap || !user.ho_ten || !user.vai_tro) return null;
   return {
     user_id: String(user.user_id),
     ten_dang_nhap: String(user.ten_dang_nhap),
     ho_ten: String(user.ho_ten),
     vai_tro: user.vai_tro,
-    token: String(user.token),
+    // V6.78.0: Firebase ID token không còn được lưu trong localStorage.
+    // Token được khôi phục từ Firebase Auth persistence khi ứng dụng khởi động.
+    token: '',
     lop_id: normalizeClassIdValue(user.lop_id),
     khoi: normalizeGradeValue(user.khoi),
     khoi_phu_trach: getManagedGradeScope(user),
@@ -290,6 +308,11 @@ function sanitizeStoredUser(raw: unknown): User | null {
     auth_provider: user.auth_provider === 'firebase' ? 'firebase' : 'legacy',
     firebase_uid: String(user.firebase_uid || '').trim(),
   };
+}
+
+function serializeStoredUser(user: User) {
+  const { token: _token, ...safeUser } = user;
+  return safeUser;
 }
 
 
@@ -446,6 +469,7 @@ function sanitizeProgressRecord(raw: Partial<LessonProgressRecord> | null | unde
     mon_hoc: String(raw.mon_hoc || ''),
     khoi: String(raw.khoi || '').replace(/\.0+$/, ''),
     lop_id: String(raw.lop_id || '').toUpperCase(),
+    nam_hoc: String(raw.nam_hoc || ''),
     status: raw.status || 'not_started',
     completion_percent: Number(raw.completion_percent || 0),
     completed_steps: Number(raw.completed_steps || 0),
@@ -459,9 +483,15 @@ function sanitizeProgressRecord(raw: Partial<LessonProgressRecord> | null | unde
     quiz_answered: Number(raw.quiz_answered || 0),
     quiz_correct: Number(raw.quiz_correct || 0),
     quiz_percent: Number(raw.quiz_percent || 0),
-    assessment_score: raw.assessment_score === undefined || raw.assessment_score === null
-      ? undefined
-      : Number(raw.assessment_score),
+    assessment_score: raw.assessment_score === undefined || raw.assessment_score === null ? undefined : Number(raw.assessment_score),
+    section_scores: raw.section_scores && typeof raw.section_scores === 'object' ? raw.section_scores as Record<string, number> : {},
+    learning_process_score: raw.learning_process_score === undefined ? undefined : Number(raw.learning_process_score),
+    final_quiz_score: raw.final_quiz_score === undefined ? undefined : Number(raw.final_quiz_score),
+    current_score: raw.current_score === undefined ? undefined : Number(raw.current_score),
+    score_status: raw.score_status === 'finalized' ? 'finalized' : 'in_progress',
+    score_calculated_at: String(raw.score_calculated_at || ''),
+    last_closed_at: String(raw.last_closed_at || ''),
+    save_state: raw.save_state === 'save_failed' ? 'save_failed' : raw.save_state === 'saving' ? 'saving' : 'saved',
     result_state: raw.result_state === 'cancelled_retake' || raw.result_state === 'invalid_cheating'
       ? raw.result_state
       : 'valid',
@@ -482,6 +512,18 @@ function sanitizeProgressRecord(raw: Partial<LessonProgressRecord> | null | unde
     co_learner_names: Array.isArray(raw.co_learner_names)
       ? raw.co_learner_names.map((item) => String(item || '').trim()).filter(Boolean)
       : [],
+    pre_lesson_status: raw.pre_lesson_status === 'completed' ? 'completed' : raw.pre_lesson_status === 'in_progress' ? 'in_progress' : 'not_started',
+    pre_lesson_watch_percent: Number(raw.pre_lesson_watch_percent || 0),
+    pre_lesson_watched_seconds: Number(raw.pre_lesson_watched_seconds || 0),
+    pre_lesson_completed_at: String(raw.pre_lesson_completed_at || ''),
+    pre_lesson_completed_before_deadline: raw.pre_lesson_completed_before_deadline === true,
+    pre_lesson_preparation_status: ['in_progress', 'prepared', 'late_completed'].includes(String(raw.pre_lesson_preparation_status || ''))
+      ? raw.pre_lesson_preparation_status as any
+      : 'not_started',
+    preparation_score: raw.preparation_score === undefined ? undefined : Number(raw.preparation_score),
+    preparation_weight: raw.preparation_weight === undefined ? undefined : Number(raw.preparation_weight),
+    learning_component_weight: raw.learning_component_weight === undefined ? undefined : Number(raw.learning_component_weight),
+    final_component_weight: raw.final_component_weight === undefined ? undefined : Number(raw.final_component_weight),
   };
 }
 
@@ -505,6 +547,46 @@ function sanitizeStoredProgressRecords(raw: unknown) {
   return raw.map((item) => sanitizeProgressRecord(item as LessonProgressRecord)).filter(Boolean) as LessonProgressRecord[];
 }
 
+
+const PENDING_LEARNING_PROGRESS_STORAGE_PREFIX = 'edusmart:pending-learning-progress:v1:';
+
+function pendingLearningProgressStorageKey(userId: string) {
+  return `${PENDING_LEARNING_PROGRESS_STORAGE_PREFIX}${String(userId || '').trim()}`;
+}
+
+function readPendingLearningProgress(userId: string): LessonProgressRecord[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(pendingLearningProgressStorageKey(userId)) || '[]');
+    return sanitizeStoredProgressRecords(raw);
+  } catch {
+    return [];
+  }
+}
+
+function writePendingLearningProgress(userId: string, records: LessonProgressRecord[]) {
+  try {
+    const deduped = new Map<string, LessonProgressRecord>();
+    records.forEach((record) => {
+      const current = deduped.get(record.progress_id);
+      if (!current || Number(record.result_version || 0) >= Number(current.result_version || 0)
+        || getProgressTimeValue(record.updated_at) >= getProgressTimeValue(current.updated_at)) {
+        deduped.set(record.progress_id, record);
+      }
+    });
+    localStorage.setItem(pendingLearningProgressStorageKey(userId), JSON.stringify(Array.from(deduped.values())));
+  } catch { /* local backup is best effort */ }
+}
+
+function queuePendingLearningProgress(userId: string, record: LessonProgressRecord) {
+  const current = readPendingLearningProgress(userId).filter((item) => item.progress_id !== record.progress_id);
+  writePendingLearningProgress(userId, [...current, { ...record, save_state: 'save_failed' }]);
+}
+
+function removePendingLearningProgress(userId: string, progressId: string) {
+  const next = readPendingLearningProgress(userId).filter((item) => item.progress_id !== progressId);
+  writePendingLearningProgress(userId, next);
+}
+
 function createEmptyProgressRecord(userId: string, lesson: Lesson): LessonProgressRecord {
   return sanitizeProgressRecord({
     progress_id: `${userId}_${lesson.lesson_id}`,
@@ -514,6 +596,7 @@ function createEmptyProgressRecord(userId: string, lesson: Lesson): LessonProgre
     mon_hoc: lesson.mon_hoc,
     khoi: lesson.khoi,
     lop_id: lesson.lop_id || '',
+    nam_hoc: lesson.nam_hoc || getComputedSchoolYear(),
     status: 'not_started',
     completion_percent: 0,
     completed_steps: 0,
@@ -548,32 +631,29 @@ function recomputeProgress(record: LessonProgressRecord): LessonProgressRecord {
 
   (Object.keys(STAGE_WEIGHTS) as LessonStageKey[]).forEach((stageKey) => {
     const detail = { ...createEmptyStepDetail(), ...(stepDetails[stageKey] || {}) };
-    let percent = detail.percent || 0;
+    let percent = Number(detail.percent || 0);
 
     if (stageKey === 'luyen_tap') {
-      const total = detail.quizTotal || 0;
-      const answered = detail.quizAnswered || 0;
-      const correct = detail.quizCorrect || 0;
-      if (total > 0) {
-        percent = Math.round((answered / total) * 100);
-        detail.viewedComplete = answered >= total;
-      } else if (detail.viewedComplete) {
-        percent = 100;
-      } else {
-        percent = 0;
-      }
-      const sectionProgressItems = Object.values(detail.sectionProgress || {}) as SectionLearningProgress[];
-      const hasSectionProgress = sectionProgressItems.length > 0;
-      const allSectionsCompleted = !hasSectionProgress || sectionProgressItems.every((item) => item.status === 'completed');
-      detail.completed = total > 0 ? answered >= total && allSectionsCompleted : Boolean(detail.viewedComplete) && allSectionsCompleted;
+      const sectionItems = Object.values(detail.sectionProgress || {}) as SectionLearningProgress[];
+      const sectionAverage = sectionItems.length
+        ? sectionItems.reduce((sum, item) => sum + Math.max(0, Math.min(100, Number(item.completionPercent ?? (item.status === 'completed' ? 100 : 0)))), 0) / sectionItems.length
+        : 0;
+      const total = Number(detail.quizTotal || 0);
+      const answered = Number(detail.quizAnswered || 0);
+      const quizProgress = total > 0 ? Math.min(100, (answered / total) * 100) : 0;
+      // Tiến độ nội dung phải tăng khi thời gian/mức hoàn thành mục tăng, không chỉ khi trả lời câu hỏi.
+      percent = sectionItems.length ? Math.round(sectionAverage * 0.8 + quizProgress * 0.2) : Math.round(quizProgress);
+      const allSectionsCompleted = !sectionItems.length || sectionItems.every((item) => item.status === 'completed');
+      detail.viewedComplete = allSectionsCompleted;
+      detail.completed = allSectionsCompleted && (total === 0 || answered >= total);
     } else {
-      percent = detail.viewedComplete ? 100 : 0;
+      percent = detail.viewedComplete ? 100 : Math.max(0, Number(detail.percent || 0));
       detail.completed = Boolean(detail.viewedComplete);
     }
 
-    detail.percent = percent;
+    detail.percent = Math.max(0, Math.min(100, Math.round(percent)));
     stepDetails[stageKey] = detail;
-    weighted += (percent / 100) * STAGE_WEIGHTS[stageKey];
+    weighted += (detail.percent / 100) * STAGE_WEIGHTS[stageKey];
     if (detail.completed) completedSteps += 1;
   });
 
@@ -584,9 +664,9 @@ function recomputeProgress(record: LessonProgressRecord): LessonProgressRecord {
   const updatedAt = new Date().toISOString();
   const finalExam = stepDetails.luyen_tap.finalExam;
   const finalExamSubmitted = ['submitted', 'auto_submitted', 'expired'].includes(String(finalExam?.status || ''));
-  const assessmentScore = finalExamSubmitted && Number.isFinite(Number(finalExam?.total_score))
-    ? Math.max(0, Math.min(10, Number(finalExam?.total_score)))
-    : record.assessment_score;
+  const sectionScores = deriveSectionScores(stepDetails.luyen_tap.sectionProgress || {});
+  const learningProcessScore = calculateLearningProcessScore(stepDetails.luyen_tap.sectionProgress || {});
+  const finalQuizScore = finalExamSubmitted && Number.isFinite(Number(finalExam?.score)) ? Math.max(0, Math.min(10, Number(finalExam?.score))) : Number(record.final_quiz_score || 0);
 
   return sanitizeProgressRecord({
     ...record,
@@ -599,7 +679,10 @@ function recomputeProgress(record: LessonProgressRecord): LessonProgressRecord {
     quiz_answered: quizAnswered,
     quiz_correct: quizCorrect,
     quiz_percent: quizTotal > 0 ? Math.round((quizCorrect / quizTotal) * 100) : 0,
-    assessment_score: assessmentScore,
+    section_scores: sectionScores,
+    learning_process_score: learningProcessScore,
+    final_quiz_score: finalQuizScore,
+    assessment_score: record.assessment_score,
     result_state: record.result_state === 'invalid_cheating' ? 'invalid_cheating' : 'valid',
     retake_allowed: record.result_state === 'invalid_cheating' ? false : true,
   })!;
@@ -711,9 +794,13 @@ function requiredDataDomains(menu: string, currentUser: User, isAdmin: boolean):
       return ['lessons'];
     case 'learning':
     case 'arena':
-      return ['lessons', 'reviews', 'progress', ...(canManage ? ['accounts' as const] : [])];
+      // V6.78.0: học sinh vẫn cần tiến độ cá nhân ngay khi mở thư viện.
+      // Giáo viên/Admin không full-scan progress ở đây; Analytics sẽ query theo scope.
+      return currentUser.vai_tro === 'student'
+        ? ['lessons', 'reviews', 'progress']
+        : ['lessons', 'reviews'];
     case 'analytics':
-      return canManage ? ['accounts', 'lessons', 'progress'] : ['lessons', 'progress'];
+      return canManage ? ['accounts', 'lessons'] : ['lessons', 'progress'];
     case 'approvals':
       return isAdmin ? ['lessons', 'shares'] : ['lessons'];
     default:
@@ -852,6 +939,8 @@ useEffect(() => {
   const [arenaLesson, setArenaLesson] = useState<Lesson | null>(null);
   const [arenaLessonContent, setArenaLessonContent] = useState<LessonContent | null>(null);
   const [isLessonViewerOpen, setIsLessonViewerOpen] = useState(false);
+  const [isPreLessonVideoOpen, setIsPreLessonVideoOpen] = useState(false);
+  const [preLessonVideoLesson, setPreLessonVideoLesson] = useState<Lesson | null>(null);
   const [viewerStage, setViewerStage] = useState<LessonStageKey>('khoi_dong');
   const [coLearningLesson, setCoLearningLesson] = useState<Lesson | null>(null);
   const [coLearningClassmates, setCoLearningClassmates] = useState<Account[]>([]);
@@ -910,6 +999,7 @@ useEffect(() => {
   const [analyticsClassFilter, setAnalyticsClassFilter] = useState('Tất cả');
   const [analyticsSubjectFilter, setAnalyticsSubjectFilter] = useState('Tất cả');
   const [analyticsSchoolYearFilter, setAnalyticsSchoolYearFilter] = useState(getComputedSchoolYear());
+  const [isAnalyticsProgressLoading, setIsAnalyticsProgressLoading] = useState(false);
 
   useEffect(() => {
     const ensureCreatedGrade = (value: string, setter: (next: string) => void) => {
@@ -945,34 +1035,41 @@ useEffect(() => {
       if (savedUser) {
         try {
           const parsed = sanitizeStoredUser(JSON.parse(savedUser));
-          if (parsed?.token) {
+          if (parsed) {
             if (isMounted) {
               setLoadingMessage('Đang khôi phục phiên đăng nhập...');
               setIsLoading(true);
             }
-            const requiresFirebase = parsed.auth_provider === 'firebase';
-            const firebaseUser = requiresFirebase ? await waitForFirebaseUser() : null;
-            if (requiresFirebase && !firebaseUser) {
+            // V6.78.0 chỉ khôi phục tự động phiên Firebase. Legacy token không còn
+            // được lưu trên thiết bị để giảm rủi ro lộ thông tin phiên qua XSS.
+            if (parsed.auth_provider !== 'firebase') {
               localStorage.removeItem('user');
               if (isMounted) setUser(null);
             } else {
-              const currentUserRes = await getCurrentUserApi(parsed.token);
-              if (currentUserRes.ok && currentUserRes.data) {
-                const restoredUser: User = {
-                  ...parsed,
-                  ...currentUserRes.data,
-                  token: parsed.token,
-                };
-                if (isMounted) {
-                  setAIConfig({ apiKey: '', model: AI_MODELS[0] });
-                  // Khôi phục đúng workspace theo vai trò trước khi setUser để tránh
-                  // tải nhầm domain `learning` của giáo viên trong một nhịp render đầu.
-                  setActiveMenu(restoredUser.vai_tro === 'admin' ? 'overview' : restoredUser.vai_tro === 'teacher' ? 'lessons' : 'learning');
-                  setUser(restoredUser);
-                }
-                localStorage.setItem('user', JSON.stringify(restoredUser));
-              } else {
+              const firebaseUser = await waitForFirebaseUser();
+              if (!firebaseUser) {
                 localStorage.removeItem('user');
+                if (isMounted) setUser(null);
+              } else {
+                const freshToken = await getFirebaseIdToken(false);
+                const currentUserRes = await getCurrentUserApi(freshToken);
+                if (currentUserRes.ok && currentUserRes.data) {
+                  const restoredUser: User = {
+                    ...parsed,
+                    ...currentUserRes.data,
+                    token: freshToken,
+                  };
+                  if (isMounted) {
+                    setAIConfig({ apiKey: '', model: AI_MODELS[0] });
+                    // Khôi phục đúng workspace theo vai trò trước khi setUser để tránh
+                    // tải nhầm domain `learning` của giáo viên trong một nhịp render đầu.
+                    setActiveMenu(restoredUser.vai_tro === 'admin' ? 'overview' : restoredUser.vai_tro === 'teacher' ? 'lessons' : 'learning');
+                    setUser(restoredUser);
+                  }
+                  localStorage.setItem('user', JSON.stringify(serializeStoredUser(restoredUser)));
+                } else {
+                  localStorage.removeItem('user');
+                }
               }
             }
           } else {
@@ -1337,7 +1434,9 @@ useEffect(() => {
           }
         })();
         const remoteItems = res.data?.items || [];
-        const mergedItems = mergeProgressCollections(remoteItems, cachedProgress);
+        const pendingProgress = user.vai_tro === 'student' ? readPendingLearningProgress(user.user_id) : [];
+        const mergedLocalProgress = mergeProgressCollections(cachedProgress, pendingProgress);
+        const mergedItems = mergeProgressCollections(remoteItems, mergedLocalProgress);
         setProgressRecordsSync(mergedItems);
         if (user.vai_tro === 'student') {
           const remoteMap = new Map(remoteItems.map((item) => [item.progress_id, Number(item.updated_at_ts || 0)]));
@@ -1358,6 +1457,46 @@ useEffect(() => {
       domainLoadPromisesRef.current.delete(domain);
     }
   };
+
+  const analyticsHasServerScope = analyticsLessonFilter !== 'Tất cả'
+    || analyticsClassFilter !== 'Tất cả'
+    || analyticsGradeFilter !== 'Tất cả';
+
+  const loadScopedAnalyticsProgress = useCallback(async () => {
+    if (!user || user.vai_tro === 'student') return;
+    if (!analyticsHasServerScope) {
+      setProgressRecordsSync([]);
+      setIsAnalyticsProgressLoading(false);
+      return;
+    }
+
+    const payload: Record<string, unknown> = {};
+    if (analyticsLessonFilter !== 'Tất cả') payload.lesson_id = analyticsLessonFilter;
+    if (analyticsClassFilter !== 'Tất cả') payload.lop_id = analyticsClassFilter;
+    if (analyticsGradeFilter !== 'Tất cả') payload.khoi = analyticsGradeFilter;
+
+    setIsAnalyticsProgressLoading(true);
+    try {
+      const res = await listLearningProgressApi(user.token, payload);
+      if (!res.ok) throw new Error(res.message || 'Không tải được tiến trình theo phạm vi đã chọn.');
+      const scoped = (res.data?.items || [])
+        .map((item) => sanitizeProgressRecord(item))
+        .filter(Boolean) as LessonProgressRecord[];
+      setProgressRecordsSync(scoped);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Không tải được tiến trình theo phạm vi đã chọn.';
+      if (!handleSessionError(message)) showToast(message, 'error');
+      setProgressRecordsSync([]);
+    } finally {
+      setIsAnalyticsProgressLoading(false);
+    }
+  }, [user?.user_id, user?.token, user?.vai_tro, analyticsHasServerScope, analyticsLessonFilter, analyticsClassFilter, analyticsGradeFilter, setProgressRecordsSync]);
+
+  useEffect(() => {
+    if (!user || user.vai_tro === 'student') return;
+    if (activeMenu !== 'analytics' && activeMenu !== 'learning') return;
+    void loadScopedAnalyticsProgress();
+  }, [activeMenu, user?.user_id, user?.vai_tro, loadScopedAnalyticsProgress]);
 
   const loadMenuData = async (menu = activeMenu, force = false) => {
     if (!user) return;
@@ -1563,6 +1702,16 @@ useEffect(() => {
           invalidated_at: record.invalidated_at,
           invalidated_by_name: record.invalidated_by_name,
           last_stage: record.last_stage,
+          pre_lesson_status: record.pre_lesson_status,
+          pre_lesson_watch_percent: record.pre_lesson_watch_percent,
+          pre_lesson_watched_seconds: record.pre_lesson_watched_seconds,
+          pre_lesson_completed_at: record.pre_lesson_completed_at,
+          pre_lesson_completed_before_deadline: record.pre_lesson_completed_before_deadline,
+          pre_lesson_preparation_status: record.pre_lesson_preparation_status,
+          preparation_score: record.preparation_score,
+          preparation_weight: record.preparation_weight,
+          learning_process_score: record.learning_process_score,
+          final_quiz_score: record.final_quiz_score,
           updated_at: record.updated_at_display || record.updated_at,
           updated_at_display: record.updated_at_display || record.updated_at,
           updated_at_ts: record.updated_at_ts || getProgressTimeValue(record.updated_at),
@@ -1644,16 +1793,10 @@ useEffect(() => {
       if (!handleSessionError(res.message)) showToast(res.message || 'Không xử lý được kết quả học tập.', 'error');
       return false;
     }
-    const progressRes = await listLearningProgressApi(user.token);
-    if (progressRes.ok) {
-      const refreshed = (progressRes.data?.items || [])
-        .map((item) => sanitizeProgressRecord(item))
-        .filter(Boolean) as LessonProgressRecord[];
-      setProgressRecordsSync(refreshed);
-    }
+    await loadScopedAnalyticsProgress();
     showToast(res.message || 'Đã xử lý kết quả học tập.', 'success');
     return true;
-  }, [user, setProgressRecordsSync]);
+  }, [user, loadScopedAnalyticsProgress]);
 
   const assistantSuggestions = useMemo(() => {
     if (!selectedLessonContent) return undefined;
@@ -1771,7 +1914,7 @@ useEffect(() => {
     localStorage.removeItem('aiConfig');
     setAIConfig({ apiKey: '', model: AI_MODELS[0] });
     setUser(userData);
-    localStorage.setItem('user', JSON.stringify(userData));
+    localStorage.setItem('user', JSON.stringify(serializeStoredUser(userData)));
     // Giáo viên vào thẳng màn hình Bài học dùng chung giao diện quản lý với Admin.
     // Kể cả giáo viên có quyen_admin vẫn giữ workspace 5 chức năng của giáo viên.
     setActiveMenu(userData.vai_tro === 'admin' ? 'overview' : userData.vai_tro === 'teacher' ? 'lessons' : 'learning');
@@ -1826,7 +1969,7 @@ useEffect(() => {
     }
     setIsSubmitting(false);
     setUser(updatedUser);
-    localStorage.setItem('user', JSON.stringify(updatedUser));
+    localStorage.setItem('user', JSON.stringify(serializeStoredUser(updatedUser)));
     setIsProfileModalOpen(false);
     setProfileClasses([]);
     showToast('Đã cập nhật hồ sơ cá nhân', 'success');
@@ -1918,6 +2061,25 @@ useEffect(() => {
     showToast(`Đã đặt năm học ${res.data.ten_nam_hoc} là hiện hành`, 'success');
     return true;
   };
+
+  const handleRunSystemDiagnostics = useCallback(async () => {
+    if (!user?.token || !currentUserIsAdmin) return;
+    setIsSubmitting(true);
+    try {
+      const res = await getSystemDiagnosticsApi(user.token);
+      if (!res.ok || !res.data) throw new Error(res.message || 'Không quét được dữ liệu hỗ trợ hệ thống.');
+      setSystemDiagnostics(res.data);
+      showToast(res.data.summary.total_issues > 0
+        ? `Đã quét xong: có ${res.data.summary.total_issues} vấn đề cần rà soát.`
+        : 'Đã quét xong. Không phát hiện lỗi chéo trong dữ liệu hỗ trợ.',
+        res.data.summary.total_issues > 0 ? 'info' : 'success');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Không quét được dữ liệu hỗ trợ hệ thống.';
+      if (!handleSessionError(message)) showToast(message, 'error');
+    } finally {
+      setIsSubmitting(false);
+    }
+  }, [user?.token, currentUserIsAdmin]);
 
   const clearAuthState = useCallback((showMessage = true) => {
     setUser(null);
@@ -2037,9 +2199,11 @@ useEffect(() => {
     setWelcomeVideoModalConfig(videoConfig);
   };
 
-  const persistProgressRecord = useCallback(async (record: LessonProgressRecord, silent = true) => {
-    if (!user || user.vai_tro !== 'student') return;
-    const payload: LessonProgressRecord = activeCoLearningSession && activeCoLearningSession.lesson_id === record.lesson_id
+  const persistProgressRecord = useCallback(async (record: LessonProgressRecord, silent = true): Promise<boolean> => {
+    if (!user || user.vai_tro !== 'student') return false;
+    const activeSessionMatches = activeCoLearningSession && activeCoLearningSession.lesson_id === record.lesson_id;
+    const queuedCoLearningRecord = record.study_mode === 'co_learning' && Boolean(String(record.co_learning_session_id || '').trim());
+    const payload: LessonProgressRecord = activeSessionMatches
       ? {
           ...record,
           study_mode: 'co_learning',
@@ -2049,17 +2213,55 @@ useEffect(() => {
           co_learner_names: getCoLearningSessionNames(activeCoLearningSession),
           result_group_id: activeCoLearningSession.co_learning_session_id,
         }
-      : { ...record, study_mode: 'single', co_learning_session_id: '', co_learner_ids: '', co_learner_user_ids: [], co_learner_names: [], result_group_id: `${record.user_id}_${record.lesson_id}` };
+      : queuedCoLearningRecord
+        ? { ...record }
+        : { ...record, study_mode: 'single', co_learning_session_id: '', co_learner_ids: '', co_learner_user_ids: [], co_learner_names: [], result_group_id: `${record.user_id}_${record.lesson_id}` };
     const res = await saveLearningProgressApi(user.token, payload);
     if (!res.ok) {
+      queuePendingLearningProgress(user.user_id, payload);
+      setProgressRecordsSync((current) => current.map((item) => item.progress_id === record.progress_id ? { ...item, ...payload, save_state: 'save_failed' } : item));
       if (!silent && !handleSessionError(res.message)) showToast(res.message || 'Không lưu được tiến trình học lên hệ thống.', 'error');
-      return;
+      return false;
     }
+    removePendingLearningProgress(user.user_id, record.progress_id);
+    delete progressPendingRecordsRef.current[record.progress_id];
     if (res.data) {
-      delete progressPendingRecordsRef.current[record.progress_id];
-      setProgressRecordsSync((current) => mergeProgressCollections(current.filter((item) => item.progress_id !== res.data!.progress_id), [sanitizeProgressRecord(res.data!)! ]));
+      const saved = sanitizeProgressRecord({ ...res.data, save_state: 'saved' })!;
+      setProgressRecordsSync((current) => mergeProgressCollections(current.filter((item) => item.progress_id !== saved.progress_id), [saved]));
+    } else {
+      setProgressRecordsSync((current) => current.map((item) => item.progress_id === record.progress_id ? { ...item, ...payload, save_state: 'saved' } : item));
     }
+    return true;
   }, [user, activeCoLearningSession]);
+
+  useEffect(() => {
+    if (!user || user.vai_tro !== 'student') return;
+    let cancelled = false;
+    let retrying = false;
+    const retryStoredProgress = async () => {
+      if (cancelled || retrying || (typeof navigator !== 'undefined' && navigator.onLine === false)) return;
+      const pending = readPendingLearningProgress(user.user_id);
+      if (!pending.length) return;
+      retrying = true;
+      try {
+        for (const record of pending) {
+          if (cancelled) break;
+          const ok = await persistProgressRecord({ ...record, save_state: 'saving' }, true);
+          if (!ok && typeof navigator !== 'undefined' && navigator.onLine === false) break;
+        }
+      } finally {
+        retrying = false;
+      }
+    };
+    void retryStoredProgress();
+    window.addEventListener('online', retryStoredProgress);
+    const retryTimer = window.setInterval(() => { void retryStoredProgress(); }, 30000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(retryTimer);
+      window.removeEventListener('online', retryStoredProgress);
+    };
+  }, [user?.user_id, user?.vai_tro, persistProgressRecord]);
 
   useEffect(() => {
     const flushPendingProgress = () => {
@@ -2110,7 +2312,7 @@ useEffect(() => {
     progressSaveTimersRef.current[timerKey] = window.setTimeout(() => {
       delete progressSaveTimersRef.current[timerKey];
       void persistProgressRecord(nextRecord, true);
-    }, isCheckpoint ? 400 : 12000);
+    }, isCheckpoint ? 400 : 30000);
   }, [user, activeCoLearningSession, persistProgressRecord, setProgressRecordsSync]);
 
   const markStepOpened = useCallback((lesson: Lesson, stage: LessonStageKey) => {
@@ -2196,6 +2398,114 @@ useEffect(() => {
     }
   }, [selectedLesson, user, updateQuizMetrics]);
 
+  const handleCloseLessonViewer = useCallback(async (snapshot?: LessonCloseSnapshot) => {
+    if (!user || !selectedLesson) {
+      setIsLessonViewerOpen(false);
+      setActiveCoLearningSession(null);
+      return;
+    }
+    if (user.vai_tro !== 'student') {
+      setIsLessonViewerOpen(false);
+      return;
+    }
+
+    const progressId = `${user.user_id}_${selectedLesson.lesson_id}`;
+    if (progressSaveTimersRef.current[progressId]) {
+      window.clearTimeout(progressSaveTimersRef.current[progressId]);
+      delete progressSaveTimersRef.current[progressId];
+    }
+    const existing = sanitizeProgressRecord(progressRecordsRef.current.find((item) => item.progress_id === progressId)) || createEmptyProgressRecord(user.user_id, selectedLesson);
+    const record: LessonProgressRecord = {
+      ...existing,
+      step_details: JSON.parse(JSON.stringify(existing.step_details)),
+    };
+    if (snapshot) {
+      const detail = record.step_details.luyen_tap || createEmptyStepDetail();
+      record.step_details.luyen_tap = {
+        ...detail,
+        opened: true,
+        quizAnswered: snapshot.answered,
+        quizCorrect: snapshot.correct,
+        quizTotal: snapshot.total,
+        quizAnswers: snapshot.answers,
+        sectionProgress: snapshot.sectionProgress,
+        finalExam: snapshot.finalExam || detail.finalExam,
+        lastVisitedAt: new Date().toISOString(),
+      };
+    }
+    const assessmentConfig = selectedLessonContent?.assessment as any;
+    const learningWeight = Number(assessmentConfig?.learning_process_weight ?? assessmentConfig?.interactive_weight ?? selectedLessonContent?.settings?.interactive_weight ?? 40);
+    const finalWeight = Number(assessmentConfig?.final_quiz_weight ?? selectedLessonContent?.settings?.final_quiz_weight ?? 60);
+    const hasPreparationVideo = Boolean(
+      String(selectedLesson.intro_video_url || '').trim()
+      || String(selectedLesson.intro_video_embed_url || '').trim()
+      || String(selectedLessonContent?.intro_video_url || '').trim()
+      || String(selectedLessonContent?.intro_video_embed_url || '').trim()
+    );
+    const preparationScoreEnabled = hasPreparationVideo
+      && selectedLesson.pre_lesson_enabled !== false
+      && selectedLesson.pre_lesson_score_enabled !== false;
+    const preparationWeight = preparationScoreEnabled
+      ? Math.max(0, Math.min(30, Number(selectedLesson.pre_lesson_score_weight ?? 10)))
+      : 0;
+    const preparationStatus = String(record.pre_lesson_preparation_status || '').trim()
+      || (record.pre_lesson_completed_before_deadline === true ? 'prepared'
+        : record.pre_lesson_status === 'completed' ? 'late_completed'
+          : Number(record.pre_lesson_watch_percent || 0) > 0 ? 'in_progress' : 'not_started');
+    const preparationScore = preparationScoreEnabled ? preparationScoreFromStatus(preparationStatus) : 0;
+    let finalRecord = finalizeProgressScore(recomputeProgress(record), new Date().toISOString(), {
+      learningWeight,
+      finalWeight,
+      preparationWeight,
+      preparationScore,
+      preparationStatus,
+    });
+    if (activeCoLearningSession && activeCoLearningSession.lesson_id === selectedLesson.lesson_id) {
+      finalRecord = {
+        ...finalRecord,
+        study_mode: 'co_learning',
+        co_learning_session_id: activeCoLearningSession.co_learning_session_id,
+        co_learner_ids: getCoLearningSessionUserIds(activeCoLearningSession).join(','),
+        co_learner_user_ids: getCoLearningSessionUserIds(activeCoLearningSession),
+        co_learner_names: getCoLearningSessionNames(activeCoLearningSession),
+        result_group_id: activeCoLearningSession.co_learning_session_id,
+      };
+    }
+    progressPendingRecordsRef.current[progressId] = finalRecord;
+    setProgressRecordsSync((current) => mergeProgressCollections(current.filter((item) => item.progress_id !== progressId), [finalRecord]));
+    const wasCoLearning = Boolean(activeCoLearningSession && activeCoLearningSession.lesson_id === selectedLesson.lesson_id);
+    // V6.78.0: chốt một bản sao local TRƯỚC khi gọi Firestore. Việc đóng Viewer
+    // không còn phụ thuộc vào tốc độ mạng hoặc permission tạm thời. Cloud save vẫn
+    // được thử ngay; nếu quá 2,5 giây thì đóng bài và hàng đợi sẽ tự đồng bộ lại.
+    queuePendingLearningProgress(user.user_id, finalRecord);
+    showToast('Đang lưu tiến độ và tính điểm bài học...', 'info');
+    const cloudSavePromise = persistProgressRecord(finalRecord, true);
+    const saved = await Promise.race<boolean>([
+      cloudSavePromise,
+      new Promise<boolean>((resolve) => window.setTimeout(() => resolve(false), 2500)),
+    ]);
+    setIsLessonViewerOpen(false);
+    setActiveCoLearningSession(null);
+    if (!saved) {
+      showToast('Đã đóng bài. Kết quả đã được giữ an toàn trên thiết bị và hệ thống sẽ tự đồng bộ lại.', 'info');
+      return;
+    }
+    showToast(wasCoLearning ? 'Đã lưu điểm chung của nhóm và điểm chuẩn bị riêng cho từng học sinh.' : 'Đã lưu điểm và tiến độ bài học.', 'success');
+  }, [user, selectedLesson, selectedLessonContent, activeCoLearningSession, persistProgressRecord, setProgressRecordsSync]);
+
+  const flushProgressBeforeStudyModeChange = useCallback(async (lessonId: string): Promise<boolean> => {
+    if (!user || user.vai_tro !== 'student') return true;
+    const progressId = `${user.user_id}_${lessonId}`;
+    if (progressSaveTimersRef.current[progressId]) {
+      window.clearTimeout(progressSaveTimersRef.current[progressId]);
+      delete progressSaveTimersRef.current[progressId];
+    }
+    const pending = progressPendingRecordsRef.current[progressId]
+      || sanitizeProgressRecord(progressRecordsRef.current.find((item) => item.progress_id === progressId));
+    if (!pending) return true;
+    return persistProgressRecord({ ...pending, save_state: 'saving' }, false);
+  }, [user, persistProgressRecord]);
+
   const closeCoLearningModal = useCallback(() => {
     setIsCoLearningModalOpen(false);
     setCoLearningLesson(null);
@@ -2237,7 +2547,7 @@ useEffect(() => {
     void loadLessonComments(lesson.lesson_id);
   };
 
-  const openCoLearningChoice = async (lesson: Lesson) => {
+  const openCoLearningChoice = async (lesson: Lesson, preferredSession: CoLearningSession | null = null) => {
     if (!user) return;
     setCoLearningLesson(lesson);
     setCoLearningClassmates([]);
@@ -2254,18 +2564,38 @@ useEffect(() => {
       setCoLearningError(`${res.message || 'Không tải được danh sách bạn cùng lớp.'} Em vẫn có thể chọn “Học một mình” để mở bài ngay.`);
       return;
     }
-    setCoLearningClassmates(res.data?.items || []);
-    setReusableCoLearningSession(res.data?.reusable_session || null);
+    const items = res.data?.items || [];
+    const reusable = preferredSession || res.data?.reusable_session || null;
+    setCoLearningClassmates(items);
+    setReusableCoLearningSession(reusable);
+    if (reusable) {
+      const availableIds = new Set(items.map((item) => item.user_id));
+      setCoLearningSelectedUserIds((reusable.participant_user_ids || []).filter((userId) => userId !== user.user_id && availableIds.has(userId)).slice(0, 5));
+    }
   };
+
+  const handleManageActiveCoLearning = useCallback(() => {
+    if (!selectedLesson || !activeCoLearningSession || user?.vai_tro !== 'student') return;
+    void openCoLearningChoice(selectedLesson, activeCoLearningSession);
+  }, [selectedLesson, activeCoLearningSession, user?.vai_tro]);
 
   const openLesson = async (lesson: Lesson) => {
     if (!user) return;
     if (user.vai_tro === 'student') {
+      const scheduleAccess = getLessonScheduleAccess(lesson);
+      // V6.77.1: quyền XEM video trước bài tách khỏi cờ THEO DÕI nhiệm vụ.
+      // Chỉ cần có video + giáo viên cho phép xem khi khóa/chưa đến giờ thì mở modal.
+      // pre_lesson_enabled chỉ quyết định có ghi nhận tiến độ chuẩn bị bài hay không.
+      const preLessonAccess = getPreLessonVideoAccess(lesson, scheduleAccess);
+      if (preLessonAccess.canWatchNow) {
+        setPreLessonVideoLesson(lesson);
+        setIsPreLessonVideoOpen(true);
+        return;
+      }
       if (lesson.is_locked === true) {
         showToast(`Bài “${lesson.tieu_de}” đang được giáo viên khóa. Em chưa thể vào học lúc này.`, 'error');
         return;
       }
-      const scheduleAccess = getLessonScheduleAccess(lesson);
       if (scheduleAccess.blocked) {
         showToast(`${scheduleAccess.message} Em chưa thể vào học lúc này.`, 'error');
         return;
@@ -2281,11 +2611,45 @@ useEffect(() => {
     await openLessonDirect(lesson, null);
   };
 
+  const openLessonTeacherMode = async (lesson: Lesson) => {
+    if (!user || user.vai_tro === 'student') return;
+    await openLessonDirect(lesson, null);
+  };
+
   const handleStudyAlone = async () => {
     const lesson = coLearningLesson;
+    const editingActiveSession = Boolean(isLessonViewerOpen && selectedLesson?.lesson_id === lesson?.lesson_id);
+    if (!lesson) { closeCoLearningModal(); return; }
+    if (editingActiveSession && activeCoLearningSession) {
+      setIsCoLearningSubmitting(true);
+      const flushed = await flushProgressBeforeStudyModeChange(lesson.lesson_id);
+      setIsCoLearningSubmitting(false);
+      if (!flushed) {
+        setCoLearningError('Chưa thể chuyển sang học một mình vì tiến độ nhóm hiện tại chưa được lưu. Hãy kiểm tra kết nối và thử lại.');
+        return;
+      }
+      closeCoLearningModal();
+      setActiveCoLearningSession(null);
+      showToast('Đã chốt tiến độ nhóm và chuyển sang học một mình.', 'success');
+      return;
+    }
     closeCoLearningModal();
-    if (lesson) await openLessonDirect(lesson, null);
+    await openLessonDirect(lesson, null);
   };
+
+  const handleToggleCoLearningClassmate = useCallback((userId: string) => {
+    // V6.78.2: chọn/bỏ chọn hoàn toàn bằng state cục bộ. Không gọi Firestore ở
+    // bước chọn bạn và luôn dùng functional updater để nhiều click liên tiếp
+    // không bị ghi đè bởi state cũ.
+    setCoLearningSelectedUserIds((current) => {
+      if (current.includes(userId)) return current.filter((item) => item !== userId);
+      if (current.length >= 5) return current;
+      return [...current, userId];
+    });
+    // Giữ mật khẩu đã nhập trong phiên modal nếu người dùng lỡ bỏ/chọn lại bạn;
+    // dữ liệu này chỉ ở memory và bị xóa khi đóng modal.
+    setCoLearningError('');
+  }, []);
 
   const handleStartCoLearning = async () => {
     if (!user || !coLearningLesson) return;
@@ -2300,19 +2664,43 @@ useEffect(() => {
       setCoLearningError('Danh sách bạn học đã thay đổi. Vui lòng chọn lại.');
       return;
     }
-    const credentials = selectedClassmates.map((student) => ({
+    const previouslyConfirmed = new Set((reusableCoLearningSession?.participant_user_ids || []).filter((id) => id !== user.user_id));
+    const newlyAdded = selectedClassmates.filter((student) => !previouslyConfirmed.has(student.user_id));
+    const credentials = newlyAdded.map((student) => ({
       user_id: student.user_id,
       identifier: student.ma_hoc_sinh || student.ten_dang_nhap,
       password: coLearningPasswords[student.user_id] || '',
     }));
     if (credentials.some((item) => !item.password.trim())) {
-      setCoLearningError('Vui lòng nhập mật khẩu xác nhận của tất cả bạn đã chọn.');
+      setCoLearningError('Bạn mới thêm vào nhóm cần nhập mật khẩu xác nhận một lần.');
       return;
     }
+    const editingActiveSession = Boolean(isLessonViewerOpen && selectedLesson?.lesson_id === coLearningLesson.lesson_id);
     setIsCoLearningSubmitting(true);
     setCoLearningError('');
-    const res = await startCoLearningSessionApi(user.token, coLearningLesson.lesson_id, credentials);
-    setIsCoLearningSubmitting(false);
+    startLoading(reusableCoLearningSession ? 'Đang chuẩn bị cập nhật nhóm học cùng...' : `Đang chuẩn bị tạo nhóm ${selectedClassmates.length + 1} học sinh...`);
+    let res;
+    try {
+      if (reusableCoLearningSession && editingActiveSession && activeCoLearningSession?.co_learning_session_id === reusableCoLearningSession.co_learning_session_id) {
+        setLoadingMessage('Đang chốt tiến độ nhóm hiện tại trước khi thay đổi thành viên...');
+        const flushed = await flushProgressBeforeStudyModeChange(coLearningLesson.lesson_id);
+        if (!flushed) {
+          setCoLearningError('Chưa thể thay đổi thành viên vì tiến độ nhóm hiện tại chưa được lưu. Hãy kiểm tra kết nối và thử lại.');
+          return;
+        }
+      }
+      const reportProgress = (message: string) => setLoadingMessage(message);
+      res = reusableCoLearningSession
+        ? await updateCoLearningSessionApi(user.token, coLearningLesson.lesson_id, reusableCoLearningSession.co_learning_session_id, coLearningSelectedUserIds, credentials, reportProgress)
+        : await startCoLearningSessionApi(user.token, coLearningLesson.lesson_id, selectedClassmates.map((student) => ({
+            user_id: student.user_id,
+            identifier: student.ma_hoc_sinh || student.ten_dang_nhap,
+            password: coLearningPasswords[student.user_id] || '',
+          })), reportProgress);
+    } finally {
+      stopLoading();
+      setIsCoLearningSubmitting(false);
+    }
     if (!res.ok || !res.data) {
       if (handleSessionError(res.message)) return;
       setCoLearningError(res.message || 'Không xác nhận được phiên học cùng.');
@@ -2321,17 +2709,20 @@ useEffect(() => {
     const lesson = coLearningLesson;
     const session = res.data;
     closeCoLearningModal();
-    showToast(`Đã xác nhận nhóm ${getCoLearningSessionUserIds(session).length} học sinh. Tiến độ và điểm sẽ được đồng bộ cho cả nhóm.`, 'success');
-    await openLessonDirect(lesson, session);
+    setActiveCoLearningSession(session);
+    showToast(reusableCoLearningSession ? `Đã cập nhật nhóm ${getCoLearningSessionUserIds(session).length} học sinh. Từ lần lưu tiếp theo, tiến độ và điểm dùng nhóm mới.` : `Đã xác nhận nhóm ${getCoLearningSessionUserIds(session).length} học sinh. Tiến độ và điểm sẽ được đồng bộ cho cả nhóm.`, 'success');
+    if (!editingActiveSession) await openLessonDirect(lesson, session);
   };
 
   const handleResumeCoLearning = async () => {
     if (!coLearningLesson || !reusableCoLearningSession) return;
     const lesson = coLearningLesson;
     const session = reusableCoLearningSession;
+    const editingActiveSession = Boolean(isLessonViewerOpen && selectedLesson?.lesson_id === lesson.lesson_id);
     closeCoLearningModal();
+    setActiveCoLearningSession(session);
     showToast(`Đang tiếp tục với nhóm ${getCoLearningSessionUserIds(session).length} học sinh đã xác nhận.`, 'success');
-    await openLessonDirect(lesson, session);
+    if (!editingActiveSession) await openLessonDirect(lesson, session);
   };
 
   const handleArenaSelectLesson = async (lesson: Lesson) => {
@@ -2430,7 +2821,12 @@ useEffect(() => {
       setActiveMenu(user?.vai_tro === 'teacher' || currentUserIsAdmin ? 'lessons' : 'my_lessons');
       setIsLessonViewerOpen(true);
       setIsComposerOpen(false);
-      showToast('Đã tạo bài học mới và mở để xem ngay.', 'success');
+      showToast('Đã tạo bài học mới và mở ở chế độ giảng dạy.', 'success');
+      return;
+    }
+
+    if (values.lesson_id && values.keep_editor_open) {
+      showToast(savingDraft ? 'Đã lưu thay đổi vào bản nháp.' : 'Đã lưu thay đổi bài học.', 'success');
       return;
     }
 
@@ -3377,12 +3773,12 @@ useEffect(() => {
       return (
         <div className="lesson-action-grid">
           <button
-            onClick={(event) => { stopCardAction(event); openLesson(lesson); }}
+            onClick={(event) => { stopCardAction(event); currentUserIsAdmin || user.vai_tro === 'teacher' ? void openLessonTeacherMode(lesson) : void openLesson(lesson); }}
             className="lesson-action-button bg-white text-slate-700 ring-1 ring-slate-200 hover:bg-slate-50"
-            aria-label="Mở bài học"
-            title="Mở bài học"
+            aria-label={currentUserIsAdmin || user.vai_tro === 'teacher' ? 'Mở chế độ giảng dạy' : 'Mở bài học'}
+            title={currentUserIsAdmin || user.vai_tro === 'teacher' ? 'Mở chế độ giảng dạy' : 'Mở bài học'}
           >
-            <Eye className="h-3.5 w-3.5 shrink-0" /><span className="lesson-action-label">Mở</span>
+            {currentUserIsAdmin || user.vai_tro === 'teacher' ? <MonitorPlay className="h-3.5 w-3.5 shrink-0" /> : <Eye className="h-3.5 w-3.5 shrink-0" />}<span className="lesson-action-label">{currentUserIsAdmin || user.vai_tro === 'teacher' ? 'Giảng dạy' : 'Mở'}</span>
           </button>
           {canModify && (
             <button
@@ -3448,8 +3844,8 @@ useEffect(() => {
 
     return (
       <div className="flex flex-wrap gap-2">
-        <button onClick={(event) => { stopCardAction(event); openLesson(lesson); }} className="rounded-full bg-white px-3 py-2 text-xs font-semibold text-slate-700 ring-1 ring-slate-200 hover:bg-slate-50">
-          Xem bài
+        <button onClick={(event) => { stopCardAction(event); currentUserIsAdmin || user.vai_tro === 'teacher' ? void openLessonTeacherMode(lesson) : void openLesson(lesson); }} className="rounded-full bg-white px-3 py-2 text-xs font-semibold text-slate-700 ring-1 ring-slate-200 hover:bg-slate-50">
+          {currentUserIsAdmin || user.vai_tro === 'teacher' ? <span className="inline-flex items-center gap-1"><MonitorPlay className="h-3.5 w-3.5" /> Giảng dạy</span> : 'Xem bài'}
         </button>
         {canModify && (
           <button onClick={(event) => { stopCardAction(event); void openComposerForEdit(lesson); }} className="rounded-full bg-indigo-50 px-3 py-2 text-xs font-semibold text-indigo-700 hover:bg-indigo-100">
@@ -3621,6 +4017,24 @@ useEffect(() => {
     );
   };
 
+  const renderAnalyticsScopeNotice = () => (
+    <div className={`rounded-2xl border px-4 py-3 text-sm ${analyticsHasServerScope ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
+      <div className="flex flex-wrap items-center gap-2 font-semibold">
+        {isAnalyticsProgressLoading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Database className="h-4 w-4" />}
+        {isAnalyticsProgressLoading
+          ? 'Đang tải tiến trình đúng phạm vi đã chọn...'
+          : analyticsHasServerScope
+            ? 'Đang dùng truy vấn theo phạm vi để tiết kiệm Firestore Spark.'
+            : 'Chưa tải tiến trình toàn trường để bảo vệ hạn mức Firestore Spark.'}
+      </div>
+      <p className="mt-1 text-xs leading-5 opacity-85">
+        {analyticsHasServerScope
+          ? 'Thay đổi Khối, Lớp hoặc Bài học sẽ chỉ tải nhóm dữ liệu cần thiết.'
+          : 'Hãy chọn ít nhất Khối, Lớp hoặc Bài học. Hệ thống sẽ không tự quét toàn bộ learningProgress khi chưa có phạm vi.'}
+      </p>
+    </div>
+  );
+
   const renderLearningHub = () => {
     const isStudent = user.vai_tro === 'student';
     const lessonOptions = lessonSourcePool.map((lesson) => ({ value: lesson.lesson_id, label: lesson.tieu_de }));
@@ -3783,11 +4197,13 @@ useEffect(() => {
           </div>
         </div>
 
+        {renderAnalyticsScopeNotice()}
+
         <LearningAnalyticsPanel
           rows={analyticsRows}
           schoolYears={schoolYears}
           availableGrades={gradeFilterOptions}
-          onRefresh={loadAppData}
+          onRefresh={async () => { await loadAppData(); await loadScopedAnalyticsProgress(); }}
           filters={{
             query: analyticsQuery,
             onQueryChange: setAnalyticsQuery,
@@ -3847,11 +4263,13 @@ useEffect(() => {
   };
 
   const renderAnalyticsHub = () => (
-    <LearningAnalyticsPanel
+    <div className="space-y-4">
+      {renderAnalyticsScopeNotice()}
+      <LearningAnalyticsPanel
       rows={analyticsRows}
       schoolYears={schoolYears}
       availableGrades={gradeFilterOptions}
-      onRefresh={loadAppData}
+      onRefresh={async () => { await loadAppData(); await loadScopedAnalyticsProgress(); }}
       filters={{
         query: analyticsQuery,
         onQueryChange: setAnalyticsQuery,
@@ -3880,7 +4298,8 @@ useEffect(() => {
       onAddComment={handleAddLessonAnalyticsComment}
       onUpdateComment={handleUpdateLessonAnalyticsComment}
       onModerateResult={handleModerateLearningResult}
-    />
+      />
+    </div>
   );
 
 
@@ -3967,7 +4386,7 @@ useEffect(() => {
                   <XCircle className="h-4 w-4" /> Từ chối
                 </button>
                 <button onClick={() => lesson && openLesson(lesson)} className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 px-4 py-3 text-sm font-semibold text-slate-700">
-                  <Eye className="h-4 w-4" /> Xem trước
+                  <Eye className="h-4 w-4" /> Mở bài
                 </button>
               </div>
             </div>
@@ -4428,6 +4847,17 @@ useEffect(() => {
                   <p>Không dùng Firebase Storage, Cloud Functions, TTL hoặc dịch vụ bắt buộc Blaze.</p>
                   <p>Tệp nguồn chỉ xử lý tạm trên trình duyệt; JSON bài học được giới hạn 750 KB để bảo vệ giới hạn document.</p>
                   <p>Truy vấn được giới hạn theo vai trò, lớp, bài học và người dùng nhằm giảm số lượt đọc Firestore.</p>
+                  {currentUserIsAdmin && (
+                    <button
+                      type="button"
+                      disabled={isSubmitting}
+                      onClick={() => void handleRunSystemDiagnostics()}
+                      className="mt-2 inline-flex items-center gap-2 rounded-xl bg-slate-800 px-4 py-2.5 text-xs font-bold text-white shadow-sm transition hover:bg-slate-900 disabled:cursor-wait disabled:opacity-60"
+                    >
+                      <RefreshCw className={`h-4 w-4 ${isSubmitting ? 'animate-spin' : ''}`} />
+                      {isSubmitting ? 'Đang quét...' : 'Quét chẩn đoán dữ liệu hỗ trợ'}
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
@@ -4438,7 +4868,7 @@ useEffect(() => {
                   <div className="flex items-start justify-between gap-4">
                     <div>
                       <h2 className="text-xl font-bold text-slate-900">Chẩn đoán dữ liệu hệ thống</h2>
-                      <p className="mt-2 text-sm leading-6 text-slate-500">Khối này giúp phát hiện nhanh những bản ghi lệch logic giữa tài khoản, lớp, môn, bài học và tiến trình học tập.</p>
+                      <p className="mt-2 text-sm leading-6 text-slate-500">Khối này quét lớp dữ liệu Google Sheet/legacy hỗ trợ để phát hiện nhanh các bản ghi lệch logic giữa tài khoản, lớp, môn, bài học và tiến trình học tập.</p>
                     </div>
                     <div className={`rounded-2xl px-4 py-2 text-sm font-semibold ${systemDiagnostics.summary.total_issues > 0 ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700'}`}>
                       {systemDiagnostics.summary.total_issues > 0 ? `Có ${systemDiagnostics.summary.total_issues} vấn đề cần rà` : 'Dữ liệu đang ổn định'}
@@ -4717,23 +5147,62 @@ useEffect(() => {
         isLoading={isCoLearningLoading}
         isSubmitting={isCoLearningSubmitting}
         error={coLearningError}
-        onToggleClassmate={(userId) => {
-          setCoLearningSelectedUserIds((current) => current.includes(userId)
-            ? current.filter((item) => item !== userId)
-            : current.length < 5 ? [...current, userId] : current);
-          setCoLearningPasswords((current) => {
-            if (!coLearningSelectedUserIds.includes(userId)) return current;
-            const next = { ...current };
-            delete next[userId];
-            return next;
-          });
+        onToggleClassmate={handleToggleCoLearningClassmate}
+        onPasswordChange={(userId, password) => {
+          setCoLearningPasswords((current) => ({ ...current, [userId]: password }));
           setCoLearningError('');
         }}
-        onPasswordChange={(userId, password) => setCoLearningPasswords((current) => ({ ...current, [userId]: password }))}
         onStudyAlone={handleStudyAlone}
         onResumeCoLearning={handleResumeCoLearning}
         onStartCoLearning={handleStartCoLearning}
         onClose={closeCoLearningModal}
+      />
+
+      <PreLessonVideoModal
+        isOpen={isPreLessonVideoOpen}
+        lesson={preLessonVideoLesson}
+        user={user}
+        onClose={() => { setIsPreLessonVideoOpen(false); setPreLessonVideoLesson(null); }}
+        onProgressChange={(preProgress) => {
+          setProgressRecordsSync((current) => {
+            const key = `${preProgress.user_id}_${preProgress.lesson_id}`;
+            const existingIndex = current.findIndex((item) => `${item.user_id}_${item.lesson_id}` === key);
+            const patch = {
+              pre_lesson_status: preProgress.video_status,
+              pre_lesson_watch_percent: preProgress.watch_percent,
+              pre_lesson_watched_seconds: preProgress.watched_seconds,
+              pre_lesson_completed_at: preProgress.completed_at,
+              pre_lesson_completed_before_deadline: preProgress.completed_before_deadline,
+              pre_lesson_preparation_status: preProgress.preparation_status,
+            };
+            if (existingIndex >= 0) {
+              return current.map((item, index) => index === existingIndex ? { ...item, ...patch } : item);
+            }
+            const lessonMeta = lessonsById.get(preProgress.lesson_id);
+            return [...current, {
+              progress_id: `${preProgress.user_id}_${preProgress.lesson_id}`,
+              user_id: preProgress.user_id,
+              lesson_id: preProgress.lesson_id,
+              ownerUid: preProgress.ownerUid || '',
+              khoi: preProgress.khoi,
+              lop_id: preProgress.lop_id || '',
+              status: 'not_started',
+              study_mode: 'single',
+              completion_percent: 0,
+              completed_steps: 0,
+              total_steps: 0,
+              quiz_correct: 0,
+              quiz_total: 0,
+              quiz_percent: 0,
+              result_state: 'valid',
+              lesson_title: lessonMeta?.tieu_de || '',
+              mon_hoc: lessonMeta?.mon_hoc || '',
+              updated_at: preProgress.last_watched_at || preProgress.completed_at || preProgress.started_at || new Date().toISOString(),
+              step_details: {} as any,
+              ...patch,
+            } as LessonProgressRecord];
+          });
+        }}
       />
 
       {isLessonViewerOpen && <LessonViewer
@@ -4742,15 +5211,23 @@ useEffect(() => {
         content={selectedLessonContent}
         aiConfig={aiConfig}
         onOpenConfig={openAIConfigModal}
-        onClose={() => { setIsLessonViewerOpen(false); setActiveCoLearningSession(null); }}
+        onClose={handleCloseLessonViewer}
         onStageChange={setViewerStage}
         progress={selectedLesson && user.vai_tro === 'student' ? currentStudentProgressByLesson[selectedLesson.lesson_id] || null : null}
         onStepOpened={handleLessonViewerStepOpened}
         onStepViewedComplete={handleLessonViewerStepViewedComplete}
         onQuizMetricsChange={handleLessonViewerQuizMetricsChange}
+        coLearningGroupSize={activeCoLearningSession && selectedLesson?.lesson_id === activeCoLearningSession.lesson_id ? getCoLearningSessionUserIds(activeCoLearningSession).length : 1}
+        onManageCoLearning={handleManageActiveCoLearning}
+        onOpenPreLessonVideo={user.vai_tro === 'student' && selectedLesson ? () => {
+          setPreLessonVideoLesson(selectedLesson);
+          setIsPreLessonVideoOpen(true);
+        } : undefined}
         comments={lessonComments}
         isCommentsLoading={isLessonCommentsLoading}
         currentUserRole={user.vai_tro}
+        currentUser={user}
+        classes={classes}
         onAddComment={handleAddLessonAnalyticsComment}
         onUpdateComment={handleUpdateLessonAnalyticsComment}
       />}

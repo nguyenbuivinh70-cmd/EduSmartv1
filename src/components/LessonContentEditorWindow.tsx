@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { ArrowLeft, BookOpen, CheckCircle2, Eye, FileQuestion, Layers, Save, X } from 'lucide-react';
+import { ArrowLeft, BookOpen, CheckCircle2, FileQuestion, Layers, Save, X } from 'lucide-react';
 import type { AIConfig, LessonContent } from '../types';
 import LessonManualEditor from './LessonManualEditor';
-import LessonPreviewModal from './LessonPreviewModal';
+import LessonActivityManualEditor from './LessonActivityManualEditor';
 
 interface LessonContentEditorWindowProps {
   isOpen: boolean;
@@ -33,23 +33,28 @@ function scrollToEditorBlock(id: string) {
 export default function LessonContentEditorWindow({ isOpen, content, aiConfig, onOpenConfig, onClose, onSave }: LessonContentEditorWindowProps) {
   const [draft, setDraft] = useState<LessonContent>(content);
   const [hasChanges, setHasChanges] = useState(false);
-  const [previewOpen, setPreviewOpen] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
       setDraft(content);
       setHasChanges(false);
-      setPreviewOpen(false);
     }
   }, [isOpen, content]);
 
+  const isActivityLesson = draft.schema_version === 'lesson_v3' || Boolean(draft.activities?.length);
+
   const stats = useMemo(() => {
     const sections = draft.sections || [];
-    const blockCount = sections.reduce((sum, section) => sum + (section.content_blocks?.length || 0), 0);
-    const interactiveCount = sections.reduce((sum, section) => sum + (section.interactive_questions?.length || 0), 0);
+    const activities = draft.activities || [];
+    const blockCount = isActivityLesson
+      ? activities.reduce((sum, activity) => sum + (activity.pages || []).reduce((pageSum, page) => pageSum + (page.blocks?.length || 0), 0), 0)
+      : sections.reduce((sum, section) => sum + (section.content_blocks?.length || 0), 0);
+    const interactiveCount = isActivityLesson
+      ? activities.reduce((sum, activity) => sum + (activity.interactions?.length || 0), 0)
+      : sections.reduce((sum, section) => sum + (section.interactive_questions?.length || 0), 0);
     const finalQuizCount = draft.final_quiz?.length || 0;
-    return { sections, blockCount, interactiveCount, finalQuizCount };
-  }, [draft]);
+    return { sections, activities, blockCount, interactiveCount, finalQuizCount };
+  }, [draft, isActivityLesson]);
 
   const updateDraft = (next: LessonContent) => {
     setDraft(next);
@@ -93,9 +98,6 @@ export default function LessonContentEditorWindow({ isOpen, content, aiConfig, o
                 <button type="button" onClick={closeSafely} className="inline-flex items-center gap-2 rounded-2xl bg-white/12 px-4 py-3 text-sm font-bold hover:bg-white/20">
                   <ArrowLeft className="h-4 w-4" /> Quay lại
                 </button>
-                <button type="button" onClick={() => setPreviewOpen(true)} className="inline-flex items-center gap-2 rounded-2xl bg-white px-4 py-3 text-sm font-bold text-slate-800 shadow-lg shadow-slate-950/10 hover:bg-slate-50">
-                  <Eye className="h-4 w-4" /> Xem trước
-                </button>
                 <button type="button" onClick={saveDraft} className="inline-flex items-center gap-2 rounded-2xl bg-emerald-500 px-4 py-3 text-sm font-bold text-white shadow-lg shadow-emerald-900/20 hover:bg-emerald-600">
                   <Save className="h-4 w-4" /> Lưu nội dung
                 </button>
@@ -113,7 +115,7 @@ export default function LessonContentEditorWindow({ isOpen, content, aiConfig, o
                 <div className="rounded-3xl border border-indigo-100 bg-indigo-50/80 p-4">
                   <p className="text-xs font-black uppercase tracking-[0.18em] text-indigo-600">Tổng quan</p>
                   <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
-                    <div className="rounded-2xl bg-white px-3 py-2"><span className="text-slate-500">Mục</span><p className="font-black text-slate-900">{stats.sections.length}</p></div>
+                    <div className="rounded-2xl bg-white px-3 py-2"><span className="text-slate-500">{isActivityLesson ? 'Hoạt động' : 'Mục'}</span><p className="font-black text-slate-900">{isActivityLesson ? stats.activities.length : stats.sections.length}</p></div>
                     <div className="rounded-2xl bg-white px-3 py-2"><span className="text-slate-500">Khối</span><p className="font-black text-slate-900">{stats.blockCount}</p></div>
                     <div className="rounded-2xl bg-white px-3 py-2"><span className="text-slate-500">Tương tác</span><p className="font-black text-slate-900">{stats.interactiveCount}</p></div>
                     <div className="rounded-2xl bg-white px-3 py-2"><span className="text-slate-500">Cuối bài</span><p className="font-black text-slate-900">{stats.finalQuizCount}</p></div>
@@ -125,18 +127,18 @@ export default function LessonContentEditorWindow({ isOpen, content, aiConfig, o
                     <BookOpen className="h-4 w-4 text-indigo-600" /> Thông tin chung
                   </button>
                   <button type="button" onClick={() => scrollToEditorBlock('lesson-editor-sections')} className="flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left text-sm font-bold text-slate-700 hover:bg-slate-100">
-                    <Layers className="h-4 w-4 text-violet-600" /> Nội dung kiến thức
+                    <Layers className="h-4 w-4 text-violet-600" /> {isActivityLesson ? 'Hoạt động dạy học' : 'Nội dung kiến thức'}
                   </button>
                   <div className="max-h-[38vh] space-y-1 overflow-y-auto pr-1">
-                    {stats.sections.map((section, index) => (
+                    {(isActivityLesson ? stats.activities : stats.sections).map((item, index) => (
                       <button
-                        key={section.section_id || index}
+                        key={(isActivityLesson ? stats.activities[index]?.activity_id : stats.sections[index]?.section_id) || index}
                         type="button"
-                        onClick={() => scrollToEditorBlock(`lesson-editor-section-${index}`)}
+                        onClick={() => scrollToEditorBlock(isActivityLesson ? `lesson-editor-activity-${index}` : `lesson-editor-section-${index}`)}
                         className="flex w-full items-start gap-2 rounded-2xl px-3 py-2 text-left text-xs font-semibold text-slate-600 hover:bg-slate-100"
                       >
                         <span className="mt-0.5 rounded-full bg-violet-100 px-2 py-0.5 text-[10px] font-black text-violet-700">{index + 1}</span>
-                        <span className="line-clamp-2">{plainText(section.title) || `Mục ${index + 1}`}</span>
+                        <span className="line-clamp-2">{plainText(item.title) || `${isActivityLesson ? 'Hoạt động' : 'Mục'} ${index + 1}`}</span>
                       </button>
                     ))}
                   </div>
@@ -152,14 +154,12 @@ export default function LessonContentEditorWindow({ isOpen, content, aiConfig, o
               <main className="min-h-0 overflow-y-auto bg-slate-50 p-4 lg:p-6">
                 <div className="mx-auto max-w-6xl">
                   <div className="mb-4 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm lg:hidden">
-                    <p className="text-sm font-bold text-slate-800">Cấu trúc bài học: {stats.sections.length} mục • {stats.blockCount} khối • {stats.interactiveCount} câu tương tác • {stats.finalQuizCount} câu cuối bài</p>
+                    <p className="text-sm font-bold text-slate-800">Cấu trúc bài học: {isActivityLesson ? `${stats.activities.length} hoạt động` : `${stats.sections.length} mục`} • {stats.blockCount} khối • {stats.interactiveCount} câu tương tác • {stats.finalQuizCount} câu cuối bài</p>
                   </div>
-                  <LessonManualEditor content={draft} onChange={updateDraft} />
+                  {isActivityLesson ? <LessonActivityManualEditor content={draft} onChange={updateDraft} /> : <LessonManualEditor content={draft} onChange={updateDraft} />}
                 </div>
               </main>
             </div>
-
-            <LessonPreviewModal isOpen={previewOpen} content={draft} aiConfig={aiConfig} onOpenConfig={onOpenConfig} onClose={() => setPreviewOpen(false)} />
           </motion.div>
         </div>
       ) : null}

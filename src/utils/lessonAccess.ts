@@ -79,3 +79,28 @@ export function getLessonScheduleAccess(
     message: '',
   };
 }
+
+export type PreLessonVideoAccessState = {
+  hasVideo: boolean;
+  trackingEnabled: boolean;
+  allowWhenLocked: boolean;
+  canWatchNow: boolean;
+  reason: 'locked' | 'before_start' | null;
+};
+
+export function getPreLessonVideoAccess(
+  lesson: (Lesson | LessonRow) | null | undefined,
+  scheduleAccess: LessonScheduleAccessState = getLessonScheduleAccess(lesson),
+): PreLessonVideoAccessState {
+  const hasVideo = Boolean(String(lesson?.intro_video_url || lesson?.intro_video_embed_url || '').trim());
+  const trackingEnabled = lesson?.pre_lesson_enabled !== false && hasVideo;
+  const allowWhenLocked = lesson?.pre_lesson_allow_when_locked !== false;
+  const reason = lesson?.is_locked === true ? 'locked' : scheduleAccess.reason === 'before_start' ? 'before_start' : null;
+  return {
+    hasVideo,
+    trackingEnabled,
+    allowWhenLocked,
+    canWatchNow: hasVideo && allowWhenLocked && reason !== null,
+    reason,
+  };
+}

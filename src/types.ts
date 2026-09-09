@@ -4,7 +4,7 @@ export type LessonStageKey = 'khoi_dong' | 'hinh_thanh_kien_thuc' | 'luyen_tap' 
 export type QuizQuestionType = 'single_choice' | 'true_false' | 'fill_in_blank' | 'short_answer';
 export type FinalQuizQuestionType = 'single_choice' | 'true_false' | 'fill_in_blank';
 export type ReviewPracticeType = 'chapter' | 'midterm' | 'final' | 'topic' | 'custom';
-export type LessonSchemaVersion = 'lesson_v1' | 'lesson_v2';
+export type LessonSchemaVersion = 'lesson_v1' | 'lesson_v2' | 'lesson_v3';
 export type LearningStatus = 'not_started' | 'in_progress' | 'completed';
 export type StudyMode = 'single' | 'co_learning';
 export type LearningResultState = 'valid' | 'cancelled_retake' | 'invalid_cheating';
@@ -171,6 +171,17 @@ export interface LessonRow {
   locked_at?: string;
   locked_by_uid?: string;
   locked_by_name?: string;
+  intro_video_url?: string;
+  intro_video_embed_url?: string;
+  pre_lesson_enabled?: boolean;
+  pre_lesson_allow_when_locked?: boolean;
+  pre_lesson_required?: boolean;
+  pre_lesson_completion_threshold?: number;
+  pre_lesson_deadline?: string;
+  pre_lesson_score_enabled?: boolean;
+  pre_lesson_score_weight?: number;
+  content_schema_version?: LessonSchemaVersion;
+  builder_settings?: LessonBuilderSettings;
   created_at?: string;
   updated_at?: string;
 }
@@ -206,6 +217,16 @@ export interface Lesson {
   locked_at?: string;
   locked_by_uid?: string;
   locked_by_name?: string;
+  intro_video_url?: string;
+  intro_video_embed_url?: string;
+  pre_lesson_enabled?: boolean;
+  pre_lesson_allow_when_locked?: boolean;
+  pre_lesson_required?: boolean;
+  pre_lesson_completion_threshold?: number;
+  pre_lesson_deadline?: string;
+  pre_lesson_score_enabled?: boolean;
+  pre_lesson_score_weight?: number;
+  content_schema_version?: LessonSchemaVersion;
   raw?: LessonRow;
 }
 
@@ -463,6 +484,96 @@ export interface LessonSectionV2 {
   youtube_url?: string;
   youtube_embed_url?: string;
   interactive_questions: QuizQuestion[];
+  // V6.76.0: lesson_v3 activity compatibility fields used by LessonViewer.
+  pages?: LessonPresentationPage[];
+  activity_type?: LessonActivityType;
+  objective?: string;
+  estimated_minutes?: number;
+  released?: boolean;
+  locked?: boolean;
+}
+
+export type LessonActivityType = 'warmup' | 'knowledge' | 'practice' | 'application' | 'discussion' | 'custom';
+export type LessonPageLayout = 'title_content' | 'concept_focus' | 'example_focus' | 'two_column' | 'image_explain' | 'remember' | 'task' | 'compare_grid' | 'process_steps' | 'highlight' | 'timeline' | 'hero_concept' | 'story_visual' | 'visual_explain' | 'comparison' | 'process' | 'card_grid';
+export type LessonVisualType = 'none' | 'icon_cards' | 'hub_spoke' | 'process' | 'comparison' | 'timeline' | 'device_diagram' | 'concept_map' | 'numbered_steps';
+
+export interface LessonPageVisual {
+  type: LessonVisualType;
+  title?: string;
+  items?: string[];
+  center_label?: string;
+  relationship?: string;
+}
+
+export interface LessonPresentationPage {
+  page_id: string;
+  title: string;
+  subtitle?: string;
+  layout?: LessonPageLayout;
+  blocks: LessonContentBlock[];
+  teacher_notes?: string;
+  student_prompt?: string;
+  visual_hint?: string;
+  illustration_keywords?: string[];
+  visual?: LessonPageVisual;
+}
+
+export interface LessonActivityV3 {
+  activity_id: string;
+  title: string;
+  objective?: string;
+  activity_type?: LessonActivityType;
+  estimated_minutes?: number;
+  pages: LessonPresentationPage[];
+  interactions: QuizQuestion[];
+  summary?: string;
+  released?: boolean;
+  locked?: boolean;
+}
+
+export interface TeachingSession {
+  session_id: string;
+  lesson_id: string;
+  class_id: string;
+  grade: string;
+  status: 'idle' | 'live' | 'ended';
+  current_activity_id?: string;
+  current_page_id?: string;
+  released_activity_ids: string[];
+  started_at?: string;
+  ended_at?: string;
+  updated_at?: string;
+  updated_by_uid?: string;
+  updated_by_name?: string;
+}
+
+export interface PreLessonProgress {
+  progress_id: string;
+  lesson_id: string;
+  user_id: string;
+  ownerUid?: string;
+  khoi: string;
+  lop_id?: string;
+  video_status: 'not_started' | 'in_progress' | 'completed';
+  /** Số giây nội dung video đã được phủ duy nhất; xem lại cùng đoạn không cộng lại. */
+  watched_seconds: number;
+  /** Tổng số giây video thực tế. */
+  duration_seconds: number;
+  /** % độ phủ nội dung video, dùng để đánh giá chuẩn bị bài. */
+  watch_percent: number;
+  /** Tổng thời gian phát thực tế, kể cả xem lại; chỉ dùng phân tích, không dùng chấm hoàn thành. */
+  playback_seconds?: number;
+  /** Vị trí phát gần nhất để học sinh tiếp tục khi mở lại video. */
+  last_position_seconds?: number;
+  /** Các khoảng giây nội dung đã xem, dạng "0-12", "18-25"; dùng để chống cộng trùng khi xem lại. */
+  watched_ranges?: string[];
+  coverage_model?: 'legacy_elapsed' | 'unique_seconds_v1';
+  preparation_status?: 'not_started' | 'in_progress' | 'prepared' | 'late_completed';
+  started_at?: string;
+  last_watched_at?: string;
+  completed_at?: string;
+  completed_before_deadline?: boolean;
+  schemaVersion?: number;
 }
 
 export interface LessonAssessmentV2 {
@@ -522,6 +633,7 @@ export interface LessonContent {
   intro_video_embed_url?: string;
   settings?: LessonBuilderSettings;
   sections?: LessonSectionV2[];
+  activities?: LessonActivityV3[];
   final_quiz?: QuizQuestion[];
   assessment?: LessonAssessmentV2;
   metadata: LessonMetadata;
@@ -642,10 +754,18 @@ export interface LessonComposerValues {
   pham_vi: 'private' | 'shared';
   share_now: boolean;
   save_mode?: 'draft' | 'publish';
+  keep_editor_open?: boolean;
   tu_khoa: string;
   lesson_json: LessonContent | null;
   builder_settings?: LessonBuilderSettings;
   intro_video_url?: string;
+  pre_lesson_enabled?: boolean;
+  pre_lesson_allow_when_locked?: boolean;
+  pre_lesson_required?: boolean;
+  pre_lesson_completion_threshold?: number;
+  pre_lesson_deadline?: string;
+  pre_lesson_score_enabled?: boolean;
+  pre_lesson_score_weight?: number;
   section_video_links?: string;
   ai_revision_request?: string;
   source_text: string;
@@ -708,8 +828,25 @@ export interface SectionLearningProgress {
   requiredSeconds: number;
   interactionCount: number;
   answeredQuestionIds: string[];
+  correctCount?: number;
+  questionTotal?: number;
+  timePercent?: number;
+  interactionPercent?: number;
+  completionPercent?: number;
+  section_score?: number;
+  score_status?: 'pending' | 'completed';
+  score_calculated_at?: string;
   completedAt?: string;
   lastVisitedAt?: string;
+}
+
+export interface LessonCloseSnapshot {
+  answered: number;
+  correct: number;
+  total: number;
+  answers: Record<string, LessonQuestionAnswerState>;
+  sectionProgress: Record<string, SectionLearningProgress>;
+  finalExam?: FinalExamProgressDetail;
 }
 
 export interface FinalExamSecurityEvents {
@@ -772,6 +909,14 @@ export interface LessonProgressRecord {
   quiz_correct?: number;
   quiz_percent?: number;
   assessment_score?: number;
+  section_scores?: Record<string, number>;
+  learning_process_score?: number;
+  final_quiz_score?: number;
+  current_score?: number;
+  score_status?: 'in_progress' | 'finalized';
+  score_calculated_at?: string;
+  last_closed_at?: string;
+  save_state?: 'saving' | 'saved' | 'save_failed';
   result_state?: LearningResultState;
   result_group_id?: string;
   result_version?: number;
@@ -787,7 +932,18 @@ export interface LessonProgressRecord {
   co_learner_user_ids?: string[];
   co_learner_names?: string[];
   nam_hoc?: string;
+  pre_lesson_status?: 'not_started' | 'in_progress' | 'completed';
+  pre_lesson_watch_percent?: number;
+  pre_lesson_watched_seconds?: number;
+  pre_lesson_completed_at?: string;
+  pre_lesson_completed_before_deadline?: boolean;
+  pre_lesson_preparation_status?: 'not_started' | 'in_progress' | 'prepared' | 'late_completed';
+  preparation_score?: number;
+  preparation_weight?: number;
+  learning_component_weight?: number;
+  final_component_weight?: number;
 }
+
 
 export interface CoLearningSession {
   co_learning_session_id: string;
@@ -803,12 +959,23 @@ export interface CoLearningSession {
   participant_uids?: string[];
   participant_names?: string[];
   participant_keys?: string[];
+  participant_preparation_statuses?: Array<'not_started' | 'in_progress' | 'prepared' | 'late_completed' | 'unknown'>;
+  participant_preparation_scores?: number[];
+  participant_preparation_watch_percents?: number[];
+  participant_assessment_scores?: number[];
+  preparation_snapshot_at?: string;
+  schemaVersion?: number;
   group_size?: number;
   study_mode: 'co_learning';
   status?: 'active' | 'completed' | 'cancelled_retake' | 'invalid_cheating' | string;
   started_at?: string;
   last_active_at?: string;
   verified_at?: string;
+  supersedes_session_id?: string;
+  superseded_by_session_id?: string;
+  membership_version?: number;
+  membership_updated_at?: string;
+  membership_updated_by_uid?: string;
 }
 
 export interface CoLearningPartnerCredential {
@@ -850,6 +1017,16 @@ export interface StudentLearningAnalyticsRow {
   updated_at_display?: string;
   updated_at_ts?: number;
   nam_hoc?: string;
+  pre_lesson_status?: 'not_started' | 'in_progress' | 'completed';
+  pre_lesson_watch_percent?: number;
+  pre_lesson_watched_seconds?: number;
+  pre_lesson_completed_at?: string;
+  pre_lesson_completed_before_deadline?: boolean;
+  pre_lesson_preparation_status?: 'not_started' | 'in_progress' | 'prepared' | 'late_completed';
+  preparation_score?: number;
+  preparation_weight?: number;
+  learning_process_score?: number;
+  final_quiz_score?: number;
 }
 
 export interface LearningResultModerationPayload {

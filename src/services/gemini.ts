@@ -7,6 +7,7 @@ import {
   LessonComposerValues,
   LessonContent,
   LessonStageKey,
+  LessonPresentationPage,
   QuizQuestion,
   QuizQuestionType,
   UploadedSourceFile,
@@ -335,7 +336,176 @@ function normalizeLessonV2(raw: any): LessonContent {
   };
 }
 
+function presentationWordCount(value: unknown) {
+  return cleanTextValue(value).split(/\s+/).filter(Boolean).length;
+}
+
+function splitPresentationText(value: string, maxWords = 55) {
+  const cleaned = cleanTextValue(value);
+  if (!cleaned || presentationWordCount(cleaned) <= maxWords) return cleaned ? [cleaned] : [];
+  const sentences = cleaned.split(/(?<=[.!?])\s+/).map((item) => item.trim()).filter(Boolean);
+  const chunks: string[] = [];
+  let current = '';
+  const pushCurrent = () => { if (current.trim()) chunks.push(current.trim()); current = ''; };
+  for (const sentence of sentences.length > 1 ? sentences : [cleaned]) {
+    const sentenceWords = sentence.split(/\s+/).filter(Boolean);
+    if (sentenceWords.length > maxWords) {
+      pushCurrent();
+      for (let i = 0; i < sentenceWords.length; i += maxWords) chunks.push(sentenceWords.slice(i, i + maxWords).join(' '));
+      continue;
+    }
+    const candidate = current ? `${current} ${sentence}` : sentence;
+    if (presentationWordCount(candidate) > maxWords) pushCurrent();
+    current = current ? `${current} ${sentence}` : sentence;
+  }
+  pushCurrent();
+  return chunks;
+}
+
+function splitPresentationBlock(block: any) {
+  const parts = splitPresentationText(cleanTextValue(block?.text || ''), 58);
+  if (parts.length <= 1) return [{ ...block, text: parts[0] || cleanTextValue(block?.text || '') }];
+  return parts.map((part, index) => ({
+    ...block,
+    title: index === 0 ? cleanTextValue(block?.title || '') : cleanTextValue(block?.title || '') ? `${cleanTextValue(block.title)} (tiếp)` : '',
+    text: part,
+  }));
+}
+
+function normalizePageVisual(page: any) {
+  const visual = page?.visual || {};
+  const allowedTypes = ['none', 'icon_cards', 'hub_spoke', 'process', 'comparison', 'timeline', 'device_diagram', 'concept_map', 'numbered_steps'];
+  const explicitType = cleanTextValue(visual?.type || page?.visual_type || page?.kieu_minh_hoa || '');
+  const explicitItemsSource = visual?.items || page?.visual_items || page?.noi_dung_minh_hoa || [];
+  const legacyItemsSource = page?.illustration_keywords || page?.tu_khoa_minh_hoa || [];
+  const itemsSource = Array.isArray(explicitItemsSource) && explicitItemsSource.length ? explicitItemsSource : legacyItemsSource;
+  const items = Array.isArray(itemsSource) ? itemsSource.map((item: any) => cleanTextValue(item)).filter(Boolean).slice(0, 5) : [];
+  const layout = String(page?.layout || '');
+  const derivedType = items.length
+    ? (['task', 'story_visual'].includes(layout) ? 'hub_spoke'
+      : ['process', 'process_steps'].includes(layout) ? 'process'
+        : ['comparison', 'compare_grid', 'two_column'].includes(layout) ? 'comparison'
+          : layout === 'timeline' ? 'timeline'
+            : ['visual_explain', 'image_explain'].includes(layout) ? 'icon_cards'
+              : 'concept_map')
+    : 'none';
+  return {
+    type: allowedTypes.includes(explicitType) ? explicitType : derivedType,
+    title: cleanTextValue(visual?.title || page?.visual_title || page?.tieu_de_minh_hoa || ''),
+    items,
+    center_label: cleanTextValue(visual?.center_label || page?.visual_center_label || page?.nhan_trung_tam || ''),
+    relationship: cleanTextValue(visual?.relationship || page?.visual_relationship || page?.moi_quan_he || ''),
+  };
+}
+
+function normalizePresentationPage(page: any, activityIndex: number, pageIndex: number) {
+  const blocks = normalizeContentBlocks(page?.blocks || page?.content_blocks || page?.noi_dung || []);
+  const fallbackText = cleanTextValue(page?.content || page?.text || '');
+  const allowedLayouts = ['title_content', 'concept_focus', 'example_focus', 'two_column', 'image_explain', 'compare_grid', 'process_steps', 'highlight', 'timeline', 'remember', 'task', 'hero_concept', 'story_visual', 'visual_explain', 'comparison', 'process', 'card_grid'];
+  return {
+    page_id: cleanTextValue(page?.page_id || page?.id || `A${activityIndex + 1}_P${pageIndex + 1}`),
+    title: cleanTextValue(page?.title || page?.tieu_de || `Trang ${pageIndex + 1}`),
+    subtitle: cleanTextValue(page?.subtitle || page?.mo_ta || ''),
+    layout: allowedLayouts.includes(String(page?.layout || '')) ? page.layout : 'title_content',
+    blocks: blocks.length ? blocks : (fallbackText ? [{ type: 'paragraph', title: '', category: 'giai_thich', theme: 'blue', text: fallbackText }] : []),
+    teacher_notes: cleanTextValue(page?.teacher_notes || page?.loi_dan_giao_vien || ''),
+    student_prompt: cleanTextValue(page?.student_prompt || page?.nhiem_vu_hoc_sinh || ''),
+    visual_hint: cleanTextValue(page?.visual_hint || page?.goi_y_trinh_bay || page?.goi_y_minh_hoa || ''),
+    illustration_keywords: Array.isArray(page?.illustration_keywords || page?.tu_khoa_minh_hoa) ? (page?.illustration_keywords || page?.tu_khoa_minh_hoa).map((item: any) => cleanTextValue(item)).filter(Boolean).slice(0, 6) : [],
+    visual: normalizePageVisual(page),
+  };
+}
+
+function applyPresentationQualityGuard(pages: any[], activityIndex: number) {
+  const guarded: any[] = [];
+  pages.forEach((page, sourceIndex) => {
+    const splitBlocks = (page.blocks || []).flatMap((block: any) => splitPresentationBlock(block)).filter((block: any) => cleanTextValue(block.text || block.title));
+    if (!splitBlocks.length) {
+      guarded.push(page);
+      return;
+    }
+    const groups: any[][] = [];
+    let current: any[] = [];
+    let currentWords = 0;
+    splitBlocks.forEach((block: any) => {
+      const blockWords = presentationWordCount(block.text);
+      if (current.length && (current.length >= 3 || currentWords + blockWords > 105)) {
+        groups.push(current);
+        current = [];
+        currentWords = 0;
+      }
+      current.push(block);
+      currentWords += blockWords;
+    });
+    if (current.length) groups.push(current);
+
+    groups.forEach((group, groupIndex) => {
+      const isFirst = groupIndex === 0;
+      const isLast = groupIndex === groups.length - 1;
+      const continuationTitle = cleanTextValue(group[0]?.title || '');
+      guarded.push({
+        ...page,
+        page_id: isFirst ? page.page_id : `${page.page_id}_Q${groupIndex + 1}`,
+        title: isFirst ? page.title : (continuationTitle && continuationTitle.toLowerCase() !== cleanTextValue(page.title).toLowerCase() ? continuationTitle : `${page.title} – tiếp theo`),
+        blocks: group,
+        teacher_notes: isFirst ? page.teacher_notes : '',
+        student_prompt: isLast ? page.student_prompt : '',
+        visual: isFirst ? page.visual : { type: 'none', title: '', items: [], center_label: '', relationship: '' },
+        visual_hint: isFirst ? page.visual_hint : '',
+        illustration_keywords: isFirst ? page.illustration_keywords : [],
+      });
+    });
+  });
+  return guarded.map((page, pageIndex) => ({
+    ...page,
+    page_id: cleanTextValue(page.page_id || `A${activityIndex + 1}_P${pageIndex + 1}`),
+  }));
+}
+
+function normalizeActivityV3(activity: any, index: number) {
+  const normalizedPages = (Array.isArray(activity?.pages) ? activity.pages : []).map((page: any, pageIndex: number) => normalizePresentationPage(page, index, pageIndex));
+  const pages = applyPresentationQualityGuard(normalizedPages, index);
+  const interactions = safeQuizArray(activity?.interactions || activity?.interactive_questions || activity?.questions || []);
+  return {
+    activity_id: cleanTextValue(activity?.activity_id || activity?.id || `A${index + 1}`),
+    title: cleanTextValue(activity?.title || activity?.tieu_de || `Hoạt động ${index + 1}`),
+    objective: cleanTextValue(activity?.objective || activity?.muc_tieu || ''),
+    activity_type: cleanTextValue(activity?.activity_type || activity?.loai_hoat_dong || (index === 0 ? 'warmup' : 'knowledge')) as any,
+    estimated_minutes: Math.max(1, Number(activity?.estimated_minutes || activity?.thoi_gian_phut || 8)),
+    pages,
+    interactions: interactions.map((q, qIndex) => ({ ...q, id: q.id || `${toQuestionIdPrefix(q.type || 'single_choice')}_A${index + 1}_${qIndex + 1}` })),
+    summary: cleanTextValue(activity?.summary || activity?.ghi_nho || ''),
+    released: activity?.released === true,
+    locked: activity?.locked === true,
+  };
+}
+
+function normalizeLessonV3(raw: any): LessonContent {
+  const base = normalizeLessonV2({ ...raw, schema_version: 'lesson_v2', sections: raw?.sections || [], final_quiz: raw?.final_quiz || [] });
+  const activities = (Array.isArray(raw?.activities) ? raw.activities : [])
+    .map((activity: any, index: number) => normalizeActivityV3(activity, index))
+    .filter((activity: any) => activity.title);
+  const syntheticSections = activities.map((activity: any, index: number) => normalizeSectionV2({
+    section_id: activity.activity_id,
+    title: activity.title,
+    content: activity.pages.flatMap((page: any) => page.blocks || []).map((block: any) => block.text || '').filter(Boolean).join('\n\n'),
+    content_blocks: activity.pages.flatMap((page: any) => page.blocks || []),
+    summary: activity.summary,
+    interactive_questions: activity.interactions,
+  }, index));
+  const legacy = buildLegacyFromV2(syntheticSections, base.final_quiz || []);
+  return {
+    ...base,
+    schema_version: 'lesson_v3',
+    activities,
+    sections: syntheticSections,
+    hinh_thanh_kien_thuc: legacy.hinh_thanh_kien_thuc,
+    luyen_tap: legacy.luyen_tap,
+  };
+}
+
 export function normalizeLessonContent(raw: any): LessonContent {
+  if (raw?.schema_version === 'lesson_v3' || Array.isArray(raw?.activities)) return normalizeLessonV3(raw);
   if (raw?.schema_version === 'lesson_v2' || Array.isArray(raw?.sections) || Array.isArray(raw?.final_quiz)) {
     return normalizeLessonV2(raw);
   }
@@ -403,6 +573,69 @@ export function normalizeLessonContent(raw: any): LessonContent {
     },
     raw_text_excerpt: cleanTextValue(raw?.raw_text_excerpt || ''),
   };
+}
+
+export function upgradeLessonToV3(content: LessonContent): LessonContent {
+  const normalized = normalizeLessonContent(content);
+  if (normalized.schema_version === 'lesson_v3' && normalized.activities?.length) return normalized;
+
+  const sections = normalized.sections || [];
+  const activities = sections.map((section, index) => {
+    const sourceBlocks = section.content_blocks?.length
+      ? section.content_blocks
+      : (section.content ? [{ type: 'paragraph' as const, title: '', category: 'giai_thich', theme: 'blue', text: section.content }] : []);
+    const pageGroups = sourceBlocks.length > 3
+      ? [sourceBlocks.slice(0, Math.ceil(sourceBlocks.length / 2)), sourceBlocks.slice(Math.ceil(sourceBlocks.length / 2))]
+      : [sourceBlocks];
+    const pages: LessonPresentationPage[] = pageGroups.filter((group) => group.length).map((blocks, pageIndex) => ({
+      page_id: `A${index + 1}_P${pageIndex + 1}`,
+      title: pageIndex === 0 ? (section.title || `Hoạt động ${index + 1}`) : `${section.title || `Hoạt động ${index + 1}`} – tiếp theo`,
+      subtitle: '',
+      layout: pageIndex === pageGroups.length - 1 && section.summary ? 'remember' as const : 'hero_concept' as const,
+      blocks,
+      teacher_notes: '',
+      student_prompt: '',
+      visual: { type: 'concept_map' as const, title: '', center_label: section.title || `Hoạt động ${index + 1}`, items: blocks.map((block) => cleanTextValue(block.title || '')).filter(Boolean).slice(0, 4), relationship: '' },
+    }));
+    if (section.summary && !pages.some((page) => page.layout === 'remember')) {
+      pages.push({
+        page_id: `A${index + 1}_P${pages.length + 1}`,
+        title: 'Ghi nhớ',
+        subtitle: '',
+        layout: 'remember' as const,
+        blocks: [{ type: 'key_point' as const, title: 'Ghi nhớ', category: 'ghi_nho', theme: 'emerald', text: section.summary }],
+        teacher_notes: '',
+        student_prompt: '',
+        visual: { type: 'none' as const, title: '', center_label: '', items: [], relationship: '' },
+      });
+    }
+    if (!pages.length) {
+      pages.push({
+        page_id: `A${index + 1}_P1`,
+        title: section.title || `Hoạt động ${index + 1}`,
+        subtitle: '',
+        layout: 'hero_concept' as const,
+        blocks: [],
+        teacher_notes: '',
+        student_prompt: '',
+        visual: { type: 'none' as const, title: '', center_label: '', items: [], relationship: '' },
+      });
+    }
+    return {
+      activity_id: section.section_id || `A${index + 1}`,
+      title: section.title || `Hoạt động ${index + 1}`,
+      objective: section.summary || '',
+      activity_type: index === 0 ? 'warmup' : 'knowledge',
+      estimated_minutes: index === 0 ? 5 : 8,
+      pages,
+      interactions: section.interactive_questions || [],
+      summary: section.summary || '',
+      released: false,
+      locked: true,
+    };
+  });
+
+  return normalizeLessonV3({ ...normalized, schema_version: 'lesson_v3', activities });
 }
 
 function stripCodeFence(text: string) {
@@ -630,7 +863,7 @@ async function repairLessonJsonWithAI(apiKey: string, model: string, brokenJsonT
     model,
     contents: [{
       role: 'user',
-      parts: [{ text: `JSON sau bị lỗi cú pháp khi phân tích bài học. Hãy sửa thành JSON hợp lệ theo schema lesson_v2. Không thêm markdown, không giải thích. Lưu ý: nếu trong chuỗi có dấu ngoặc kép tiếng Việt như "bộ não", hãy đổi thành dấu nháy đơn hoặc escape đúng chuẩn JSON.\n\nLỗi: ${originalError instanceof Error ? originalError.message : String(originalError || '')}\n\nJSON cần sửa:\n${sliceLikelyJson(brokenJsonText).slice(0, 65000)}` }],
+      parts: [{ text: `JSON sau bị lỗi cú pháp khi phân tích bài học. Hãy sửa thành JSON hợp lệ theo schema lesson_v3. Không thêm markdown, không giải thích. Lưu ý: nếu trong chuỗi có dấu ngoặc kép tiếng Việt như "bộ não", hãy đổi thành dấu nháy đơn hoặc escape đúng chuẩn JSON.\n\nLỗi: ${originalError instanceof Error ? originalError.message : String(originalError || '')}\n\nJSON cần sửa:\n${sliceLikelyJson(brokenJsonText).slice(0, 65000)}` }],
     }],
     config: {
       systemInstruction: 'Bạn chỉ sửa cú pháp JSON. Luôn trả về JSON hợp lệ, không markdown.',
@@ -652,19 +885,23 @@ Bạn là chuyên gia thiết kế bài học trực tuyến tương tác cho h�
 
 Nhiệm vụ:
 - Phân tích học liệu gốc và tạo DUY NHẤT 1 JSON hợp lệ bằng tiếng Việt.
-- Tạo bài học theo cấu trúc SGK điện tử chất lượng cao: Mục tiêu bài học → Tình huống khởi động → Kiến thức theo mục → Hoạt động/quan sát → Ghi nhớ → Câu hỏi tương tác → Kiểm tra cuối bài → Vận dụng.
-- Tự xác định số nội dung kiến thức dựa trên học liệu nguồn; mỗi section phải tương ứng với một mục kiến thức thật trong tài liệu, ví dụ: “Xử lí thông tin”, “Xử lí thông tin trong máy tính”, “Ứng dụng thực tế…”, “Tác động…”. Không tách vụn thành các đoạn nhỏ rời rạc.
-- Mỗi nội dung kiến thức bắt buộc có ít nhất ${config.interactive_questions_per_section || 1} câu hỏi tương tác.
+- Tạo bài học theo mô hình HOẠT ĐỘNG DẠY HỌC: Mục tiêu → Hoạt động khởi động → Hoạt động hình thành kiến thức → Luyện tập/Vận dụng → Kiểm tra cuối bài. Mỗi hoạt động có các trang trình bày giống slide 16:9 và phần tương tác cho học sinh.
+- Tự xác định số hoạt động dạy học dựa trên học liệu nguồn; mỗi activity phải tương ứng với một mục tiêu/nhiệm vụ học tập thật. Không tách vụn máy móc. Mỗi activity nên có 2-6 pages tùy lượng kiến thức.
+- Mỗi hoạt động kiến thức/luyện tập bắt buộc có ít nhất ${config.interactive_questions_per_section || 1} câu hỏi tương tác.
 - Câu hỏi tương tác trong từng nội dung chỉ hỗ trợ 3 dạng: single_choice, true_false, fill_in_blank. Không tạo short_answer/tự luận ngắn trong bài học.
 - Dạng fill_in_blank là câu chọn từ/cụm từ có sẵn để điền vào chỗ trống: mỗi câu có đúng 1 ô trống ký hiệu _____, đúng 4 choices, correctAnswers gồm đúng 1 từ/cụm từ đúng. Các câu mở dạng kể tên, nêu ý kiến, giải thích, liên hệ thực tế phải chuyển thành fill_in_blank bằng cách chọn một khái niệm/từ khóa/cụm từ trọng tâm để điền, không tạo ô nhập tự luận.
 - Chỉ tạo true_false khi câu hỏi là một phát biểu có thể xác định Đúng hoặc Sai rõ ràng.
 - Không dùng markdown thô như **, ##, ký tự đầu dòng rối trong nội dung.
 - Không tạo tiêu đề dạng "Nội dung 1: ...", "Nội dung 2: ...". Nếu học liệu đã có tiêu đề "1. ...", "2. ..." thì giữ nguyên tiêu đề đó.
-- Với mỗi content_blocks, bắt buộc đặt title ngắn gọn theo đúng ý chính của đoạn, không dùng title chung chung như "Ý 1", "Ý 2", "Kiến thức trọng tâm", "Hoạt động luyện hiểu". Không để nhiều khối liên tiếp trùng title. Ví dụ: "Dữ liệu từ tín hiệu giao thông", "Mối quan hệ giữa thông tin và dữ liệu", "Vật mang tin trong đời sống".
+- Mỗi page là một trang trình bày ngắn gọn, ít chữ, có title rõ. Chỉ dùng 8 layout chuẩn cho bài giảng: hero_concept, story_visual, visual_explain, comparison, process, card_grid, remember, task. Chọn layout theo ý nghĩa nội dung, không đổi layout chỉ để trang trí.
+- Trình bày như bài giảng chuyên nghiệp dùng máy chiếu: tiêu đề tối đa khoảng 10-12 từ, mỗi trang chỉ 1 ý chính; tối đa 3 blocks; toàn trang ưu tiên không quá 90-110 từ; mỗi block khoảng 20-55 từ. Nếu nội dung dài phải tự chia thành page tiếp theo, tuyệt đối không tạo slide cần cuộn.
+- teacher_notes chỉ dành cho giáo viên, không đưa nội dung teacher_notes vào blocks hoặc student_prompt hay nội dung học sinh nhìn thấy. Nội dung học sinh cần thấy phải nằm trong blocks/student_prompt.
+- Không lặp lại cùng một thông tin ở nhiều vị trí trên slide: không lặp tên hoạt động trong title, không đưa tên môn/loại hoạt động/thời lượng/metadata AI vào visual, không tạo chip chứa lại title hoặc visual_hint.
+- Với trang dùng để giảng dạy trên máy chiếu, ưu tiên từ khóa, cụm ý, quy trình, bảng so sánh/card; tránh câu văn dài khi có thể tách thành 2-4 ý ngắn.
 - Với mỗi content_blocks, gán category phù hợp: khai_niem, giai_thich, vi_du, ung_dung, ghi_nho, hoat_dong, lien_he_thuc_te, mo_rong. Gán theme màu nhẹ: blue, violet, amber, emerald, rose, cyan, orange.
-- Mỗi section nên có 3-5 content_blocks theo trật tự sư phạm: tình huống/hoạt động nếu có → khái niệm/giải thích → ví dụ/ứng dụng → ghi nhớ. Mỗi block viết ngắn gọn, tối đa khoảng 80 từ, tránh một đoạn văn quá dài.
-- Nếu học liệu có khung hoặc mục Ghi nhớ/Kết luận/Em cần nhớ/Lưu ý thì phải trích đúng nội dung đó vào source_note và summary của section tương ứng, đồng thời tạo một content_block category="ghi_nho".
-- Nếu học liệu có câu hỏi/hoạt động/bài tập/Em hãy/Quan sát/Thảo luận thì phải ưu tiên chuyển các câu hỏi đó thành interactive_questions hoặc final_quiz; chỉ sinh thêm câu hỏi khi không đủ số lượng cấu hình.
+- Mỗi activity nên có 2-6 pages theo trật tự sư phạm: tình huống/nhiệm vụ → khái niệm/giải thích → ví dụ/ứng dụng → ghi nhớ. Minh hoạ phải mang ý nghĩa học tập, không phải danh sách từ khóa trang trí. Mỗi page nên có visual dạng object khi phù hợp: type, title, items, center_label, relationship. visual.type chỉ dùng: none, icon_cards, hub_spoke, process, comparison, timeline, device_diagram, concept_map, numbered_steps.
+- Nếu học liệu có khung hoặc mục Ghi nhớ/Kết luận/Em cần nhớ/Lưu ý thì phải đưa đúng nội dung đó vào page layout="remember" và summary của activity tương ứng.
+- Nếu học liệu có câu hỏi/hoạt động/bài tập/Em hãy/Quan sát/Thảo luận thì phải ưu tiên chuyển các câu hỏi đó thành activity.interactions hoặc final_quiz; chỉ sinh thêm câu hỏi khi không đủ số lượng cấu hình.
 - Với học liệu dạng SGK có các khối “Sau bài này em sẽ”, “Hoạt động”, “Hình”, “Luyện tập”, “Vận dụng”: hãy giữ logic sư phạm này. Hoạt động quan sát/hỏi đáp trong bài dùng làm interactive_questions; Luyện tập/Vận dụng dùng làm final_quiz hoặc fill_in_blank trong section nếu là câu hỏi mở.
 - Không trả về HTML thô như <br>, <p>, <div>. Dùng xuống dòng \n hoặc content_blocks.
 - Bắt buộc bảo đảm JSON hợp lệ tuyệt đối: nếu nội dung có dấu ngoặc kép trong câu như “bộ não”, hãy đổi sang dấu nháy đơn hoặc escape thành \"bộ não\"; không để dấu ngoặc kép thô bên trong chuỗi JSON.
@@ -700,10 +937,10 @@ Cấu hình bài học:
 
 Yêu cầu nội dung:
 1. metadata.muc_tieu_bai_hoc có 3-5 ý ngắn gọn.
-2. sections: tự chia theo các đơn vị kiến thức thật sự có trong học liệu; mỗi section có title, content, summary, examples, youtube_url để trống nếu chưa có, interactive_questions.
-3. section.content là đoạn văn dễ học, có thể xuống dòng bằng \n, bám sát học liệu.
-4. section.content_blocks phải chia nội dung thành các khối ngắn. Mỗi khối có type, title, category, theme, text. title phải bám sát nội dung, không dùng tiêu đề chung chung, không trùng title giữa các khối nếu nội dung khác nhau.
-5. section.interactive_questions gồm câu hỏi kiểm tra ngay sau phần kiến thức và chỉ có 3 dạng: single_choice, true_false, fill_in_blank. Với fill_in_blank phải có sentence chứa đúng một _____, choices đúng 4 từ/cụm từ, correctAnswers đúng 1 từ/cụm từ đúng và explanation.
+2. activities: tự chia thành các hoạt động dạy học. Mỗi activity có activity_id, title, objective, activity_type, estimated_minutes, pages, interactions, summary.
+3. Mỗi page có page_id, title, subtitle, layout, blocks, teacher_notes, student_prompt và visual. visual gồm type, title, items, center_label, relationship. visual_hint/illustration_keywords chỉ dùng làm tương thích, không dùng để lặp lại tiêu đề hoặc hiển thị như chip cho học sinh.
+4. page.blocks chia nội dung thành các khối ngắn. Mỗi khối có type, title, category, theme, text; title phải bám sát nội dung.
+5. activity.interactions gồm câu hỏi/nhiệm vụ tương tác sau phần trình bày và chỉ có 3 dạng: single_choice, true_false, fill_in_blank. Với fill_in_blank phải có sentence chứa đúng một _____, choices đúng 4 từ/cụm từ, correctAnswers đúng 1 từ/cụm từ đúng và explanation.
 5. final_quiz gồm câu hỏi cuối bài khách quan dạng single_choice và true_false, có explanation; không dùng short_answer. Các đáp án phải có option rõ, đáp án đúng phải không phụ thuộc thứ tự hiển thị để hệ thống có thể đảo đáp án.
 6. settings phải lưu đầy đủ cấu hình thời gian học, thời gian kiểm tra, đảo câu hỏi, đảo đáp án, xem đáp án sau khi nộp, làm lại kiểm tra.
 7. assessment quy định thang điểm 10.
@@ -711,18 +948,11 @@ Yêu cầu nội dung:
 
 JSON bắt buộc:
 {
-  "schema_version": "lesson_v2",
+  "schema_version": "lesson_v3",
   "title": "",
   "metadata": {
-    "tieu_de": "",
-    "mon_hoc": "",
-    "khoi": "",
-    "chu_de": "",
-    "tom_tat": "",
-    "muc_tieu_bai_hoc": [""],
-    "tu_khoa": [""],
-    "thong_diep_chinh": "",
-    "thoi_luong_goi_y": ""
+    "tieu_de": "", "mon_hoc": "", "khoi": "", "chu_de": "", "tom_tat": "",
+    "muc_tieu_bai_hoc": [""], "tu_khoa": [""], "thong_diep_chinh": "", "thoi_luong_goi_y": ""
   },
   "settings": {
     "content_count": 0,
@@ -748,73 +978,41 @@ JSON bắt buộc:
     "exam_score_policy": "${config.exam_score_policy || 'best'}",
     "ai_instructions": ""
   },
-  "sections": [
+  "activities": [
     {
-      "section_id": "S1",
-      "title": "",
-      "content": "",
-      "content_blocks": [
-        { "type": "paragraph", "title": "Bộ xử lí là gì?", "category": "khai_niem", "theme": "blue", "text": "" },
-        { "type": "example", "title": "Ví dụ trong đời sống", "category": "vi_du", "theme": "amber", "text": "" },
-        { "type": "note", "title": "Điều em cần nhớ", "category": "ghi_nho", "theme": "emerald", "text": "" }
-      ],
-      "source_note": "",
-      "summary": "",
-      "examples": [""],
-      "youtube_url": "",
-      "youtube_embed_url": "",
-      "interactive_questions": [
+      "activity_id": "A1",
+      "title": "Khởi động: ...",
+      "objective": "",
+      "activity_type": "warmup",
+      "estimated_minutes": 5,
+      "pages": [
         {
-          "id": "IQ1",
-          "type": "single_choice",
-          "question": "",
-          "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
-          "correctAnswer": "A",
-          "explanation": "",
-          "level": "nhan_biet"
-        },
-        {
-          "id": "IQ2",
-          "type": "true_false",
-          "question": "",
-          "options": ["Đúng", "Sai"],
-          "correctAnswer": "Đúng",
-          "explanation": "",
-          "level": "thong_hieu"
-        },
-        {
-          "id": "IQ3",
-          "type": "fill_in_blank",
-          "question": "Điền từ/cụm từ thích hợp vào chỗ trống.",
-          "sentence": "_____ là khái niệm trọng tâm của nội dung vừa học.",
-          "choices": ["dữ liệu", "thông tin", "vật mang tin", "xử lí thông tin"],
-          "correctAnswers": ["dữ liệu"],
-          "explanation": "Giải thích ngắn vì sao từ/cụm từ này phù hợp với chỗ trống.",
-          "level": "van_dung",
-          "source": "from_lesson"
+          "page_id": "A1_P1",
+          "title": "",
+          "subtitle": "",
+          "layout": "story_visual",
+          "visual": {
+            "type": "hub_spoke",
+            "title": "Vai trò của người điều hành",
+            "center_label": "Trưởng nhóm",
+            "items": ["Phân công nhiệm vụ", "Theo dõi tiến độ", "Kết nối thành viên"],
+            "relationship": "Các nhiệm vụ phối hợp để nhóm hoàn thành mục tiêu"
+          },
+          "blocks": [
+            { "type": "activity", "title": "Tình huống", "category": "hoat_dong", "theme": "violet", "text": "" }
+          ],
+          "teacher_notes": "Lời dẫn ngắn cho giáo viên.",
+          "student_prompt": "Nhiệm vụ học sinh cần thực hiện."
         }
-      ]
+      ],
+      "interactions": [
+        { "id": "IQ_A1_1", "type": "single_choice", "question": "", "options": ["A. ...", "B. ...", "C. ...", "D. ..."], "correctAnswer": "A", "explanation": "", "level": "nhan_biet" }
+      ],
+      "summary": ""
     }
   ],
   "final_quiz": [
-    {
-      "id": "FQ1",
-      "type": "single_choice",
-      "question": "",
-      "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
-      "correctAnswer": "A",
-      "explanation": "",
-      "level": "thong_hieu"
-    },
-    {
-      "id": "FQ2",
-      "type": "true_false",
-      "question": "",
-      "options": ["Đúng", "Sai"],
-      "correctAnswer": "Sai",
-      "explanation": "",
-      "level": "van_dung"
-    }
+    { "id": "FQ1", "type": "single_choice", "question": "", "options": ["A. ...", "B. ...", "C. ...", "D. ..."], "correctAnswer": "A", "explanation": "", "level": "thong_hieu" }
   ],
   "assessment": {
     "interactive_weight": ${config.interactive_weight || 40},
@@ -841,10 +1039,10 @@ export async function reviseLessonWithAI(
     model,
     contents: [{
       role: 'user',
-      parts: [{ text: `Bạn là chuyên gia thiết kế bài học trực tuyến. Hãy chỉnh sửa JSON bài học theo yêu cầu của giáo viên, giữ nguyên schema_version lesson_v2, bảo toàn cấu trúc sections, interactive_questions, final_quiz, assessment. Không tạo tiêu đề dạng "Nội dung 1" dư thừa, không trả HTML thô như <br>, ưu tiên giữ ghi nhớ và câu hỏi lấy từ học liệu gốc; không ép câu hỏi mở thành đúng/sai; nếu cần câu hỏi mở, hãy chuyển thành fill_in_blank với 1 chỗ trống và 4 từ/cụm từ lựa chọn. Với content_blocks, đặt title ngắn gọn theo đúng ý chính, gán category/theme để giao diện hiển thị màu nền nhẹ phù hợp.\n\nYêu cầu chỉnh sửa: ${request}\n\nCấu hình hiện tại: ${JSON.stringify(settings || lesson.settings || {})}\n\nJSON bài học hiện tại:\n${JSON.stringify(lesson).slice(0, 60000)}\n\nChỉ trả về JSON bài học đã chỉnh sửa, không giải thích thêm.` }],
+      parts: [{ text: `Bạn là chuyên gia thiết kế bài học trực tuyến. Hãy chỉnh sửa JSON bài học theo yêu cầu của giáo viên, giữ nguyên schema_version lesson_v3, bảo toàn cấu trúc activities, pages, interactions, final_quiz, assessment. Không tạo tiêu đề dạng "Nội dung 1" dư thừa, không trả HTML thô như <br>, ưu tiên giữ ghi nhớ và câu hỏi lấy từ học liệu gốc; không ép câu hỏi mở thành đúng/sai; nếu cần câu hỏi mở, hãy chuyển thành fill_in_blank với 1 chỗ trống và 4 từ/cụm từ lựa chọn. Với content_blocks, đặt title ngắn gọn theo đúng ý chính, gán category/theme để giao diện hiển thị màu nền nhẹ phù hợp.\n\nYêu cầu chỉnh sửa: ${request}\n\nCấu hình hiện tại: ${JSON.stringify(settings || lesson.settings || {})}\n\nJSON bài học hiện tại:\n${JSON.stringify(lesson).slice(0, 60000)}\n\nChỉ trả về JSON bài học đã chỉnh sửa, không giải thích thêm.` }],
     }],
     config: {
-      systemInstruction: 'Luôn trả về JSON hợp lệ theo schema lesson_v2. Không trả về markdown.',
+      systemInstruction: 'Luôn trả về JSON hợp lệ theo schema lesson_v3. Không trả về markdown.',
       responseMimeType: 'application/json',
       temperature: 0.25,
     },

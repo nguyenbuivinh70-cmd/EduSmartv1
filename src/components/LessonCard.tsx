@@ -16,6 +16,7 @@ import {
   Map,
   Microscope,
   MonitorCog,
+  PlayCircle,
   ShieldAlert,
   Trophy,
   Users,
@@ -24,7 +25,7 @@ import {
 import { Lesson, LessonProgressRecord } from '../types';
 import { getLessonName, getLessonNumber } from '../utils/lessonCatalog';
 import { getLessonVisualCatalog } from '../utils/lessonVisualCatalog';
-import { getLessonScheduleAccess, formatLessonAccessDateTime } from '../utils/lessonAccess';
+import { getLessonScheduleAccess, formatLessonAccessDateTime, getPreLessonVideoAccess } from '../utils/lessonAccess';
 
 interface LessonCardProps {
   key?: any;
@@ -222,37 +223,53 @@ export default function LessonCard({ lesson, onClick, actions, highlight = false
     const progressPercent = Math.max(0, Math.min(100, Number(progress?.completion_percent || 0)));
     const scheduleAccess = getLessonScheduleAccess(lesson);
     const scheduleBlocked = scheduleAccess.blocked;
-    const accessBlocked = accessLocked || scheduleBlocked;
+    const preLessonAccess = getPreLessonVideoAccess(lesson, scheduleAccess);
+    const hasPreLessonVideo = preLessonAccess.hasVideo;
+    const trackPreLessonProgress = preLessonAccess.trackingEnabled;
+    const canPreviewPreLesson = preLessonAccess.canWatchNow;
+    const accessBlocked = (accessLocked || scheduleBlocked) && !canPreviewPreLesson;
     const progressStateLabel = getProgressStatusLabel(progress);
     const progressStateTone = getProgressStatusTone(progress);
-    const actionLabel = accessLocked
-      ? 'Chưa thể học'
-      : scheduleAccess.reason === 'before_start'
-        ? 'Chưa đến giờ'
-        : scheduleAccess.reason === 'after_end'
-          ? 'Đã hết giờ'
-          : progress?.status === 'in_progress'
-            ? 'Tiếp tục học'
-            : progress?.status === 'completed'
-              ? 'Xem lại bài'
-              : score
-                ? 'Xem kết quả'
-                : 'Bắt đầu học';
-    const progressLabel = accessLocked
-      ? 'Giáo viên chưa mở bài'
-      : scheduleBlocked
-        ? scheduleAccess.message
-        : progress?.status === 'completed'
-          ? 'Đã hoàn thành bài học'
-          : progress
-            ? `Tiến độ ${progressPercent}%`
-            : 'Chưa bắt đầu';
+    const preLessonPercent = Math.max(0, Math.min(100, Number(progress?.pre_lesson_watch_percent || 0)));
+    const preLessonCompleted = progress?.pre_lesson_status === 'completed';
+    const actionLabel = canPreviewPreLesson
+      ? (preLessonCompleted ? 'Xem lại video' : preLessonPercent > 0 ? 'Tiếp tục xem video' : 'Xem video trước bài')
+      : accessLocked
+        ? 'Chưa thể học'
+        : scheduleAccess.reason === 'before_start'
+          ? 'Chưa đến giờ'
+          : scheduleAccess.reason === 'after_end'
+            ? 'Đã hết giờ'
+            : progress?.status === 'in_progress'
+              ? 'Tiếp tục học'
+              : progress?.status === 'completed'
+                ? 'Xem lại bài'
+                : score
+                  ? 'Xem kết quả'
+                  : 'Bắt đầu học';
+    const progressLabel = canPreviewPreLesson
+      ? (trackPreLessonProgress
+        ? (preLessonCompleted
+          ? (progress?.pre_lesson_completed_before_deadline === false ? 'Đã hoàn thành video • Muộn' : 'Đã hoàn thành video trước bài')
+          : preLessonPercent > 0 ? `Video trước bài ${Math.round(preLessonPercent)}%` : 'Nhiệm vụ trước bài: xem video')
+        : 'Video xem trước bài học')
+      : accessLocked
+        ? 'Giáo viên chưa mở bài'
+        : scheduleBlocked
+          ? scheduleAccess.message
+          : progress?.status === 'completed'
+            ? 'Đã hoàn thành bài học'
+            : progress
+              ? `Tiến độ ${progressPercent}%`
+              : 'Chưa bắt đầu';
     const PrimaryTopicIcon = topicVisual.PrimaryIcon;
     const SecondaryTopicIcon = topicVisual.SecondaryIcon;
     const TertiaryTopicIcon = topicVisual.TertiaryIcon;
-    const cardStatusLabel = accessLocked ? 'Đang khóa' : scheduleBlocked ? scheduleAccess.shortLabel : progressStateLabel;
-    const cardStatusTone = accessLocked || scheduleAccess.reason === 'before_start'
-      ? 'bg-white/92 text-amber-700'
+    const cardStatusLabel = canPreviewPreLesson ? 'Video trước bài' : accessLocked ? 'Đang khóa' : scheduleBlocked ? scheduleAccess.shortLabel : progressStateLabel;
+    const cardStatusTone = canPreviewPreLesson
+      ? 'bg-white/92 text-fuchsia-700'
+      : accessLocked || scheduleAccess.reason === 'before_start'
+        ? 'bg-white/92 text-amber-700'
       : scheduleAccess.reason === 'after_end'
         ? 'bg-white/92 text-rose-700'
         : progress?.status === 'completed'
@@ -331,13 +348,13 @@ export default function LessonCard({ lesson, onClick, actions, highlight = false
                 <div className="min-w-0">
                   <div className="flex items-center justify-between gap-2 text-[11px] font-bold">
                     <span className={`truncate ${accessBlocked ? (scheduleAccess.reason === 'after_end' ? 'text-rose-700' : 'text-amber-700') : 'text-slate-600'}`}>{progressLabel}</span>
-                    {!accessBlocked ? <span className="shrink-0 text-slate-400">{progressPercent}%</span> : null}
+                    {!accessBlocked ? <span className="shrink-0 text-slate-400">{canPreviewPreLesson ? (trackPreLessonProgress ? `${Math.round(preLessonPercent)}%` : 'Video') : `${progressPercent}%`}</span> : null}
                   </div>
                   <div className={`mt-2 h-2 overflow-hidden rounded-full ${accessBlocked ? (scheduleAccess.reason === 'after_end' ? 'bg-rose-100' : 'bg-amber-100') : 'bg-white ring-1 ring-slate-100'}`}>
                     {!accessBlocked ? (
                       <div
-                        className={`h-full rounded-full ${progress?.status === 'completed' ? 'bg-emerald-500' : 'bg-indigo-500'}`}
-                        style={{ width: `${progressPercent > 0 ? Math.max(8, progressPercent) : 0}%` }}
+                        className={`h-full rounded-full ${canPreviewPreLesson ? (trackPreLessonProgress ? (preLessonCompleted ? 'bg-emerald-500' : 'bg-fuchsia-500') : 'bg-fuchsia-400') : progress?.status === 'completed' ? 'bg-emerald-500' : 'bg-indigo-500'}`}
+                        style={{ width: `${canPreviewPreLesson ? (trackPreLessonProgress ? (preLessonPercent > 0 ? Math.max(8, preLessonPercent) : 0) : 100) : (progressPercent > 0 ? Math.max(8, progressPercent) : 0)}%` }}
                       />
                     ) : null}
                   </div>
@@ -361,6 +378,7 @@ export default function LessonCard({ lesson, onClick, actions, highlight = false
               <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                 <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.08em] text-slate-600">{STATUS_LABELS[lesson.trang_thai] || lesson.trang_thai}</span>
                 {score?.provisional ? <span className="rounded-full bg-amber-50 px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.08em] text-amber-700">Điểm tạm</span> : null}
+                {canPreviewPreLesson ? <span className="inline-flex items-center gap-1 rounded-full bg-fuchsia-50 px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.08em] text-fuchsia-700"><PlayCircle className="h-3 w-3" /> Video trước bài</span> : null}
               </div>
 
               <span className={`inline-flex shrink-0 items-center gap-1 rounded-xl px-3 py-2 text-[11px] font-black transition ${accessBlocked ? (scheduleAccess.reason === 'after_end' ? 'bg-rose-50 text-rose-700 ring-1 ring-rose-100' : 'bg-amber-50 text-amber-700 ring-1 ring-amber-100') : 'bg-indigo-600 text-white shadow-sm group-hover:bg-indigo-700'}`}>

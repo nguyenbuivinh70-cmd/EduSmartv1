@@ -16,6 +16,9 @@ export default function LessonResultSummary({
   finalExamScore = 0,
   learningWeight = 40,
   finalWeight = 60,
+  preparationScore = 0,
+  preparationWeight = 0,
+  preparationStatus = 'not_started',
   onReviewIncomplete,
   onRetry,
 }: {
@@ -34,12 +37,17 @@ export default function LessonResultSummary({
   finalExamScore?: number;
   learningWeight?: number;
   finalWeight?: number;
+  preparationScore?: number;
+  preparationWeight?: number;
+  preparationStatus?: string;
   onReviewIncomplete?: () => void;
   onRetry?: () => void;
 }) {
   const safeScore = Number.isFinite(score) ? score : 0;
   const safeLearningProcessScore = Number.isFinite(learningProcessScore) ? learningProcessScore : 0;
   const safeFinalExamScore = Number.isFinite(finalExamScore) ? finalExamScore : 0;
+  const safePreparationScore = Number.isFinite(preparationScore) ? preparationScore : 0;
+  const preparationLabel = preparationStatus === 'prepared' ? 'Có chuẩn bị bài' : preparationStatus === 'late_completed' ? 'Hoàn thành muộn' : preparationStatus === 'in_progress' ? 'Đang chuẩn bị' : 'Chưa chuẩn bị';
   const hasIncompleteSections = incompleteSections.length > 0;
   const passed = safeScore >= passScore && !hasIncompleteSections;
   const statusLabel = passed ? 'Hoàn thành bài học' : hasIncompleteSections ? 'Chưa đủ điều kiện hoàn thành' : 'Cần ôn tập thêm';
@@ -52,10 +60,15 @@ export default function LessonResultSummary({
         </div>
         <h3 className="mt-4 text-2xl font-black text-slate-900">{statusLabel}</h3>
         <p className={`mt-2 text-3xl font-black ${passed ? 'text-emerald-600' : hasIncompleteSections ? 'text-amber-600' : 'text-rose-600'}`}>{safeScore.toFixed(1)}/10</p>
-        <p className="mt-1 text-sm text-slate-500">Điểm tổng kết = quá trình học ({learningWeight}%) + kiểm tra cuối bài ({finalWeight}%) • Điểm đạt {passScore}/10</p>
+        <p className="mt-1 text-sm text-slate-500">Điểm tổng kết = chuẩn bị bài ({preparationWeight}%) + quá trình học ({learningWeight}%) + kiểm tra cuối bài ({finalWeight}%) • Điểm đạt {passScore}/10</p>
       </div>
 
-      <div className="mt-6 grid gap-3 md:grid-cols-4">
+      <div className="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+        <div className={`rounded-2xl px-4 py-3 ${preparationStatus === 'prepared' ? 'bg-emerald-50' : 'bg-fuchsia-50'}`}>
+          <p className={`text-xs font-semibold uppercase tracking-[0.15em] ${preparationStatus === 'prepared' ? 'text-emerald-600' : 'text-fuchsia-600'}`}>Chuẩn bị bài</p>
+          <p className={`mt-2 text-xl font-black ${preparationStatus === 'prepared' ? 'text-emerald-900' : 'text-fuchsia-900'}`}>{preparationWeight > 0 ? `${safePreparationScore.toFixed(1)}/10` : 'Không tính'}</p>
+          <p className={`mt-1 text-xs ${preparationStatus === 'prepared' ? 'text-emerald-700' : 'text-fuchsia-700'}`}>{preparationLabel}{preparationWeight > 0 ? ` • ${preparationWeight}%` : ''}</p>
+        </div>
         <div className="rounded-2xl bg-indigo-50 px-4 py-3">
           <p className="text-xs font-semibold uppercase tracking-[0.15em] text-indigo-600">Quá trình học</p>
           <p className="mt-2 text-xl font-black text-indigo-900">{safeLearningProcessScore.toFixed(1)}/10</p>
@@ -80,7 +93,7 @@ export default function LessonResultSummary({
 
       <div className="mt-6 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4 text-sm leading-7 text-slate-700">
         <p className="font-bold text-slate-900">Cách hiểu kết quả</p>
-        <p className="mt-1">Điểm quá trình học phản ánh việc học sinh học đủ các mục và hoàn thành câu hỏi tương tác. Điểm kiểm tra cuối bài phản ánh kết quả làm bài sau khi học.</p>
+        <p className="mt-1">Điểm chuẩn bị bài phản ánh việc hoàn thành video trước hạn; điểm quá trình phản ánh việc học đủ các mục và hoàn thành câu hỏi tương tác; điểm kiểm tra cuối bài phản ánh kết quả sau khi học. Khi học nhóm, phần quá trình và kiểm tra có thể dùng chung cho nhóm nhưng điểm chuẩn bị được áp dụng riêng cho từng học sinh.</p>
       </div>
 
       {hasIncompleteSections ? (
