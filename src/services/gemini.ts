@@ -12,6 +12,7 @@ import {
   QuizQuestionType,
   UploadedSourceFile,
 } from '../types';
+import { sanitizeSingleChoiceQuestion } from '../utils/quizSanitizer';
 
 function cleanTextValue(value: unknown): string {
   return String(value ?? '')
@@ -168,7 +169,7 @@ function safeQuizArray(value: unknown) {
       const correctAnswer = cleanTextValue(raw?.correctAnswer ?? raw?.dap_an ?? '');
       const question = cleanTextValue(raw?.question ?? raw?.cau_hoi ?? '');
       if (!question || options.length < 2 || !correctAnswer) return null;
-      const result: QuizQuestion = {
+      const result = sanitizeSingleChoiceQuestion({
         id: String(raw?.id || `SC${index + 1}`),
         type: 'single_choice',
         question,
@@ -182,8 +183,10 @@ function safeQuizArray(value: unknown) {
         suggestedAnswer: cleanTextValue(raw?.suggestedAnswer ?? raw?.suggested_answer ?? raw?.dap_an_goi_y ?? ''),
         rubric: cleanTextValue(raw?.rubric ?? raw?.tieu_chi_cham ?? ''),
         wrongAnswerExplanations,
-      };
-      return result;
+      });
+      // Một câu trắc nghiệm có ít hơn 2 lựa chọn khác nhau sau khi loại trùng
+      // không đủ chất lượng để đưa vào bài kiểm tra.
+      return (result.options?.length || 0) >= 2 && result.correctAnswer ? result : null;
     })
     .filter(Boolean) as LessonContent['luyen_tap']['trac_nghiem'];
 }
@@ -277,8 +280,8 @@ function normalizeLessonV2(raw: any): LessonContent {
       include_summary: settings.include_summary !== false,
       allow_retry: settings.allow_retry !== false,
       show_explanation: settings.show_explanation !== false,
-      interactive_weight: Number(settings.interactive_weight || assessment.interactive_weight || 40),
-      final_quiz_weight: Number(settings.final_quiz_weight || assessment.final_quiz_weight || 60),
+      interactive_weight: 0,
+      final_quiz_weight: 100,
       pass_score: Number(settings.pass_score || assessment.pass_score || 5),
       lesson_time_minutes: Number(settings.lesson_time_minutes || 45),
       auto_finish_lesson_on_timeout: settings.auto_finish_lesson_on_timeout !== false,
@@ -294,8 +297,8 @@ function normalizeLessonV2(raw: any): LessonContent {
     sections,
     final_quiz: finalQuiz.map((q, index) => ({ ...q, id: q.id || `FQ${index + 1}` })),
     assessment: {
-      interactive_weight: Number(assessment.interactive_weight || settings.interactive_weight || 40),
-      final_quiz_weight: Number(assessment.final_quiz_weight || settings.final_quiz_weight || 60),
+      interactive_weight: 0,
+      final_quiz_weight: 100,
       score_scale: Number(assessment.score_scale || 10),
       pass_score: Number(assessment.pass_score || settings.pass_score || 5),
     },
@@ -922,13 +925,13 @@ Cấu hình bài học:
 - Có ghi nhớ cuối mỗi nội dung: ${config.include_summary !== false ? 'có' : 'không'}
 - Hiển thị giải thích đáp án: ${config.show_explanation !== false ? 'có' : 'không'}
 - Điểm đạt: ${config.pass_score || 5}/10
-- Tỉ trọng điểm tương tác: ${config.interactive_weight || 40}%
-- Tỉ trọng điểm cuối bài: ${config.final_quiz_weight || 60}%
+- Cách tính điểm: CHỈ kiểm tra cuối bài tạo điểm chính thức (100%); tương tác trong các mục học tập chỉ dùng để xác nhận hoàn thành và không tính điểm.
 - Thời gian học toàn bài: ${config.lesson_time_minutes || 45} phút
 - Tự kết thúc khi hết thời gian học: ${config.auto_finish_lesson_on_timeout !== false ? 'có' : 'không'}
 - Thời gian kiểm tra cuối bài: ${config.final_exam_time_minutes || 15} phút
 - Đảo câu hỏi kiểm tra cuối bài: ${config.shuffle_final_questions !== false ? 'có' : 'không'}
 - Đảo đáp án kiểm tra cuối bài: ${config.shuffle_final_options !== false ? 'có' : 'không'}
+- Với câu trắc nghiệm: options chỉ chứa NỘI DUNG đáp án, tuyệt đối không thêm tiền tố A./B./C./D.; các options không được trùng nhau; correctAnswer phải là nguyên văn nội dung đáp án đúng, không chỉ là chữ cái.
 - Cho xem đáp án sau khi nộp: ${config.show_final_answers_after_submit !== false ? 'có' : 'không'}
 - Cho phép làm lại kiểm tra: ${config.allow_exam_retry !== false ? 'có' : 'không'}
 - Số lần làm lại tối đa: ${config.max_exam_attempts || 2}
@@ -964,8 +967,8 @@ JSON bắt buộc:
     "include_summary": ${config.include_summary !== false},
     "allow_retry": ${config.allow_retry !== false},
     "show_explanation": ${config.show_explanation !== false},
-    "interactive_weight": ${config.interactive_weight || 40},
-    "final_quiz_weight": ${config.final_quiz_weight || 60},
+    "interactive_weight": 0,
+    "final_quiz_weight": 100,
     "pass_score": ${config.pass_score || 5},
     "lesson_time_minutes": ${config.lesson_time_minutes || 45},
     "auto_finish_lesson_on_timeout": ${config.auto_finish_lesson_on_timeout !== false},
@@ -1006,17 +1009,17 @@ JSON bắt buộc:
         }
       ],
       "interactions": [
-        { "id": "IQ_A1_1", "type": "single_choice", "question": "", "options": ["A. ...", "B. ...", "C. ...", "D. ..."], "correctAnswer": "A", "explanation": "", "level": "nhan_biet" }
+        { "id": "IQ_A1_1", "type": "single_choice", "question": "", "options": ["phương án 1", "phương án 2", "phương án 3", "phương án 4"], "correctAnswer": "phương án 1", "explanation": "", "level": "nhan_biet" }
       ],
       "summary": ""
     }
   ],
   "final_quiz": [
-    { "id": "FQ1", "type": "single_choice", "question": "", "options": ["A. ...", "B. ...", "C. ...", "D. ..."], "correctAnswer": "A", "explanation": "", "level": "thong_hieu" }
+    { "id": "FQ1", "type": "single_choice", "question": "", "options": ["phương án 1", "phương án 2", "phương án 3", "phương án 4"], "correctAnswer": "phương án 1", "explanation": "", "level": "thong_hieu" }
   ],
   "assessment": {
-    "interactive_weight": ${config.interactive_weight || 40},
-    "final_quiz_weight": ${config.final_quiz_weight || 60},
+    "interactive_weight": 0,
+    "final_quiz_weight": 100,
     "score_scale": 10,
     "pass_score": ${config.pass_score || 5}
   },

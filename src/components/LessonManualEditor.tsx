@@ -57,8 +57,8 @@ function createEmptyQuestion(type: QuizQuestionType = 'single_choice', index = 1
     id: `Q_${Date.now()}_${index}`,
     type: 'single_choice',
     question: '',
-    options: ['A. ', 'B. ', 'C. ', 'D. '],
-    correctAnswer: 'A. ',
+    options: ['Phương án 1', 'Phương án 2', 'Phương án 3', 'Phương án 4'],
+    correctAnswer: 'Phương án 1',
     explanation: '',
     level: 'nhan_biet',
     source: 'manual',
@@ -100,7 +100,7 @@ function normalizeQuestionForType(question: QuizQuestion, nextType: QuizQuestion
       rubric: undefined,
     };
   }
-  return { ...base, type: 'single_choice', choices: undefined, correctAnswers: undefined, sentence: '', options: base.options?.length ? base.options : ['A. ', 'B. ', 'C. ', 'D. '], correctAnswer: base.correctAnswer || base.options?.[0] || 'A. ' };
+  return { ...base, type: 'single_choice', choices: undefined, correctAnswers: undefined, sentence: '', options: base.options?.length ? base.options : ['Phương án 1', 'Phương án 2', 'Phương án 3', 'Phương án 4'], correctAnswer: base.correctAnswer || base.options?.[0] || 'Phương án 1' };
 }
 
 function EditorCard({ title, icon, children, defaultOpen = false }: { title: string; icon: ReactNode; children: ReactNode; defaultOpen?: boolean }) {
@@ -141,11 +141,11 @@ function QuestionEditor({ question, index, onChange, onDelete }: { key?: string 
           <>
             <label className="space-y-1.5">
               <span className="text-xs font-bold text-slate-600">Các đáp án, mỗi dòng một đáp án</span>
-              <textarea value={optionsText} onChange={(e) => onChange({ ...question, options: splitLines(e.target.value) })} rows={4} className={fieldClass} placeholder={'A. ...\nB. ...\nC. ...\nD. ...'} />
+              <textarea value={optionsText} onChange={(e) => onChange({ ...question, options: splitLines(e.target.value) })} rows={4} className={fieldClass} placeholder={'Phương án 1\nPhương án 2\nPhương án 3\nPhương án 4'} />
             </label>
             <label className="space-y-1.5">
               <span className="text-xs font-bold text-slate-600">Đáp án đúng</span>
-              <input value={text(question.correctAnswer)} onChange={(e) => onChange({ ...question, correctAnswer: e.target.value })} className={fieldClass} placeholder="Nhập đúng nguyên văn đáp án đúng hoặc A/B/C/D" />
+              <input value={text(question.correctAnswer)} onChange={(e) => onChange({ ...question, correctAnswer: e.target.value })} className={fieldClass} placeholder="Nhập đúng nguyên văn nội dung đáp án đúng" />
             </label>
           </>
         ) : null}
@@ -339,9 +339,8 @@ export default function LessonManualEditor({ content, onChange }: LessonManualEd
 
       <div id="lesson-editor-assessment"><EditorCard title="Cấu hình đánh giá" icon={<FileQuestion className="h-5 w-5" />}>
         <div className="grid gap-4 md:grid-cols-3">
-          <label className="space-y-1.5"><span className="text-xs font-bold text-slate-600">Điểm đạt</span><input type="number" min={0} max={10} value={content.assessment?.pass_score ?? content.settings?.pass_score ?? 5} onChange={(e) => updateContent({ assessment: { interactive_weight: content.assessment?.interactive_weight || 40, final_quiz_weight: content.assessment?.final_quiz_weight || 60, score_scale: 10, pass_score: Number(e.target.value || 5) }, settings: { ...(content.settings as any), pass_score: Number(e.target.value || 5) } })} className={fieldClass} /></label>
-          <label className="space-y-1.5"><span className="text-xs font-bold text-slate-600">Tỉ trọng tương tác (%)</span><input type="number" min={0} max={100} value={content.assessment?.interactive_weight ?? 40} onChange={(e) => updateContent({ assessment: { interactive_weight: Number(e.target.value || 40), final_quiz_weight: content.assessment?.final_quiz_weight || 60, score_scale: 10, pass_score: content.assessment?.pass_score || 5 } })} className={fieldClass} /></label>
-          <label className="space-y-1.5"><span className="text-xs font-bold text-slate-600">Tỉ trọng cuối bài (%)</span><input type="number" min={0} max={100} value={content.assessment?.final_quiz_weight ?? 60} onChange={(e) => updateContent({ assessment: { interactive_weight: content.assessment?.interactive_weight || 40, final_quiz_weight: Number(e.target.value || 60), score_scale: 10, pass_score: content.assessment?.pass_score || 5 } })} className={fieldClass} /></label>
+          <label className="space-y-1.5"><span className="text-xs font-bold text-slate-600">Điểm đạt</span><input type="number" min={0} max={10} value={content.assessment?.pass_score ?? content.settings?.pass_score ?? 5} onChange={(e) => updateContent({ assessment: { interactive_weight: 0, final_quiz_weight: 100, score_scale: 10, pass_score: Number(e.target.value || 5) }, settings: { ...(content.settings as any), pass_score: Number(e.target.value || 5) } })} className={fieldClass} /></label>
+          <div className="rounded-2xl border border-emerald-100 bg-emerald-50 px-4 py-3 md:col-span-2"><p className="text-xs font-black uppercase tracking-[0.12em] text-emerald-700">Cách tính điểm V6.81</p><p className="mt-1 text-sm font-semibold text-emerald-900">Chỉ kiểm tra cuối bài tạo điểm chính thức (100%). Các mục học tập không tính điểm.</p></div>
         </div>
       </EditorCard></div>
     </div>

@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from 'motion/react';
 import {
   AlertCircle,
   Bot,
+  KeyRound,
   LoaderCircle,
   MessageCircleMore,
   Mic,
@@ -286,7 +287,7 @@ export default function AIAssistant({
   const playAIReading = async (text: string) => {
     if (!text.trim()) return;
     if (!config.apiKey) {
-      setVoiceNotice('Chưa có API Key nên chưa thể dùng giọng đọc AI. Hãy mở Cấu hình AI trong menu khi cần.');
+      setVoiceNotice('Chưa có API Key nên chưa thể dùng giọng đọc AI. Hãy cấu hình ngay trong khung trợ lý để tiếp tục.');
       return;
     }
 
@@ -330,7 +331,7 @@ export default function AIAssistant({
       appendMessages(contextKey, [
         ...currentMessages,
         { role: 'user', text: question },
-        { role: 'model', text: 'Bạn chưa cấu hình API Key. Hãy mở Cấu hình AI trong menu khi cần dùng trợ lý.' },
+        { role: 'model', text: 'Bạn chưa cấu hình API Key. Hãy dùng nút “Cấu hình API Key ngay” trong khung trợ lý; cửa sổ hiện tại sẽ được giữ nguyên.' },
       ]);
       setInput('');
       setActiveTab('chat');
@@ -470,6 +471,18 @@ export default function AIAssistant({
                 </button>
               </div>
             </div>
+
+            {!config.apiKey ? (
+              <div className="flex flex-col gap-2 border-b border-amber-200 bg-amber-50 px-4 py-3 text-xs font-semibold text-amber-800 sm:flex-row sm:items-center">
+                <div className="flex items-center gap-2">
+                  <AlertCircle className="h-4 w-4 shrink-0" />
+                  <span>Chưa cấu hình API Key. Trợ lý sẽ giữ nguyên nội dung đang mở khi bạn cấu hình.</span>
+                </div>
+                <button type="button" onClick={() => onOpenConfig('manual')} className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-lg bg-amber-500 px-3 py-2 font-black text-white sm:ml-auto">
+                  <KeyRound className="h-3.5 w-3.5" /> Cấu hình API Key ngay
+                </button>
+              </div>
+            ) : null}
 
             {voiceNotice ? (
               <div className="flex items-center gap-2 border-b border-amber-100 bg-amber-50 px-4 py-3 text-xs font-semibold text-amber-700">

@@ -10,7 +10,7 @@ interface AIConfigModalProps {
   onClose: () => void;
   config: AIConfig;
   user?: User | null;
-  onSave: (config: AIConfig) => void;
+  onSave: (config: AIConfig) => Promise<boolean | void> | boolean | void;
   onDelete?: () => void;
   setLoading: (loading: boolean) => void;
   showToast: (msg: string, type: 'success' | 'error') => void;
@@ -23,6 +23,7 @@ export default function AIConfigModal({ isOpen, onClose, config, user, onSave, o
   const [apiKey, setApiKey] = useState(config.apiKey);
   const [model, setModel] = useState(config.model || AI_MODELS[0]);
   const [isTesting, setIsTesting] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   const [testResult, setTestResult] = useState<'success' | 'error' | null>(null);
 
   useEffect(() => {
@@ -46,17 +47,20 @@ export default function AIConfigModal({ isOpen, onClose, config, user, onSave, o
     else showToast('API Key không hợp lệ hoặc lỗi kết nối', 'error');
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!apiKey) {
       showToast('Vui lòng nhập API Key', 'error');
       return;
     }
+    setIsSaving(true);
     setLoading(true);
     try {
-      onSave({ apiKey, model });
+      const saved = await onSave({ apiKey, model });
+      if (saved === false) return;
       onClose();
     } finally {
       setLoading(false);
+      setIsSaving(false);
     }
   };
 
@@ -210,10 +214,11 @@ export default function AIConfigModal({ isOpen, onClose, config, user, onSave, o
                 Hủy
               </button>
               <button
-                onClick={handleSave}
-                className="rounded-2xl bg-primary px-5 py-2.5 text-sm font-bold text-white shadow-lg shadow-primary/30 transition-all hover:bg-indigo-700"
+                onClick={() => void handleSave()}
+                disabled={isSaving}
+                className="rounded-2xl bg-primary px-5 py-2.5 text-sm font-bold text-white shadow-lg shadow-primary/30 transition-all hover:bg-indigo-700 disabled:opacity-60"
               >
-                Lưu theo tài khoản
+                {isSaving ? 'Đang lưu...' : 'Lưu theo tài khoản'}
               </button>
             </div>
           </motion.div>

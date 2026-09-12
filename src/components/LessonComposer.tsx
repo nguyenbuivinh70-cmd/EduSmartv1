@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { AlertTriangle, BookOpenCheck, CheckCircle2, ChevronLeft, ChevronRight, Edit3, FileText, Link2, Loader2, PlayCircle, Presentation, Rocket, Save, Settings2, Sparkles, Upload, Users, X, Youtube } from 'lucide-react';
+import { AlertTriangle, BookOpenCheck, CheckCircle2, ChevronLeft, ChevronRight, Edit3, FileText, KeyRound, Link2, Loader2, PlayCircle, Presentation, Rocket, Save, Settings2, Sparkles, Upload, Users, X, Youtube } from 'lucide-react';
 import {
   AIConfig,
   CatalogClass,
@@ -179,8 +179,9 @@ function buildInitialValues(user: User, lesson?: Lesson | null, content?: Lesson
     pre_lesson_required: lesson?.pre_lesson_required ?? lesson?.raw?.pre_lesson_required ?? false,
     pre_lesson_completion_threshold: Number(lesson?.pre_lesson_completion_threshold ?? lesson?.raw?.pre_lesson_completion_threshold ?? 80),
     pre_lesson_deadline: toDatetimeLocalValue(lesson?.pre_lesson_deadline || lesson?.raw?.pre_lesson_deadline || lesson?.thoi_gian_bat_dau || ''),
-    pre_lesson_score_enabled: lesson?.pre_lesson_score_enabled ?? lesson?.raw?.pre_lesson_score_enabled ?? preLessonEnabled,
-    pre_lesson_score_weight: Math.max(0, Math.min(30, Number(lesson?.pre_lesson_score_weight ?? lesson?.raw?.pre_lesson_score_weight ?? 10))),
+    // V6.79.0: video chỉ đánh giá chuẩn bị bài, không tham gia điểm. Giữ field legacy ở 0/false để tương thích backend cũ.
+    pre_lesson_score_enabled: false,
+    pre_lesson_score_weight: 0,
     section_video_links: sectionVideoLinks,
     ai_revision_request: '',
     source_text: '',
@@ -191,6 +192,8 @@ function buildInitialValues(user: User, lesson?: Lesson | null, content?: Lesson
     thoi_gian_ket_thuc: toDatetimeLocalValue(lesson?.thoi_gian_ket_thuc || lesson?.raw?.thoi_gian_ket_thuc || ''),
     cho_phep_hoc_sau_han: lesson?.cho_phep_hoc_sau_han === true || String(lesson?.cho_phep_hoc_sau_han || lesson?.raw?.cho_phep_hoc_sau_han || '').toLowerCase() === 'true',
     cho_phep_nop_sau_han: lesson?.cho_phep_nop_sau_han === true || String(lesson?.cho_phep_nop_sau_han || lesson?.raw?.cho_phep_nop_sau_han || '').toLowerCase() === 'true',
+    access_mode: lesson?.access_mode || lesson?.raw?.access_mode || 'teacher_controlled',
+    allow_retake_after_completion: lesson?.allow_retake_after_completion === true || lesson?.raw?.allow_retake_after_completion === true,
   };
 }
 
@@ -424,6 +427,11 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
     }
   };
 
+  useEffect(() => {
+    if (!aiConfig.apiKey) return;
+    setErrorMessage((current) => /chưa cấu hình API Key/i.test(current) ? '' : current);
+  }, [aiConfig.apiKey]);
+
   const handleFileChange = async (file?: File | null) => {
     if (!file) return;
     const uploaded = await fileToUploadedSourceFile(file);
@@ -433,7 +441,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
 
   const handleAnalyze = async () => {
     if (!aiConfig.apiKey) {
-      setErrorMessage('Bạn chưa cấu hình API Key. Hãy mở Cấu hình AI trước khi phân tích bài học.');
+      setErrorMessage('Bạn chưa cấu hình API Key. Có thể cấu hình ngay tại đây rồi tiếp tục phân tích bài học mà không cần đóng trình tạo bài.');
       return;
     }
     if (!canAnalyze) {
@@ -480,7 +488,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
   const handleRevise = async () => {
     if (!values.lesson_json || !values.ai_revision_request?.trim()) return;
     if (!aiConfig.apiKey) {
-      setErrorMessage('Bạn chưa cấu hình API Key.');
+      setErrorMessage('Bạn chưa cấu hình API Key. Hãy cấu hình ngay tại cửa sổ này rồi tiếp tục yêu cầu AI điều chỉnh.');
       return;
     }
     setErrorMessage('');
@@ -539,6 +547,8 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
         share_now: saveMode === 'publish' && values.pham_vi === 'shared',
         pham_vi: saveMode === 'draft' ? 'private' : values.pham_vi,
         lesson_json: finalJson,
+        pre_lesson_score_enabled: false,
+        pre_lesson_score_weight: 0,
         tom_tat: values.tom_tat.trim(),
         tu_khoa: values.tu_khoa.trim(),
       };
@@ -673,6 +683,11 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
     publish: false,
   };
 
+  const apiKeyErrorVisible = /api key/i.test(errorMessage);
+  const apiKeyQuotaErrorVisible = /hết hạn|quota|429|resource_exhausted|rate|limit/i.test(errorMessage);
+  const showInlineAIConfigRequirement = !aiConfig.apiKey && !errorMessage && (activeStep === 'material' || activeStep === 'content');
+
+
   return (
     <AnimatePresence>
       {isOpen && (
@@ -705,7 +720,30 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
                   );
                 })}
               </div>
-              {errorMessage && <p className="mt-3 rounded-2xl border border-rose-100 bg-rose-50 px-4 py-3 text-sm font-medium text-rose-700">{errorMessage}</p>}
+              {showInlineAIConfigRequirement ? (
+                <div className="mt-3 flex flex-col gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex min-w-0 items-start gap-2.5">
+                    <KeyRound className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                    <div>
+                      <p className="font-bold">Chưa cấu hình Gemini API Key</p>
+                      <p className="mt-0.5 text-xs font-medium leading-5 text-amber-700">Cấu hình ngay tại đây. Trình tạo bài học và toàn bộ dữ liệu đang nhập sẽ được giữ nguyên phía sau.</p>
+                    </div>
+                  </div>
+                  <button type="button" onClick={() => onOpenConfig('manual')} className="inline-flex shrink-0 items-center justify-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-xs font-black text-white shadow-sm transition hover:bg-amber-600">
+                    <KeyRound className="h-4 w-4" /> Cấu hình API Key ngay
+                  </button>
+                </div>
+              ) : null}
+              {errorMessage ? (
+                <div className="mt-3 flex flex-col gap-3 rounded-2xl border border-rose-100 bg-rose-50 px-4 py-3 text-sm font-medium text-rose-700 sm:flex-row sm:items-center sm:justify-between">
+                  <span className="min-w-0">{errorMessage}</span>
+                  {apiKeyErrorVisible ? (
+                    <button type="button" onClick={() => onOpenConfig(apiKeyQuotaErrorVisible ? 'quota' : 'manual')} className="inline-flex shrink-0 items-center justify-center gap-2 rounded-xl bg-rose-600 px-4 py-2 text-xs font-black text-white shadow-sm transition hover:bg-rose-700">
+                      <KeyRound className="h-4 w-4" /> {apiKeyQuotaErrorVisible ? 'Đổi API Key ngay' : 'Cấu hình API Key ngay'}
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
               {savedStatusMessage && !errorMessage ? <p className="mt-3 rounded-2xl border border-emerald-100 bg-emerald-50 px-4 py-3 text-sm font-semibold text-emerald-700">{savedStatusMessage}</p> : null}
             </div>
 
@@ -760,21 +798,16 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
                           </label>
                           <label className="flex items-start gap-3 rounded-2xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm font-semibold text-indigo-900">
                             <input type="checkbox" className="mt-1" checked={Boolean(values.pre_lesson_required)} onChange={(e) => setValues((prev) => ({ ...prev, pre_lesson_required: e.target.checked }))} />
-                            <span><b>Yêu cầu hoàn thành trước bài</b><small className="mt-1 block font-normal leading-5 text-indigo-700">Dùng để thống kê Có chuẩn bị / Chưa chuẩn bị và có thể tính thành một thành phần điểm riêng của bài học.</small></span>
+                            <span><b>Yêu cầu hoàn thành trước bài</b><small className="mt-1 block font-normal leading-5 text-indigo-700">Dùng để thống kê Có chuẩn bị / Chưa chuẩn bị. Trạng thái này không cộng vào điểm bài học.</small></span>
                           </label>
                           <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3">
                             <label className="text-sm font-bold text-emerald-900">Ngưỡng hoàn thành: {Math.max(50, Math.min(100, Number(values.pre_lesson_completion_threshold || 80)))}%</label>
                             <input type="range" min="50" max="100" step="5" value={Math.max(50, Math.min(100, Number(values.pre_lesson_completion_threshold || 80)))} onChange={(e) => setValues((prev) => ({ ...prev, pre_lesson_completion_threshold: Number(e.target.value) }))} className="mt-2 w-full" />
                             <p className="mt-1 text-xs leading-5 text-emerald-700">Mặc định 80%. Học sinh đạt ngưỡng trước hạn sẽ được ghi nhận Có chuẩn bị bài.</p>
                           </div>
-                          <label className="flex items-start gap-3 rounded-2xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-sm font-semibold text-cyan-900">
-                            <input type="checkbox" className="mt-1" checked={values.pre_lesson_score_enabled !== false} onChange={(e) => setValues((prev) => ({ ...prev, pre_lesson_score_enabled: e.target.checked }))} />
-                            <span><b>Tính điểm chuẩn bị vào điểm bài học</b><small className="mt-1 block font-normal leading-5 text-cyan-700">Có chuẩn bị đúng hạn = 10/10 thành phần chuẩn bị; chưa chuẩn bị hoặc hoàn thành muộn = 0/10. Khi học nhóm, điểm này áp dụng riêng từng học sinh.</small></span>
-                          </label>
-                          <div className={`rounded-2xl border px-4 py-3 ${values.pre_lesson_score_enabled !== false ? 'border-fuchsia-200 bg-fuchsia-50' : 'border-slate-200 bg-slate-50 opacity-60'}`}>
-                            <label className="text-sm font-bold text-fuchsia-900">Trọng số điểm chuẩn bị: {Math.max(0, Math.min(30, Number(values.pre_lesson_score_weight ?? 10)))}%</label>
-                            <input type="range" min="0" max="30" step="5" disabled={values.pre_lesson_score_enabled === false} value={Math.max(0, Math.min(30, Number(values.pre_lesson_score_weight ?? 10)))} onChange={(e) => setValues((prev) => ({ ...prev, pre_lesson_score_weight: Number(e.target.value) }))} className="mt-2 w-full" />
-                            <p className="mt-1 text-xs leading-5 text-fuchsia-700">Mặc định 10%. Phần còn lại vẫn giữ tỷ lệ tương đối giữa điểm quá trình và kiểm tra cuối bài.</p>
+                          <div className="md:col-span-2 rounded-2xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-sm text-cyan-900">
+                            <p className="font-black">Nguyên tắc đánh giá V6.79</p>
+                            <p className="mt-1 leading-6 text-cyan-800">Video chuẩn bị chỉ ghi nhận trạng thái <b>Có chuẩn bị / Chưa chuẩn bị / Hoàn thành muộn</b>. Hệ thống không quy đổi video thành điểm và không cộng trạng thái chuẩn bị vào điểm bài học.</p>
                           </div>
                         </div>
                       </div>
@@ -844,6 +877,10 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
                         <div><label className="mb-2 block text-sm font-semibold text-slate-700">Bắt đầu mở bài</label><input type="datetime-local" value={values.thoi_gian_bat_dau || ''} onChange={(e) => setValues((prev) => ({ ...prev, thoi_gian_bat_dau: e.target.value }))} className={fieldClass} /></div>
                         <div><label className="mb-2 block text-sm font-semibold text-slate-700">Kết thúc bài học</label><input type="datetime-local" value={values.thoi_gian_ket_thuc || ''} onChange={(e) => setValues((prev) => ({ ...prev, thoi_gian_ket_thuc: e.target.value }))} className={fieldClass} /></div>
                         <label className="md:col-span-2 flex items-center gap-3 rounded-2xl border border-emerald-100 bg-emerald-50 px-4 py-3 text-sm font-semibold text-emerald-700"><input type="checkbox" checked={Boolean(values.cho_phep_hoc_sau_han)} onChange={(e) => setValues((prev) => ({ ...prev, cho_phep_hoc_sau_han: e.target.checked }))} /> Cho phép học sau thời gian kết thúc</label>
+                        <div className="md:col-span-2 grid gap-3 md:grid-cols-2">
+                          <label className={`flex cursor-pointer items-start gap-3 rounded-2xl border px-4 py-3 text-sm font-semibold ${values.access_mode === 'self_study' ? 'border-indigo-200 bg-indigo-50 text-indigo-800' : 'border-slate-200 bg-slate-50 text-slate-700'}`}><input type="checkbox" className="mt-1" checked={values.access_mode === 'self_study'} onChange={(e) => setValues((prev) => ({ ...prev, access_mode: e.target.checked ? 'self_study' : 'teacher_controlled' }))} /><span><b>Mở chế độ tự học</b><span className="mt-1 block text-xs font-medium opacity-80">Học sinh được mở tất cả hoạt động mà không cần giáo viên mở từng mục. Phạm vi lớp/khối và lịch học vẫn được giữ.</span></span></label>
+                          <label className={`flex cursor-pointer items-start gap-3 rounded-2xl border px-4 py-3 text-sm font-semibold ${values.allow_retake_after_completion ? 'border-violet-200 bg-violet-50 text-violet-800' : 'border-slate-200 bg-slate-50 text-slate-700'}`}><input type="checkbox" className="mt-1" checked={Boolean(values.allow_retake_after_completion)} onChange={(e) => setValues((prev) => ({ ...prev, allow_retake_after_completion: e.target.checked }))} /><span><b>Cho phép học lại sau khi hoàn thành</b><span className="mt-1 block text-xs font-medium opacity-80">Điểm học lại chỉ để tham khảo, được lưu riêng và không thay thế điểm chính thức.</span></span></label>
+                        </div>
                       </div>
 
                       <div className="rounded-3xl border border-indigo-100 bg-indigo-50/60 p-5">

@@ -7,6 +7,7 @@ export type ReviewPracticeType = 'chapter' | 'midterm' | 'final' | 'topic' | 'cu
 export type LessonSchemaVersion = 'lesson_v1' | 'lesson_v2' | 'lesson_v3';
 export type LearningStatus = 'not_started' | 'in_progress' | 'completed';
 export type StudyMode = 'single' | 'co_learning';
+export type LessonAccessMode = 'teacher_controlled' | 'self_study';
 export type LearningResultState = 'valid' | 'cancelled_retake' | 'invalid_cheating';
 export type LearningResultActionType = 'allow_retake' | 'invalidate_cheating';
 
@@ -168,6 +169,8 @@ export interface LessonRow {
   cho_phep_hoc_sau_han?: boolean | string;
   cho_phep_nop_sau_han?: boolean | string;
   is_locked?: boolean;
+  access_mode?: LessonAccessMode;
+  allow_retake_after_completion?: boolean;
   locked_at?: string;
   locked_by_uid?: string;
   locked_by_name?: string;
@@ -214,6 +217,8 @@ export interface Lesson {
   cho_phep_hoc_sau_han?: boolean | string;
   cho_phep_nop_sau_han?: boolean | string;
   is_locked?: boolean;
+  access_mode?: LessonAccessMode;
+  allow_retake_after_completion?: boolean;
   locked_at?: string;
   locked_by_uid?: string;
   locked_by_name?: string;
@@ -776,6 +781,8 @@ export interface LessonComposerValues {
   thoi_gian_ket_thuc?: string;
   cho_phep_hoc_sau_han?: boolean;
   cho_phep_nop_sau_han?: boolean;
+  access_mode?: LessonAccessMode;
+  allow_retake_after_completion?: boolean;
 }
 
 export interface LessonComment {
@@ -834,7 +841,7 @@ export interface SectionLearningProgress {
   interactionPercent?: number;
   completionPercent?: number;
   section_score?: number;
-  score_status?: 'pending' | 'completed';
+  score_status?: 'pending' | 'scored' | 'not_applicable' | 'completed';
   score_calculated_at?: string;
   completedAt?: string;
   lastVisitedAt?: string;
@@ -913,7 +920,7 @@ export interface LessonProgressRecord {
   learning_process_score?: number;
   final_quiz_score?: number;
   current_score?: number;
-  score_status?: 'in_progress' | 'finalized';
+  score_status?: 'in_progress' | 'finalized' | 'not_applicable';
   score_calculated_at?: string;
   last_closed_at?: string;
   save_state?: 'saving' | 'saved' | 'save_failed';
@@ -921,6 +928,18 @@ export interface LessonProgressRecord {
   result_group_id?: string;
   result_version?: number;
   retake_allowed?: boolean;
+  /** V6.84.0: quyền học lại chính thức do giáo viên cấp; 1 quyền = 1 lần nộp mới. */
+  official_retake_remaining?: number;
+  official_retake_grant_id?: string;
+  official_retake_granted_at?: string;
+  official_retake_granted_by_uid?: string;
+  official_retake_granted_by_name?: string;
+  official_retake_last_consumed_at?: string;
+  official_retake_count?: number;
+  previous_official_score?: number;
+  score_reason?: 'submitted' | 'deadline_missed' | 'official_retake' | string;
+  deadline_status?: 'not_due' | 'on_time' | 'missed' | 'overridden' | string;
+  deadline_finalized_at?: string;
   invalidated_reason?: string;
   invalidated_at?: string;
   invalidated_by_uid?: string;
@@ -942,8 +961,37 @@ export interface LessonProgressRecord {
   preparation_weight?: number;
   learning_component_weight?: number;
   final_component_weight?: number;
+  /** V6.81.0: 4 = chỉ kiểm tra cuối bài tạo điểm; mục học tập/video chỉ ghi nhận tiến độ. */
+  score_model_version?: number;
+  scored_section_count?: number;
+  scorable_section_count?: number;
 }
 
+
+export interface LessonRetakeAttempt {
+  attempt_id: string;
+  attempt_number: number;
+  lesson_id: string;
+  user_id: string;
+  ownerUid?: string;
+  status: 'in_progress' | 'completed';
+  is_official: boolean;
+  retake_mode?: 'reference' | 'official_update';
+  official_retake_grant_id?: string;
+  reference_score?: number;
+  official_score_snapshot?: number;
+  learning_process_score?: number;
+  final_quiz_score?: number;
+  completion_percent: number;
+  score_status?: 'in_progress' | 'finalized' | 'not_applicable';
+  score_model_version?: number;
+  progress: LessonProgressRecord;
+  started_at: string;
+  updated_at: string;
+  completed_at?: string;
+  schoolId?: string;
+  schemaVersion?: number;
+}
 
 export interface CoLearningSession {
   co_learning_session_id: string;
@@ -984,6 +1032,35 @@ export interface CoLearningPartnerCredential {
   password: string;
 }
 
+
+
+export type AssessmentMilestoneKey = 'midterm1' | 'finalterm1' | 'midterm2' | 'finalterm2' | 'annual';
+
+export interface ScoreTrackingConfig {
+  config_id: string;
+  academic_year: string;
+  subject_id: string;
+  grade: string;
+  class_id?: string;
+  midterm1_lesson_ids: string[];
+  finalterm1_lesson_ids: string[];
+  midterm2_lesson_ids: string[];
+  finalterm2_lesson_ids: string[];
+  annual_mode: 'auto' | 'manual';
+  annual_lesson_ids: string[];
+  schemaVersion: number;
+  schoolId?: string;
+  updatedByUid?: string;
+  updatedByName?: string;
+  updated_at?: string;
+  /** Chỉ dùng phía client để báo cấu hình lớp đang kế thừa cấu hình chung khối/môn. */
+  inherited_from_grade?: boolean;
+  /** V6.84.0: governance cho mốc điểm. */
+  milestone_status?: Partial<Record<AssessmentMilestoneKey, 'draft' | 'locked'>>;
+  milestone_locked_at?: Partial<Record<AssessmentMilestoneKey, string>>;
+  milestone_locked_by_name?: Partial<Record<AssessmentMilestoneKey, string>>;
+}
+
 export interface StudentLearningAnalyticsRow {
   user_id: string;
   ho_ten: string;
@@ -1004,6 +1081,13 @@ export interface StudentLearningAnalyticsRow {
   result_state?: LearningResultState;
   result_group_id?: string;
   retake_allowed?: boolean;
+  official_retake_remaining?: number;
+  official_retake_grant_id?: string;
+  official_retake_count?: number;
+  previous_official_score?: number;
+  score_reason?: string;
+  deadline_status?: string;
+  deadline_finalized_at?: string;
   study_mode?: StudyMode;
   co_learning_session_id?: string;
   co_learner_ids?: string;
@@ -1027,6 +1111,11 @@ export interface StudentLearningAnalyticsRow {
   preparation_weight?: number;
   learning_process_score?: number;
   final_quiz_score?: number;
+  current_score?: number;
+  score_status?: 'in_progress' | 'finalized' | 'not_applicable';
+  score_model_version?: number;
+  scored_section_count?: number;
+  scorable_section_count?: number;
 }
 
 export interface LearningResultModerationPayload {

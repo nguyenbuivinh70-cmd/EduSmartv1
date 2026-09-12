@@ -78,7 +78,7 @@ export default function CoLearningModal({
   const handleToggleStudent = (userId: string) => {
     const wasSelected = selectedSet.has(userId);
     onToggleClassmate(userId);
-    // V6.78.2: sau khi thêm một bạn từ kết quả tìm kiếm, hiện lại toàn bộ lớp
+    // V6.79.0: sau khi thêm một bạn từ kết quả tìm kiếm, hiện lại toàn bộ lớp
     // để người dùng chọn tiếp bạn thứ 2, 3... mà không phải xóa từ khóa thủ công.
     if (!wasSelected) setSearch('');
   };

@@ -7,21 +7,23 @@ import YoutubeEmbedBlock from './YoutubeEmbedBlock';
 import LessonResultSummary from './LessonResultSummary';
 import LearningChatPanel from './LearningChatPanel';
 import { getLessonContentApi, getTeachingSessionApi, saveTeachingSessionApi, setTeachingActivityAccessApi } from '../services/api';
-import { calculateLearningProcessScore, calculateSectionProgress, calculateWeightedAssessmentScore, preparationScoreFromStatus } from '../utils/learningScoreEngine';
-import { subscribeFirebaseTeachingSession } from '../services/firebaseOperational';
+import { calculateFairAssessmentScore, calculateSectionProgress } from '../utils/learningScoreEngine';
+import { getFirebaseCurrentMemberClassId, subscribeFirebaseTeachingSession } from '../services/firebaseOperational';
+import { sanitizeSingleChoiceQuestion } from '../utils/quizSanitizer';
 
 interface LessonViewerProps {
   isOpen: boolean;
   lesson: Lesson | null;
   content: LessonContent | null;
   aiConfig: AIConfig;
-  onOpenConfig: () => void;
+  onOpenConfig: (reason?: 'manual' | 'quota') => void;
   onClose: (snapshot?: LessonCloseSnapshot) => void | Promise<void>;
   onStageChange?: (stage: LessonStageKey) => void;
   progress?: LessonProgressRecord | null;
   onStepOpened?: (stage: LessonStageKey) => void;
   onStepViewedComplete?: (stage: LessonStageKey) => void;
   onQuizMetricsChange?: (stage: LessonStageKey, metrics: { answered: number; correct: number; total: number; answers?: Record<string, LessonQuestionAnswerState>; sectionProgress?: Record<string, SectionLearningProgress>; finalExam?: any }) => void;
+  onFinalExamSubmit?: (snapshot: LessonCloseSnapshot) => Promise<boolean> | boolean;
   coLearningGroupSize?: number;
   onManageCoLearning?: () => void;
   onOpenPreLessonVideo?: () => void;
@@ -32,6 +34,10 @@ interface LessonViewerProps {
   classes?: CatalogClass[];
   onAddComment?: (payload: { lesson_id: string; noi_dung: string; parent_id?: string; loai?: string }) => Promise<boolean>;
   onUpdateComment?: (payload: { comment_id: string; trang_thai?: string; noi_dung?: string }) => Promise<boolean>;
+  attemptMode?: 'official' | 'retake' | 'review';
+  officialScore?: number;
+  retakeAttemptNumber?: number;
+  retakeIsOfficial?: boolean;
 }
 
 const HTML_ENTITY_MAP: Record<string, string> = {
@@ -130,14 +136,13 @@ function normalizeQuestion(question: QuizQuestion, fallbackId: string): QuizQues
   const qType = question.type === 'short_answer' ? 'fill_in_blank' : question.type;
   if (qType === 'fill_in_blank') return buildFillInBlankQuestion({ ...question, type: 'fill_in_blank' }, fallbackId);
   const isTrueFalse = qType === 'true_false';
-  const options = question.options?.length ? question.options.map((item) => cleanText(item)) : isTrueFalse ? ['Đúng', 'Sai'] : [];
-  return {
+  const base: QuizQuestion = {
     ...question,
     id: question.id || fallbackId,
     type: qType || 'single_choice',
     question: cleanText(question.question || question.sentence || ''),
     sentence: cleanText(question.sentence || ''),
-    options,
+    options: question.options?.length ? question.options.map((item) => cleanText(item)) : isTrueFalse ? ['Đúng', 'Sai'] : [],
     choices: question.choices?.map((item) => cleanText(item)).filter(Boolean),
     correctAnswers: question.correctAnswers?.map((item) => cleanText(item)).filter(Boolean),
     correctAnswer: typeof question.correctAnswer === 'string' ? cleanText(question.correctAnswer) : question.correctAnswer,
@@ -145,6 +150,10 @@ function normalizeQuestion(question: QuizQuestion, fallbackId: string): QuizQues
     rubric: cleanText(question.rubric || ''),
     explanation: cleanText(question.explanation || ''),
   };
+  // V6.81.0: dữ liệu cũ/AI có thể đã nhúng sẵn A./B./C./D. vào nội dung
+  // đáp án. Chuẩn hóa trước khi hiển thị để không còn dạng "A. B. Dữ liệu" và
+  // loại các lựa chọn trùng nội dung nhưng vẫn giữ đúng đáp án chuẩn.
+  return base.type === 'single_choice' ? sanitizeSingleChoiceQuestion(base) : base;
 }
 
 function normalizeSection(section: LessonSectionV2, index: number): LessonSectionV2 {
@@ -570,6 +579,7 @@ export default function LessonViewer({
   onStepOpened,
   onStepViewedComplete,
   onQuizMetricsChange,
+  onFinalExamSubmit,
   coLearningGroupSize = 1,
   onManageCoLearning,
   onOpenPreLessonVideo,
@@ -580,6 +590,10 @@ export default function LessonViewer({
   classes = [],
   onAddComment,
   onUpdateComment,
+  attemptMode = 'official',
+  officialScore,
+  retakeAttemptNumber,
+  retakeIsOfficial = false,
 }: LessonViewerProps) {
   const [liveContent, setLiveContent] = useState<LessonContent | null>(content);
   const effectiveContent = liveContent || content;
@@ -600,6 +614,9 @@ export default function LessonViewer({
   const [lessonTimedOut, setLessonTimedOut] = useState(false);
   const [examStarted, setExamStarted] = useState(false);
   const [examSubmitted, setExamSubmitted] = useState(false);
+  const [finalExamSaving, setFinalExamSaving] = useState(false);
+  const [finalExamSaveError, setFinalExamSaveError] = useState('');
+  const finalSubmitPersistedRef = useRef('');
   const [examAutoSubmitted, setExamAutoSubmitted] = useState(false);
   const [examElapsedSeconds, setExamElapsedSeconds] = useState(0);
   const [examAttemptNumber, setExamAttemptNumber] = useState(1);
@@ -613,6 +630,20 @@ export default function LessonViewer({
   const [replyInputs, setReplyInputs] = useState<Record<string, string>>({});
   const [submittingCommentId, setSubmittingCommentId] = useState<string | null>(null);
   const [closingLesson, setClosingLesson] = useState(false);
+
+  const isStudentView = currentUserRole === 'student';
+  const selfStudyMode = lesson?.access_mode === 'self_study';
+  const releasedActivityIds = useMemo<Set<string>>(() => new Set((teachingSession?.released_activity_ids || []).map((item) => String(item).trim()).filter(Boolean)), [teachingSession?.released_activity_ids]);
+  const releasedActivitySignature = useMemo(() => Array.from(releasedActivityIds).sort().join('|'), [releasedActivityIds]);
+  const isSectionLockedForStudent = (section: LessonSectionV2) => {
+    if (!isStudentView) return false;
+    // Học lại/xem lại chính thức và chế độ tự học được đọc toàn bộ activity theo Rules V6.80.0.
+    if (selfStudyMode || attemptMode === 'retake' || attemptMode === 'review') return false;
+    // Khi đã có realtime teachingSession, session là nguồn sự thật cho trạng thái mở/khóa.
+    // Không tiếp tục phụ thuộc cờ `locked` cũ nằm trong content snapshot đã tải trước đó.
+    if (teachingSession) return !releasedActivityIds.has(String(section.section_id || '').trim());
+    return section.locked === true;
+  };
 
   useEffect(() => {
     setLiveContent(content);
@@ -630,8 +661,15 @@ export default function LessonViewer({
   useEffect(() => {
     if (!isOpen || !lesson) return;
     if (currentUserRole === 'student') {
-      setTeachingClassId(String(currentUser?.lop_id || lesson.lop_id || ''));
-      return;
+      let cancelled = false;
+      // V6.80.1: lấy classId chuẩn trực tiếp từ member Firebase, đúng cùng giá trị
+      // mà Firestore Rules dùng trong memberClassValue(). Chỉ dùng lop_id UI làm fallback.
+      void getFirebaseCurrentMemberClassId(String(currentUser?.lop_id || lesson.lop_id || '')).then((resolvedClassId) => {
+        if (!cancelled) setTeachingClassId(resolvedClassId);
+      }).catch(() => {
+        if (!cancelled) setTeachingClassId(String(currentUser?.lop_id || lesson.lop_id || ''));
+      });
+      return () => { cancelled = true; };
     }
     const preferred = String(lesson.lop_id || teachingClassId || teachingClassOptions[0]?.lop_id || '');
     setTeachingClassId(preferred);
@@ -642,18 +680,39 @@ export default function LessonViewer({
     if (currentUserRole === 'student') {
       releasedSignatureRef.current = '';
       const unsubscribe = subscribeFirebaseTeachingSession(lesson.lesson_id, teachingClassId, (session) => {
-        const nextReleased = (session?.released_activity_ids || []).map((item) => String(item)).sort().join('|');
+        const nextReleased = (session?.released_activity_ids || []).map((item) => String(item).trim()).filter(Boolean).sort().join('|');
         setTeachingSession(session);
+        setTeachingSessionError('');
+
+        // V6.80.1: phản ánh mở/khóa ngay trên snapshot content đang hiển thị,
+        // không chờ request tải activity hoàn tất mới đổi trạng thái sidebar.
+        // Sau đó vẫn tải lại content để nhận pages/interactions của mục vừa mở.
+        setLiveContent((current) => {
+          if (!current?.activities?.length || lesson.access_mode === 'self_study' || attemptMode === 'review' || attemptMode === 'retake') return current;
+          const releasedNow = new Set((session?.released_activity_ids || []).map((item) => String(item).trim()).filter(Boolean));
+          return {
+            ...current,
+            activities: current.activities.map((activity) => ({
+              ...activity,
+              locked: !releasedNow.has(String(activity.activity_id || '').trim()),
+              released: releasedNow.has(String(activity.activity_id || '').trim()),
+            })),
+          };
+        });
+
         if (releasedSignatureRef.current !== nextReleased) {
           releasedSignatureRef.current = nextReleased;
           void getLessonContentApi(currentUser.token, lesson.lesson_id).then(async (res) => {
-            if (!res.ok || !res.data?.content) return;
+            if (!res.ok || !res.data?.content) {
+              setTeachingSessionError(res.message || 'Mục đã được giáo viên mở nhưng chưa tải lại được nội dung. Hãy thử lại sau vài giây.');
+              return;
+            }
             const { normalizeLessonContent } = await import('../services/gemini');
             setLiveContent(normalizeLessonContent(res.data.content));
-          });
+          }).catch(() => setTeachingSessionError('Mục đã được giáo viên mở nhưng chưa tải lại được nội dung. Hệ thống sẽ tự đồng bộ lại.'));
         }
         const currentActivity = String(session?.current_activity_id || '');
-        if (currentActivity && (session?.released_activity_ids || []).includes(currentActivity)) {
+        if (currentActivity && (session?.released_activity_ids || []).map(String).includes(currentActivity)) {
           // Khi giáo viên chuyển sang hoạt động khác, học sinh tự đi tới hoạt động
           // đang được trình bày. Các hoạt động cũ vẫn có thể mở lại thủ công sau đó.
           setActiveStep(currentActivity);
@@ -749,7 +808,7 @@ export default function LessonViewer({
   useEffect(() => {
     if (!isOpen || !activeStep || !sections.some((section) => section.section_id === activeStep)) return;
     const section = sections.find((item) => item.section_id === activeStep)!;
-    if (section.locked && currentUserRole === 'student') return;
+    if (isSectionLockedForStudent(section)) return;
     setSectionProgress((prev) => {
       const current = prev[section.section_id] || createSectionProgress(section);
       return {
@@ -778,7 +837,7 @@ export default function LessonViewer({
       });
     }, 1000);
     return () => window.clearInterval(interval);
-  }, [isOpen, activeStep, sections]);
+  }, [isOpen, activeStep, sections, selfStudyMode, attemptMode, releasedActivitySignature]);
 
   useEffect(() => {
     if (!isOpen || lessonTimedOut) return;
@@ -864,18 +923,10 @@ export default function LessonViewer({
     return { answered, correct, total: allQuestions.length, interactiveCorrect, interactiveTotal: allInteractiveQuestions.length, finalCorrect, finalTotal: activeFinalQuiz.length };
   }, [allQuestions, allInteractiveQuestions, activeFinalQuiz, answerStates, examSubmitted]);
 
-  const assessmentConfig = content?.assessment || { interactive_weight: 40, final_quiz_weight: 60, score_scale: 10, pass_score: 5 };
-  const learningProcessWeight = Number((assessmentConfig as any).learning_process_weight || assessmentConfig.interactive_weight || 40);
-  const finalExamWeight = Number(assessmentConfig.final_quiz_weight || 60);
-
-  const learningProcessScore = useMemo(() => {
-    return calculateLearningProcessScore(computedSectionProgress);
-  }, [computedSectionProgress]);
-
   const finalExamScore = useMemo(() => {
-    if (!metrics.finalTotal) return 10;
+    if (!metrics.finalTotal || !examSubmitted) return undefined;
     return Math.min(10, Math.max(0, (metrics.finalCorrect / metrics.finalTotal) * 10));
-  }, [metrics.finalCorrect, metrics.finalTotal]);
+  }, [metrics.finalCorrect, metrics.finalTotal, examSubmitted]);
 
   const hasPreparationVideo = Boolean(
     String(lesson?.intro_video_url || '').trim()
@@ -883,27 +934,19 @@ export default function LessonViewer({
     || String(effectiveContent?.intro_video_url || '').trim()
     || String(effectiveContent?.intro_video_embed_url || '').trim()
   );
-  const preparationScoreEnabled = hasPreparationVideo
-    && lesson?.pre_lesson_enabled !== false
-    && lesson?.pre_lesson_score_enabled !== false;
-  const preparationWeight = preparationScoreEnabled
-    ? Math.max(0, Math.min(30, Number(lesson?.pre_lesson_score_weight ?? 10)))
-    : 0;
   const preparationStatus = String(progress?.pre_lesson_preparation_status || '').trim()
     || (progress?.pre_lesson_completed_before_deadline === true ? 'prepared'
       : progress?.pre_lesson_status === 'completed' ? 'late_completed'
         : Number(progress?.pre_lesson_watch_percent || 0) > 0 ? 'in_progress' : 'not_started');
-  const preparationScore = preparationScoreEnabled ? preparationScoreFromStatus(preparationStatus) : 0;
-  const weightedAssessment = useMemo(() => calculateWeightedAssessmentScore({
-    learningProcessScore,
+  const allRequiredSectionsCompleted = sections.every((section) => computedSectionProgress[section.section_id]?.status === 'completed');
+  const weightedAssessment = useMemo(() => calculateFairAssessmentScore({
     finalQuizScore: finalExamScore,
+    finalQuizExists: metrics.finalTotal > 0,
     finalSubmitted: examSubmitted,
-    learningWeight: learningProcessWeight,
-    finalWeight: finalExamWeight,
-    preparationWeight,
-    preparationScore,
-  }), [learningProcessScore, finalExamScore, examSubmitted, learningProcessWeight, finalExamWeight, preparationWeight, preparationScore]);
-  const score = weightedAssessment.score;
+    allRequiredSectionsCompleted,
+  }), [finalExamScore, metrics.finalTotal, examSubmitted, allRequiredSectionsCompleted]);
+  const score = weightedAssessment.finalScore ?? 0;
+  const finalQuizLockedForStudent = isStudentView && attemptMode !== 'review' && metrics.finalTotal > 0 && !allRequiredSectionsCompleted;
 
   useEffect(() => {
     if (!allQuestions.length && !sections.length) return;
@@ -920,8 +963,7 @@ export default function LessonViewer({
         time_spent_seconds: examElapsedSeconds,
         status: examSubmitted ? (examAutoSubmitted ? 'auto_submitted' : 'submitted') : examStarted ? 'in_progress' : 'not_started',
         score: finalExamScore,
-        total_score: score,
-        learning_process_score: learningProcessScore,
+        total_score: weightedAssessment.finalScore ?? weightedAssessment.currentScore,
         correct_count: metrics.finalCorrect,
         total_count: metrics.finalTotal,
         unanswered_count: activeFinalQuiz.filter((question, index) => !answerStates[getQuestionKey(question, index + allInteractiveQuestions.length)]?.submitted).length,
@@ -929,7 +971,7 @@ export default function LessonViewer({
         security_events: examSecurityEvents,
       },
     });
-  }, [metrics.answered, metrics.correct, metrics.total, metrics.finalCorrect, metrics.finalTotal, answerStates, allQuestions.length, onQuizMetricsChange, computedSectionProgress, sections.length, examStarted, examSubmitted, examAutoSubmitted, examElapsedSeconds, finalExamTimeMinutes, score, finalExamScore, learningProcessScore, activeFinalQuiz, allInteractiveQuestions.length, examAttemptNumber, examSecurityEvents]);
+  }, [metrics.answered, metrics.correct, metrics.total, metrics.finalCorrect, metrics.finalTotal, answerStates, allQuestions.length, onQuizMetricsChange, computedSectionProgress, sections.length, examStarted, examSubmitted, examAutoSubmitted, examElapsedSeconds, finalExamTimeMinutes, score, finalExamScore, activeFinalQuiz, allInteractiveQuestions.length, examAttemptNumber, examSecurityEvents]);
 
   useEffect(() => {
     if (sections.length > 0 && completedSectionsCount === sections.length) {
@@ -937,9 +979,7 @@ export default function LessonViewer({
     }
   }, [sections.length, completedSectionsCount, onStepViewedComplete]);
 
-  const isStudentView = currentUserRole === 'student';
-  const releasedActivityIds = useMemo<Set<string>>(() => new Set((teachingSession?.released_activity_ids || []).map((item) => String(item))), [teachingSession?.released_activity_ids]);
-  const toggleActivityAccessForClass = async (section: LessonSectionV2, open: boolean, pageId?: string) => {
+    const toggleActivityAccessForClass = async (section: LessonSectionV2, open: boolean, pageId?: string) => {
     if (!lesson?.lesson_id || !currentUser || currentUserRole === 'student' || !teachingClassId) return;
     setTeachingSessionBusy(true);
     setTeachingSessionError('');
@@ -971,8 +1011,16 @@ export default function LessonViewer({
 
   const selectStep = (step: string) => {
     const targetSection = sections.find((section) => section.section_id === step);
-    if (targetSection?.locked && isStudentView) {
+    if (targetSection && isSectionLockedForStudent(targetSection)) {
       setMobileMenuOpen(false);
+      return;
+    }
+    // V6.81.0: học sinh chỉ được vào kiểm tra cuối bài sau khi hoàn thành
+    // toàn bộ mục học tập. Guard này áp dụng cả click trực tiếp lẫn điều hướng.
+    if (step === 'final_quiz' && finalQuizLockedForStudent) {
+      setMobileMenuOpen(false);
+      const firstIncomplete = sections.find((section) => computedSectionProgress[section.section_id]?.status !== 'completed');
+      if (firstIncomplete) setActiveStep(firstIncomplete.section_id);
       return;
     }
     setActiveStep(step);
@@ -998,10 +1046,11 @@ export default function LessonViewer({
   };
 
   const currentSection = sections.find((section) => section.section_id === activeStep) || null;
-  const lessonNavigationSteps = useMemo(() => ['intro', ...sections.filter((section) => !isStudentView || !section.locked).map((section) => section.section_id), 'final_quiz', 'comments', 'result'], [sections, isStudentView]);
+  const lessonNavigationSteps = useMemo(() => ['intro', ...sections.filter((section) => !isSectionLockedForStudent(section)).map((section) => section.section_id), 'final_quiz', 'comments', 'result'], [sections, isStudentView, selfStudyMode, attemptMode, releasedActivitySignature]);
   const activeNavigationIndex = Math.max(0, lessonNavigationSteps.indexOf(activeStep));
   const previousNavigationStep = activeNavigationIndex > 0 ? lessonNavigationSteps[activeNavigationIndex - 1] : null;
   const nextNavigationStep = activeNavigationIndex < lessonNavigationSteps.length - 1 ? lessonNavigationSteps[activeNavigationIndex + 1] : null;
+  const nextNavigationLocked = nextNavigationStep === 'final_quiz' && finalQuizLockedForStudent;
   const activeStepLabel = activeStep === 'intro'
     ? 'Tổng quan'
     : activeStep === 'final_quiz'
@@ -1064,6 +1113,10 @@ export default function LessonViewer({
   };
 
   const startFinalExam = () => {
+    if (finalQuizLockedForStudent) {
+      goToFirstIncompleteSection();
+      return;
+    }
     const prepared = prepareExamQuestions(finalQuiz, settings.shuffle_final_questions !== false, settings.shuffle_final_options !== false);
     setExamQuestions(prepared);
     setExamStarted(true);
@@ -1071,6 +1124,8 @@ export default function LessonViewer({
     setExamReviewMarks({});
     setExamSubmitted(false);
     setExamAutoSubmitted(false);
+    setFinalExamSaveError('');
+    finalSubmitPersistedRef.current = '';
     setExamElapsedSeconds(0);
     setLessonChatOpen(false);
     setLessonChatPrompt(null);
@@ -1078,14 +1133,78 @@ export default function LessonViewer({
 
   const unansweredFinalQuestions = activeFinalQuiz.filter((question, index) => !answerStates[getQuestionKey(question, index + allInteractiveQuestions.length)]?.submitted);
 
-  const submitFinalExam = (force = false) => {
+  const buildSubmittedExamSnapshot = (autoSubmitted = false): LessonCloseSnapshot => {
+    const finalCorrectNow = activeFinalQuiz.filter((question, index) =>
+      answerStates[getQuestionKey(question, index + allInteractiveQuestions.length)]?.isCorrect,
+    ).length;
+    const finalScoreNow = activeFinalQuiz.length > 0
+      ? Math.min(10, Math.max(0, (finalCorrectNow / activeFinalQuiz.length) * 10))
+      : undefined;
+    const submittedAssessment = calculateFairAssessmentScore({
+      finalQuizScore: finalScoreNow,
+      finalQuizExists: activeFinalQuiz.length > 0,
+      finalSubmitted: true,
+      allRequiredSectionsCompleted,
+    });
+    const submittedAt = new Date().toISOString();
+    return {
+      answered: metrics.answered,
+      correct: allInteractiveQuestions.filter((question, index) => answerStates[getQuestionKey(question, index)]?.isCorrect).length + finalCorrectNow,
+      total: allQuestions.length,
+      answers: answerStates,
+      sectionProgress: computedSectionProgress,
+      finalExam: {
+        started_at: examStarted ? new Date(Date.now() - examElapsedSeconds * 1000).toISOString() : '',
+        submitted_at: submittedAt,
+        time_limit_minutes: finalExamTimeMinutes,
+        time_spent_seconds: examElapsedSeconds,
+        status: autoSubmitted ? 'auto_submitted' : 'submitted',
+        score: finalScoreNow,
+        total_score: submittedAssessment.finalScore ?? submittedAssessment.currentScore,
+        correct_count: finalCorrectNow,
+        total_count: activeFinalQuiz.length,
+        unanswered_count: activeFinalQuiz.filter((question, index) => !answerStates[getQuestionKey(question, index + allInteractiveQuestions.length)]?.submitted).length,
+        attempt_number: examAttemptNumber,
+        security_events: examSecurityEvents,
+      },
+    };
+  };
+
+  const persistSubmittedExam = async (autoSubmitted = false) => {
+    const snapshot = buildSubmittedExamSnapshot(autoSubmitted);
+    const submitKey = `${examAttemptNumber}:${snapshot.finalExam?.submitted_at || ''}:${autoSubmitted ? 'auto' : 'manual'}`;
+    if (finalSubmitPersistedRef.current && !autoSubmitted) return true;
+    setFinalExamSaving(true);
+    setFinalExamSaveError('');
+    try {
+      const ok = onFinalExamSubmit ? await onFinalExamSubmit(snapshot) : true;
+      if (ok) finalSubmitPersistedRef.current = submitKey;
+      else setFinalExamSaveError('Bài đã được chấm trên màn hình nhưng chưa đồng bộ được điểm lên hệ thống. Hãy giữ màn hình và thử lại.');
+      return Boolean(ok);
+    } catch (error) {
+      setFinalExamSaveError(error instanceof Error ? error.message : 'Không đồng bộ được điểm bài kiểm tra.');
+      return false;
+    } finally {
+      setFinalExamSaving(false);
+    }
+  };
+
+  const submitFinalExam = async (force = false) => {
+    if (finalQuizLockedForStudent) {
+      setSubmitConfirmState(null);
+      goToFirstIncompleteSection();
+      return;
+    }
     if (!force) {
       setSubmitConfirmState({ unanswered: unansweredFinalQuestions.length, total: activeFinalQuiz.length });
       return;
     }
+    if (finalExamSaving) return;
     setSubmitConfirmState(null);
+    // Chốt trạng thái hiển thị trước, sau đó ghi điểm chính thức ngay lên Firestore.
     setExamSubmitted(true);
     setExamAutoSubmitted(false);
+    await persistSubmittedExam(false);
   };
 
   const retryFinalExam = () => {
@@ -1102,6 +1221,8 @@ export default function LessonViewer({
     setExamStarted(false);
     setExamSubmitted(false);
     setExamAutoSubmitted(false);
+    setFinalExamSaveError('');
+    finalSubmitPersistedRef.current = '';
     setExamElapsedSeconds(0);
     setFocusedExamIndex(0);
     setExamReviewMarks({});
@@ -1225,7 +1346,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
             <div className="rounded-2xl bg-white px-4 py-3 text-indigo-800 shadow-sm"><p className="text-xs font-bold uppercase">Hoạt động</p><p className="mt-1 text-xl font-black">{sections.length}</p></div>
             <div className="rounded-2xl bg-white px-4 py-3 text-fuchsia-800 shadow-sm"><p className="text-xs font-bold uppercase">Tương tác</p><p className="mt-1 text-xl font-black">{allInteractiveQuestions.length}</p></div>
             <div className="rounded-2xl bg-white px-4 py-3 text-emerald-800 shadow-sm"><p className="text-xs font-bold uppercase">Cuối bài</p><p className="mt-1 text-xl font-black">{finalQuiz.length}</p></div>
-            <div className="rounded-2xl bg-white px-4 py-3 text-amber-800 shadow-sm"><p className="text-xs font-bold uppercase">Điểm đạt</p><p className="mt-1 text-xl font-black">{passScore}/10</p></div>
+            <div className="rounded-2xl bg-white px-4 py-3 text-amber-800 shadow-sm"><p className="text-xs font-bold uppercase">Mức đạt</p><p className="mt-1 text-xl font-black">≥ {passScore}/10</p></div>
           </div>
         </div>
       </section>
@@ -1244,9 +1365,9 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                 <p className="mt-1 text-xs font-semibold">{preparationStatus === 'prepared' ? 'Có chuẩn bị bài' : preparationStatus === 'late_completed' ? 'Đã xem đủ nhưng hoàn thành muộn' : Number(progress?.pre_lesson_watch_percent || 0) > 0 ? 'Đang chuẩn bị' : 'Chưa chuẩn bị'}</p>
               </div>
               <div className="rounded-2xl bg-white px-4 py-3 text-fuchsia-800 ring-1 ring-fuchsia-100">
-                <p className="text-[11px] font-black uppercase tracking-[0.12em]">Điểm chuẩn bị</p>
-                <p className="mt-1 text-lg font-black">{preparationScoreEnabled ? `${preparationScore.toFixed(1)}/10` : 'Không tính'}</p>
-                <p className="mt-1 text-xs font-semibold">{preparationScoreEnabled ? `Trọng số ${preparationWeight}%` : 'Giáo viên chưa bật tính điểm'}</p>
+                <p className="text-[11px] font-black uppercase tracking-[0.12em]">Đánh giá chuẩn bị</p>
+                <p className="mt-1 text-lg font-black">{preparationStatus === 'prepared' ? 'Đã chuẩn bị' : preparationStatus === 'late_completed' ? 'Hoàn thành muộn' : preparationStatus === 'in_progress' ? 'Đang chuẩn bị' : 'Chưa chuẩn bị'}</p>
+                <p className="mt-1 text-xs font-semibold">Không cộng vào điểm bài học</p>
               </div>
             </div>
           </div>
@@ -1271,8 +1392,8 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
           {sections.map((section) => {
             const sp = computedSectionProgress[section.section_id] || createSectionProgress(section);
             const done = sp.status === 'completed';
-            if (section.locked && currentUserRole === 'student') return <div key={section.section_id} className="rounded-2xl bg-slate-100 px-4 py-3 text-sm font-semibold text-slate-500"><LockKeyhole className="mr-2 inline h-4 w-4" /> {section.title} • Giáo viên chưa mở</div>;
-            return <div key={section.section_id} className={`rounded-2xl px-4 py-3 text-sm ${done ? 'bg-emerald-50 text-emerald-800' : 'bg-rose-50 text-rose-800'}`}>{done ? '✓' : '!' } {section.title} • {sp.timeSpentSeconds}/{sp.requiredSeconds}s • {sp.interactionCount}/{section.interactive_questions?.length || 0} câu{done && Number.isFinite(Number(sp.section_score)) ? ` • ${Number(sp.section_score).toFixed(1)}/10` : ''}</div>;
+            if (isSectionLockedForStudent(section)) return <div key={section.section_id} className="rounded-2xl bg-slate-100 px-4 py-3 text-sm font-semibold text-slate-500"><LockKeyhole className="mr-2 inline h-4 w-4" /> {section.title} • Giáo viên chưa mở</div>;
+            return <div key={section.section_id} className={`rounded-2xl px-4 py-3 text-sm ${done ? 'bg-emerald-50 text-emerald-800' : 'bg-rose-50 text-rose-800'}`}>{done ? '✓' : '!' } {section.title} • {sp.timeSpentSeconds}/{sp.requiredSeconds}s • {sp.interactionCount}/{section.interactive_questions?.length || 0} câu{done ? ' • Hoàn thành' : ''}</div>;
           })}
         </div>
       </section>
@@ -1292,8 +1413,8 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
     const pages = section.pages || [];
     const firstPage = pages[0] || null;
     const classLabel = teachingClassOptions.find((item) => item.lop_id === teachingClassId)?.ten_lop || teachingClassId;
-    const releasedForClass = releasedActivityIds.has(section.section_id);
-    if (section.locked && currentUserRole === 'student') {
+    const releasedForClass = selfStudyMode || releasedActivityIds.has(section.section_id);
+    if (isSectionLockedForStudent(section)) {
       return <section className="rounded-[28px] bg-white p-8 text-center shadow-sm ring-1 ring-slate-100"><LockKeyhole className="mx-auto h-10 w-10 text-slate-400" /><h3 className="mt-4 text-xl font-black text-slate-900">Hoạt động chưa được mở</h3><p className="mt-2 text-sm text-slate-500">Giáo viên sẽ mở hoạt động này khi lớp học đến nội dung tương ứng.</p></section>;
     }
     return (
@@ -1306,9 +1427,9 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                   {teachingClassOptions.map((item) => <option key={item.lop_id} value={item.lop_id}>{item.ten_lop || item.lop_id} • {item.lop_id}</option>)}
                 </select>
               </label>
-              <button type="button" disabled={!teachingClassId || teachingSessionBusy} onClick={() => void toggleActivityAccessForClass(section, !releasedForClass, firstPage?.page_id)} className={`inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-black text-white shadow-sm disabled:opacity-50 ${releasedForClass ? 'bg-rose-600 hover:bg-rose-700' : 'bg-emerald-600 hover:bg-emerald-700'}`}>{releasedForClass ? <LockKeyhole className="h-4 w-4" /> : <UnlockKeyhole className="h-4 w-4" />}{releasedForClass ? `Khóa mục đối với ${classLabel || 'lớp'}` : `Mở mục cho ${classLabel || 'lớp'}`}</button>
+              <button type="button" disabled={!teachingClassId || teachingSessionBusy || selfStudyMode} onClick={() => void toggleActivityAccessForClass(section, !releasedForClass, firstPage?.page_id)} className={`inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-black text-white shadow-sm disabled:opacity-50 ${releasedForClass ? 'bg-rose-600 hover:bg-rose-700' : 'bg-emerald-600 hover:bg-emerald-700'}`}>{releasedForClass ? <LockKeyhole className="h-4 w-4" /> : <UnlockKeyhole className="h-4 w-4" />}{selfStudyMode ? 'Đang mở tự học' : releasedForClass ? `Khóa mục đối với ${classLabel || 'lớp'}` : `Mở mục cho ${classLabel || 'lớp'}`}</button>
               {releasedForClass ? <button type="button" disabled={teachingSessionBusy} onClick={() => void presentActivityForClass(section, firstPage?.page_id)} className="rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-black text-white shadow-sm hover:bg-indigo-700 disabled:opacity-50">Trình bày mục này</button> : null}
-              <span className={`rounded-xl px-3 py-2.5 text-xs font-bold ${releasedForClass ? 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-100' : 'bg-slate-100 text-slate-600 ring-1 ring-slate-200'}`}>{releasedForClass ? 'Học sinh được phép mở' : 'Đang khóa đối với học sinh'}</span>
+              <span className={`rounded-xl px-3 py-2.5 text-xs font-bold ${releasedForClass ? 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-100' : 'bg-slate-100 text-slate-600 ring-1 ring-slate-200'}`}>{selfStudyMode ? 'Tự học: tất cả mục đang mở' : releasedForClass ? 'Học sinh được phép mở' : 'Đang khóa đối với học sinh'}</span>
             </div>
             {teachingSessionError ? <p className="mt-2 text-xs font-bold text-rose-700">{teachingSessionError}</p> : null}
           </section>
@@ -1320,7 +1441,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
               {currentUserRole === 'student' ? (
                 <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-bold ${isComplete ? 'bg-emerald-100 text-emerald-700' : needsWork ? 'bg-rose-100 text-rose-700' : 'bg-amber-100 text-amber-700'}`}>
                   {isComplete ? <CheckCircle2 className="h-4 w-4" /> : <AlertTriangle className="h-4 w-4" />}
-                  {isComplete ? `Đã hoàn thành • ${Number(sp.section_score || 0).toFixed(1)}/10` : needsWork ? 'Chưa hoàn thành' : 'Đang học'}
+                  {isComplete ? 'Đã hoàn thành • Không tính điểm' : needsWork ? 'Chưa hoàn thành' : 'Đang học'}
                 </span>
               ) : (
                 <span className="rounded-full bg-white px-3 py-1 text-xs font-bold text-slate-600 shadow-sm ring-1 ring-slate-200">Giảng dạy</span>
@@ -1422,6 +1543,22 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
       setExamReviewMarks((prev) => ({ ...prev, [questionKey]: !prev[questionKey] }));
     };
 
+    if (finalQuizLockedForStudent) {
+      return (
+        <section className="rounded-[22px] border border-amber-200 bg-white p-5 shadow-sm ring-1 ring-amber-100 sm:rounded-[28px] sm:p-6">
+          <div className="flex items-start gap-4">
+            <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-amber-100 text-amber-700"><LockKeyhole className="h-6 w-6" /></div>
+            <div className="min-w-0">
+              <p className="text-xs font-black uppercase tracking-[0.16em] text-amber-700">Chưa đủ điều kiện kiểm tra</p>
+              <h3 className="mt-2 text-xl font-black text-slate-900">Hoàn thành tất cả mục học tập trước khi làm kiểm tra cuối bài</h3>
+              <p className="mt-2 text-sm leading-7 text-slate-600">Em còn <b>{incompleteSectionTitles.length}</b> mục chưa hoàn thành. Các mục học tập chỉ ghi nhận tiến độ, không tính điểm. Điểm duy nhất của bài học là điểm kiểm tra cuối bài sau khi em bấm Nộp bài.</p>
+              <button type="button" onClick={goToFirstIncompleteSection} className="mt-4 inline-flex items-center gap-2 rounded-2xl bg-amber-600 px-4 py-2.5 text-sm font-black text-white hover:bg-amber-700"><BookOpen className="h-4 w-4" /> Học tiếp mục chưa hoàn thành</button>
+            </div>
+          </div>
+        </section>
+      );
+    }
+
     if (!examStarted) {
       return (
         <section className="rounded-[22px] bg-white p-4 shadow-sm ring-1 ring-slate-100 sm:rounded-[28px] sm:p-6">
@@ -1437,12 +1574,6 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
               <p><span className="font-bold">Lần làm:</span> {examAttemptNumber}/{maxAttempts}</p>
             </div>
           </div>
-          {incompleteSectionTitles.length ? (
-            <div className="mt-5 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-4 text-sm leading-7 text-rose-800">
-              <p className="font-bold">Em còn {incompleteSectionTitles.length} nội dung chưa hoàn thành.</p>
-              <p>Em vẫn có thể bắt đầu kiểm tra, nhưng bài học chỉ được công nhận hoàn thành khi các nội dung học đều có check xanh.</p>
-            </div>
-          ) : null}
           <div className="mt-5 grid gap-3 text-sm leading-7 text-slate-700 md:grid-cols-2">
             <div className="rounded-2xl bg-emerald-50 px-4 py-3 text-emerald-800">✓ Hết giờ hệ thống sẽ tự động nộp bài.</div>
             <div className="rounded-2xl bg-amber-50 px-4 py-3 text-amber-800">✓ Khi nộp bài, hệ thống sẽ cảnh báo nếu còn câu chưa làm.</div>
@@ -1544,7 +1675,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                 <button type="button" onClick={() => scrollToExamQuestion(Math.max(0, focusedExamIndex - 1))} className="rounded-2xl bg-slate-50 px-4 py-3 text-sm font-bold text-slate-700 ring-1 ring-slate-200 hover:bg-slate-100">Câu trước</button>
                 <button type="button" onClick={() => scrollToExamQuestion(Math.min(activeFinalQuiz.length - 1, focusedExamIndex + 1))} className="rounded-2xl bg-slate-50 px-4 py-3 text-sm font-bold text-slate-700 ring-1 ring-slate-200 hover:bg-slate-100">Câu tiếp</button>
               </div>
-              <button onClick={() => submitFinalExam(false)} className="inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-emerald-600 px-5 py-3 text-sm font-black text-white shadow-lg shadow-emerald-200 hover:bg-emerald-700"><ListChecks className="h-5 w-5" /> Nộp bài</button>
+              <button disabled={finalExamSaving} onClick={() => void submitFinalExam(false)} className="inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-emerald-600 px-5 py-3 text-sm font-black text-white shadow-lg shadow-emerald-200 hover:bg-emerald-700 disabled:cursor-wait disabled:opacity-70"><ListChecks className="h-5 w-5" /> {finalExamSaving ? 'Đang chấm và cập nhật điểm...' : 'Nộp bài'}</button>{finalExamSaveError ? <p className="rounded-xl bg-rose-50 px-3 py-2 text-xs font-bold text-rose-700 ring-1 ring-rose-100">{finalExamSaveError}</p> : null}
             </div>
           </div>
         ) : (
@@ -1553,9 +1684,15 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
               <p className="text-base font-black text-slate-900">Kết quả</p>
               <div className="mx-auto mt-3 rounded-3xl bg-orange-50 px-5 py-5 text-orange-700 ring-1 ring-orange-100">
                 <p className="text-xs font-bold uppercase tracking-[0.2em] text-orange-500">Điểm</p>
-                <p className="mt-1 text-4xl font-black">{finalExamScore.toFixed(1)}<span className="text-xl text-slate-500">/10</span></p>
+                <p className="mt-1 text-4xl font-black">{(finalExamScore ?? 0).toFixed(1)}<span className="text-xl text-slate-500">/10</span></p>
               </div>
               <p className="mt-3 text-sm font-bold text-slate-600">Đúng {metrics.finalCorrect}/{metrics.finalTotal} câu • Thời gian {formatSeconds(examElapsedSeconds)}</p>
+              {finalExamSaveError ? (
+                <div className="mt-4 space-y-2 rounded-2xl bg-rose-50 p-3 text-left ring-1 ring-rose-100">
+                  <p className="text-xs font-bold text-rose-700">{finalExamSaveError}</p>
+                  <button type="button" disabled={finalExamSaving} onClick={() => void persistSubmittedExam(false)} className="w-full rounded-xl bg-rose-600 px-3 py-2 text-xs font-black text-white hover:bg-rose-700 disabled:cursor-wait disabled:opacity-70">{finalExamSaving ? 'Đang đồng bộ...' : 'Thử cập nhật điểm lại'}</button>
+                </div>
+              ) : null}
             </div>
 
             <div className="rounded-3xl bg-slate-50 p-4 ring-1 ring-slate-100">
@@ -1634,7 +1771,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
   };
 
 
-  const renderResult = () => <LessonResultSummary score={score} passScore={passScore} correct={metrics.correct} total={metrics.total} interactiveCorrect={metrics.interactiveCorrect} interactiveTotal={metrics.interactiveTotal} finalCorrect={metrics.finalCorrect} finalTotal={metrics.finalTotal} completedSections={completedSectionsCount} totalSections={sections.length} incompleteSections={incompleteSectionTitles} learningProcessScore={learningProcessScore} finalExamScore={finalExamScore} learningWeight={weightedAssessment.learningComponentWeight} finalWeight={weightedAssessment.finalComponentWeight} preparationScore={preparationScore} preparationWeight={weightedAssessment.preparationWeight} preparationStatus={preparationStatus} onReviewIncomplete={goToFirstIncompleteSection} onRetry={content?.settings?.allow_retry !== false ? () => setAnswerStates({}) : undefined} />;
+  const renderResult = () => <LessonResultSummary score={score} scoreStatus={weightedAssessment.scoreStatus} passScore={passScore} finalCorrect={metrics.finalCorrect} finalTotal={metrics.finalTotal} finalExamSubmitted={examSubmitted} completedSections={completedSectionsCount} totalSections={sections.length} incompleteSections={incompleteSectionTitles} finalExamScore={finalExamScore} preparationStatus={preparationStatus} preparationWatchPercent={Number(progress?.pre_lesson_watch_percent || 0)} onReviewIncomplete={goToFirstIncompleteSection} onRetry={content?.settings?.allow_retry !== false ? () => setAnswerStates({}) : undefined} />;
 
 
   const renderSubmitConfirmDialog = () => {
@@ -1656,7 +1793,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
           </div>
           <div className="flex flex-wrap justify-end gap-3 border-t border-slate-100 px-6 py-4">
             <button type="button" onClick={() => setSubmitConfirmState(null)} className="rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-bold text-slate-600 hover:bg-slate-50">Quay lại làm tiếp</button>
-            <button type="button" onClick={() => submitFinalExam(true)} className="rounded-2xl bg-emerald-600 px-5 py-2.5 text-sm font-black text-white shadow-lg shadow-emerald-200 hover:bg-emerald-700">Nộp bài</button>
+            <button type="button" disabled={finalExamSaving} onClick={() => void submitFinalExam(true)} className="rounded-2xl bg-emerald-600 px-5 py-2.5 text-sm font-black text-white shadow-lg shadow-emerald-200 hover:bg-emerald-700 disabled:cursor-wait disabled:opacity-70">{finalExamSaving ? 'Đang cập nhật điểm...' : 'Nộp bài'}</button>
           </div>
         </motion.div>
       </div>
@@ -1821,9 +1958,8 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
           time_spent_seconds: examElapsedSeconds,
           status: examSubmitted ? (examAutoSubmitted ? 'auto_submitted' : 'submitted') : examStarted ? 'in_progress' : 'not_started',
           score: finalExamScore,
-          total_score: score,
-          learning_process_score: learningProcessScore,
-          correct_count: metrics.finalCorrect,
+          total_score: weightedAssessment.finalScore ?? weightedAssessment.currentScore,
+            correct_count: metrics.finalCorrect,
           total_count: metrics.finalTotal,
           unanswered_count: activeFinalQuiz.filter((question, index) => !answerStates[getQuestionKey(question, index + allInteractiveQuestions.length)]?.submitted).length,
           attempt_number: examAttemptNumber,
@@ -1874,6 +2010,14 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
               </div>
             </div>
           </div>
+          {attemptMode === 'retake' ? (
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-violet-200 bg-violet-50 px-4 py-2.5 text-sm text-violet-900 lg:px-6">
+              <span className="inline-flex items-center gap-2 font-black"><RotateCcw className="h-4 w-4" /> PHIÊN HỌC LẠI {retakeAttemptNumber ? `#${retakeAttemptNumber}` : ''}</span>
+              <span className="font-semibold">{retakeIsOfficial ? `Điểm lần nộp mới sẽ thay thế điểm chính thức${Number.isFinite(Number(officialScore)) ? ` ${Number(officialScore).toFixed(1)}/10` : ''}; điểm cũ vẫn được lưu lịch sử.` : `Điểm lần này chỉ mang tính tham khảo${Number.isFinite(Number(officialScore)) ? ` • Điểm chính thức: ${Number(officialScore).toFixed(1)}/10` : ''}.`}</span>
+            </div>
+          ) : attemptMode === 'review' ? (
+            <div className="border-b border-sky-200 bg-sky-50 px-4 py-2.5 text-center text-sm font-bold text-sky-800 lg:px-6">Đang xem lại kết quả chính thức • thao tác trong màn hình này không ghi đè kết quả đã chốt.</div>
+          ) : null}
           <div className="grid flex-1 grid-cols-1 overflow-hidden xl:grid-cols-[300px_minmax(0,1fr)]">
             <aside className="hidden overflow-y-auto border-r border-slate-100 bg-slate-50/70 p-4 xl:block">
               <div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-slate-100">
@@ -1883,18 +2027,18 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                   {sections.map((section, index) => {
                     const sp = computedSectionProgress[section.section_id] || createSectionProgress(section);
                     const active = activeStep === section.section_id;
-                    const locked = currentUserRole === 'student' && section.locked;
+                    const locked = isSectionLockedForStudent(section);
                     return (
                       <button key={section.section_id || index} disabled={locked} onClick={() => selectStep(section.section_id)} className={`flex w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold transition ${locked ? 'cursor-not-allowed bg-slate-100 text-slate-400' : statusClasses(sp.status, active)}`}>
                         <span className="shrink-0">{locked ? <LockKeyhole className="h-4 w-4" /> : sp.status === 'completed' ? '✓' : sp.status === 'need_interaction' ? '!' : sp.status === 'viewing' ? '…' : '○'}</span>
                         <span className="line-clamp-2 flex-1">{section.title}</span>
-                        <span className="ml-auto shrink-0 text-xs opacity-80">{locked ? 'chưa mở' : sp.status === 'completed' ? `${Number(sp.section_score || 0).toFixed(1)}/10` : `${sp.interactionCount}/${section.interactive_questions?.length || 0}`}</span>
+                        <span className="ml-auto shrink-0 text-xs opacity-80">{locked ? 'chưa mở' : sp.status === 'completed' ? 'Hoàn thành' : sp.status === 'need_interaction' ? 'Cần tương tác' : sp.status === 'viewing' ? 'Đang học' : 'Chưa học'}</span>
                       </button>
                     );
                   })}
-                  <button onClick={() => selectStep('final_quiz')} className={`flex w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold transition ${activeStep === 'final_quiz' ? 'bg-emerald-600 text-white' : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'}`}>Kiểm tra cuối bài<span className="ml-auto text-xs opacity-70">{finalQuiz.length} câu</span></button>
+                  <button disabled={finalQuizLockedForStudent} onClick={() => selectStep('final_quiz')} className={`flex w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold transition ${finalQuizLockedForStudent ? 'cursor-not-allowed bg-slate-100 text-slate-400' : activeStep === 'final_quiz' ? 'bg-emerald-600 text-white' : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'}`}>{finalQuizLockedForStudent ? <LockKeyhole className="h-4 w-4" /> : null}Kiểm tra cuối bài<span className="ml-auto text-xs opacity-70">{finalQuizLockedForStudent ? `còn ${incompleteSectionTitles.length} mục` : `${finalQuiz.length} câu`}</span></button>
                   <button onClick={() => selectStep('comments')} className={`flex w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold transition ${activeStep === 'comments' ? 'bg-fuchsia-600 text-white' : 'bg-fuchsia-50 text-fuchsia-700 hover:bg-fuchsia-100'}`}><MessageSquareText className="h-4 w-4" /> Bình luận/Câu hỏi<span className="ml-auto text-xs opacity-80">{topLevelComments.length}</span></button>
-                  <button onClick={() => selectStep('result')} className={`flex w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold transition ${activeStep === 'result' ? 'bg-amber-500 text-white' : 'bg-amber-50 text-amber-700 hover:bg-amber-100'}`}>Kết quả<span className="ml-auto text-xs opacity-70">{score.toFixed(1)}/10</span></button>
+                  <button onClick={() => selectStep('result')} className={`flex w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold transition ${activeStep === 'result' ? 'bg-amber-500 text-white' : 'bg-amber-50 text-amber-700 hover:bg-amber-100'}`}>Kết quả<span className="ml-auto text-xs opacity-70">{weightedAssessment.scoreStatus === 'finalized' ? `${score.toFixed(1)}/10` : '--/10'}</span></button>
                 </div>
               </div>
             </aside>
@@ -1929,18 +2073,18 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                       {sections.map((section, index) => {
                         const sp = computedSectionProgress[section.section_id] || createSectionProgress(section);
                         const active = activeStep === section.section_id;
-                        const locked = currentUserRole === 'student' && section.locked;
+                        const locked = isSectionLockedForStudent(section);
                         return (
                           <button key={section.section_id || index} disabled={locked} onClick={() => selectStep(section.section_id)} className={`flex min-h-12 w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold transition ${locked ? 'cursor-not-allowed bg-slate-100 text-slate-400' : statusClasses(sp.status, active)}`}>
                             <span className="shrink-0">{locked ? <LockKeyhole className="h-4 w-4" /> : sp.status === 'completed' ? '✓' : sp.status === 'need_interaction' ? '!' : sp.status === 'viewing' ? '…' : '○'}</span>
                             <span className="line-clamp-2 flex-1">{section.title}</span>
-                            <span className="ml-auto shrink-0 text-xs opacity-80">{locked ? 'chưa mở' : sp.status === 'completed' ? `${Number(sp.section_score || 0).toFixed(1)}/10` : `${sp.interactionCount}/${section.interactive_questions?.length || 0}`}</span>
+                            <span className="ml-auto shrink-0 text-xs opacity-80">{locked ? 'chưa mở' : sp.status === 'completed' ? 'Hoàn thành' : sp.status === 'need_interaction' ? 'Cần tương tác' : sp.status === 'viewing' ? 'Đang học' : 'Chưa học'}</span>
                           </button>
                         );
                       })}
-                      <button onClick={() => selectStep('final_quiz')} className={`flex min-h-12 w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold ${activeStep === 'final_quiz' ? 'bg-emerald-600 text-white' : 'bg-emerald-50 text-emerald-700'}`}>Kiểm tra cuối bài<span className="ml-auto text-xs opacity-70">{finalQuiz.length} câu</span></button>
+                      <button disabled={finalQuizLockedForStudent} onClick={() => selectStep('final_quiz')} className={`flex min-h-12 w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold ${finalQuizLockedForStudent ? 'cursor-not-allowed bg-slate-100 text-slate-400' : activeStep === 'final_quiz' ? 'bg-emerald-600 text-white' : 'bg-emerald-50 text-emerald-700'}`}>{finalQuizLockedForStudent ? <LockKeyhole className="h-4 w-4" /> : null}Kiểm tra cuối bài<span className="ml-auto text-xs opacity-70">{finalQuizLockedForStudent ? `còn ${incompleteSectionTitles.length} mục` : `${finalQuiz.length} câu`}</span></button>
                       <button onClick={() => selectStep('comments')} className={`flex min-h-12 w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold ${activeStep === 'comments' ? 'bg-fuchsia-600 text-white' : 'bg-fuchsia-50 text-fuchsia-700'}`}><MessageSquareText className="h-4 w-4" /> Bình luận/Câu hỏi<span className="ml-auto text-xs opacity-80">{topLevelComments.length}</span></button>
-                      <button onClick={() => selectStep('result')} className={`flex min-h-12 w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold ${activeStep === 'result' ? 'bg-amber-500 text-white' : 'bg-amber-50 text-amber-700'}`}>Kết quả<span className="ml-auto text-xs opacity-70">{score.toFixed(1)}/10</span></button>
+                      <button onClick={() => selectStep('result')} className={`flex min-h-12 w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold ${activeStep === 'result' ? 'bg-amber-500 text-white' : 'bg-amber-50 text-amber-700'}`}>Kết quả<span className="ml-auto text-xs opacity-70">{weightedAssessment.scoreStatus === 'finalized' ? `${score.toFixed(1)}/10` : '--/10'}</span></button>
                     </div>
                   </div>
                 </motion.aside>
@@ -1953,7 +2097,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
               <div className="grid grid-cols-[1fr_1.2fr_1fr] gap-2">
                 <button type="button" disabled={!previousNavigationStep} onClick={() => previousNavigationStep && selectStep(previousNavigationStep)} className="flex min-h-11 items-center justify-center gap-1 rounded-xl bg-slate-100 px-2 text-xs font-black text-slate-700 disabled:opacity-35"><ChevronLeft className="h-4 w-4" /> Trước</button>
                 <button type="button" onClick={() => setMobileMenuOpen(true)} className="flex min-h-11 min-w-0 items-center justify-center gap-1.5 rounded-xl bg-indigo-50 px-2 text-xs font-black text-indigo-700 ring-1 ring-indigo-100"><Menu className="h-4 w-4" /><span className="truncate">{activeStepLabel}</span></button>
-                <button type="button" disabled={!nextNavigationStep} onClick={() => nextNavigationStep && selectStep(nextNavigationStep)} className="flex min-h-11 items-center justify-center gap-1 rounded-xl bg-indigo-600 px-2 text-xs font-black text-white disabled:opacity-35">Sau <ChevronRight className="h-4 w-4" /></button>
+                <button type="button" disabled={!nextNavigationStep || nextNavigationLocked} onClick={() => nextNavigationStep && !nextNavigationLocked && selectStep(nextNavigationStep)} className="flex min-h-11 items-center justify-center gap-1 rounded-xl bg-indigo-600 px-2 text-xs font-black text-white disabled:opacity-35">Sau <ChevronRight className="h-4 w-4" /></button>
               </div>
             </div>
           ) : null}

@@ -1,6 +1,6 @@
 import { AI_MODELS, BACKEND_URL, DEFAULT_VIDEO_POPUP_CONFIG, VIDEO_CONFIG_STORAGE_KEY } from '../constants';
 import { normalizeGradeScope } from '../utils/gradeScope';
-import { AIConfig, Account, ApiResponse, CatalogClass, CatalogResponse, CoLearningPartnerCredential, CoLearningSession, GoogleSlidesPromptDetailResponse, GoogleSlidesPromptRecord, GoogleSlidesPromptSaveResponse, LearningResultModerationPayload, LearningResultModerationSummary, LessonBuilderDefaultsResponse, LessonBuilderSettings, LessonComment, LessonComposerValues, LessonContentResponse, LessonProgressRecord, LessonRow, PendingShareItem, ReviewPracticeAttempt, ReviewPracticeContentResponse, ReviewPracticeResultStudent, ReviewPracticeResultsResponse, ReviewPracticeRow, SchoolYear, SchoolYearTransferPayload, SchoolYearTransferSummary, MoveStudentsPayload, MoveStudentsSummary, StudentLearningAnalyticsRow, Subject, SystemDiagnostics, SystemDiagnosticIssue, SystemDiagnosticSection, User, VideoPopupConfig, PreLessonProgress, TeachingSession } from '../types';
+import { AIConfig, Account, ApiResponse, CatalogClass, CatalogResponse, CoLearningPartnerCredential, CoLearningSession, GoogleSlidesPromptDetailResponse, GoogleSlidesPromptRecord, GoogleSlidesPromptSaveResponse, LearningResultModerationPayload, LearningResultModerationSummary, LessonBuilderDefaultsResponse, LessonBuilderSettings, LessonComment, LessonComposerValues, LessonContentResponse, LessonProgressRecord, LessonRow, PendingShareItem, ReviewPracticeAttempt, ReviewPracticeContentResponse, ReviewPracticeResultStudent, ReviewPracticeResultsResponse, ReviewPracticeRow, SchoolYear, SchoolYearTransferPayload, SchoolYearTransferSummary, MoveStudentsPayload, MoveStudentsSummary, StudentLearningAnalyticsRow, Subject, SystemDiagnostics, SystemDiagnosticIssue, SystemDiagnosticSection, User, VideoPopupConfig, PreLessonProgress, TeachingSession, LessonRetakeAttempt, LessonAccessMode } from '../types';
 import {
   FIREBASE_SCHOOL_ID,
   getFirebaseIdToken,
@@ -29,6 +29,12 @@ import {
   listFirebaseLessons,
   saveFirebaseLesson,
   setFirebaseLessonLock,
+  setFirebaseLessonAccessMode,
+  startFirebaseLessonRetake,
+  saveFirebaseLessonRetake,
+  finalizeFirebaseOfficialRetake,
+  finalizeFirebaseDeadlineZeros,
+  listFirebaseLessonRetakes,
   submitFirebaseLessonReview,
   listFirebaseProgress,
   saveFirebaseProgress,
@@ -440,6 +446,8 @@ function normalizeLessonRow(raw: any): LessonRow {
     cho_phep_hoc_sau_han: raw?.cho_phep_hoc_sau_han,
     cho_phep_nop_sau_han: raw?.cho_phep_nop_sau_han,
     is_locked: raw?.is_locked === true,
+    access_mode: raw?.access_mode === 'self_study' ? 'self_study' : 'teacher_controlled',
+    allow_retake_after_completion: raw?.allow_retake_after_completion === true,
     locked_at: toCleanString(raw?.locked_at),
     locked_by_uid: toCleanString(raw?.locked_by_uid),
     locked_by_name: toCleanString(raw?.locked_by_name),
@@ -450,8 +458,9 @@ function normalizeLessonRow(raw: any): LessonRow {
     pre_lesson_required: raw?.pre_lesson_required === true,
     pre_lesson_completion_threshold: Number.isFinite(Number(raw?.pre_lesson_completion_threshold)) ? Math.max(50, Math.min(100, Number(raw?.pre_lesson_completion_threshold))) : 80,
     pre_lesson_deadline: toCleanString(raw?.pre_lesson_deadline),
-    pre_lesson_score_enabled: raw?.pre_lesson_score_enabled !== false && raw?.pre_lesson_enabled !== false,
-    pre_lesson_score_weight: Number.isFinite(Number(raw?.pre_lesson_score_weight)) ? Math.max(0, Math.min(30, Number(raw.pre_lesson_score_weight))) : 10,
+    // V6.79.0: video chuẩn bị chỉ tạo trạng thái, không còn là thành phần điểm.
+    pre_lesson_score_enabled: false,
+    pre_lesson_score_weight: 0,
     content_schema_version: toCleanString(raw?.content_schema_version || raw?.lesson_schema_version) as any,
     builder_settings: raw?.builder_settings && typeof raw.builder_settings === 'object' ? raw.builder_settings : undefined,
     created_at: toCleanString(raw?.created_at),
@@ -703,12 +712,34 @@ function normalizeLessonProgressRecord(raw: any): LessonProgressRecord {
     assessment_score: raw?.assessment_score === undefined || raw?.assessment_score === null
       ? undefined
       : Number(raw.assessment_score),
+    learning_process_score: raw?.learning_process_score === undefined || raw?.learning_process_score === null ? undefined : Number(raw.learning_process_score),
+    final_quiz_score: raw?.final_quiz_score === undefined || raw?.final_quiz_score === null ? undefined : Number(raw.final_quiz_score),
+    current_score: raw?.current_score === undefined || raw?.current_score === null ? undefined : Number(raw.current_score),
+    score_status: ['finalized', 'not_applicable'].includes(toCleanString(raw?.score_status))
+      ? toCleanString(raw.score_status) as any
+      : 'in_progress',
+    score_model_version: Number(raw?.score_model_version || 0) || undefined,
+    scored_section_count: raw?.scored_section_count === undefined || raw?.scored_section_count === null ? undefined : Number(raw.scored_section_count),
+    scorable_section_count: raw?.scorable_section_count === undefined || raw?.scorable_section_count === null ? undefined : Number(raw.scorable_section_count),
+    preparation_score: Number(raw?.score_model_version || 0) >= 3 ? 0 : (raw?.preparation_score === undefined || raw?.preparation_score === null ? undefined : Number(raw.preparation_score)),
+    preparation_weight: Number(raw?.score_model_version || 0) >= 3 ? 0 : (raw?.preparation_weight === undefined || raw?.preparation_weight === null ? undefined : Number(raw.preparation_weight)),
     result_state: ['cancelled_retake', 'invalid_cheating'].includes(toCleanString(raw?.result_state))
       ? toCleanString(raw.result_state) as any
       : 'valid',
     result_group_id: toCleanString(raw?.result_group_id),
     result_version: Number(raw?.result_version || 0),
     retake_allowed: raw?.retake_allowed !== false,
+    official_retake_remaining: Number(raw?.official_retake_remaining || 0),
+    official_retake_grant_id: toCleanString(raw?.official_retake_grant_id),
+    official_retake_granted_at: toCleanString(raw?.official_retake_granted_at),
+    official_retake_granted_by_uid: toCleanString(raw?.official_retake_granted_by_uid),
+    official_retake_granted_by_name: toCleanString(raw?.official_retake_granted_by_name),
+    official_retake_last_consumed_at: toCleanString(raw?.official_retake_last_consumed_at),
+    official_retake_count: Number(raw?.official_retake_count || 0),
+    previous_official_score: raw?.previous_official_score === undefined || raw?.previous_official_score === null ? undefined : Number(raw.previous_official_score),
+    score_reason: toCleanString(raw?.score_reason),
+    deadline_status: toCleanString(raw?.deadline_status),
+    deadline_finalized_at: toCleanString(raw?.deadline_finalized_at),
     invalidated_reason: toCleanString(raw?.invalidated_reason),
     invalidated_at: toCleanString(raw?.invalidated_at),
     invalidated_by_uid: toCleanString(raw?.invalidated_by_uid),
@@ -1079,8 +1110,8 @@ function normalizeLessonBuilderSettings(raw: any): LessonBuilderSettings | null 
     include_summary: normalizeBoolean(raw.include_summary, true),
     allow_retry: normalizeBoolean(raw.allow_retry, true),
     show_explanation: normalizeBoolean(raw.show_explanation, true),
-    interactive_weight: toNumber(raw.interactive_weight, 40, 0, 100),
-    final_quiz_weight: toNumber(raw.final_quiz_weight, 60, 0, 100),
+    interactive_weight: 0,
+    final_quiz_weight: 100,
     pass_score: toNumber(raw.pass_score, 5, 0, 10),
     ai_instructions: toCleanString(raw.ai_instructions),
     lesson_time_minutes: toNumber(raw.lesson_time_minutes, 45, 1, 240),
@@ -2028,6 +2059,36 @@ export async function setLessonLockApi(_token: string, lesson_id: string, locked
   }
 }
 
+export async function setLessonAccessModeApi(_token: string, lesson_id: string, mode: LessonAccessMode): Promise<ApiResponse<LessonRow>> {
+  try {
+    const saved = await setFirebaseLessonAccessMode(lesson_id, mode);
+    return { ok: true, message: mode === 'self_study' ? 'Đã mở chế độ tự học nhanh.' : 'Đã chuyển sang chế độ giáo viên điều khiển.', data: normalizeLessonRow(saved) };
+  } catch (error) {
+    return { ok: false, message: firebaseErrorMessage(error), error };
+  }
+}
+
+export async function startLessonRetakeApi(_token: string, lesson_id: string, officialProgress: LessonProgressRecord, mode: 'reference' | 'official_update' = 'reference'): Promise<ApiResponse<LessonRetakeAttempt>> {
+  try { return { ok: true, message: mode === 'official_update' ? 'Đã bắt đầu lượt học lại cập nhật điểm.' : 'Đã bắt đầu phiên học lại tham khảo.', data: await startFirebaseLessonRetake(lesson_id, officialProgress, mode) }; }
+  catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
+}
+
+export async function saveLessonRetakeApi(_token: string, attempt: LessonRetakeAttempt): Promise<ApiResponse<LessonRetakeAttempt>> {
+  try { return { ok: true, message: 'Đã lưu kết quả học lại tham khảo.', data: await saveFirebaseLessonRetake(attempt) }; }
+  catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
+}
+
+
+export async function finalizeOfficialLessonRetakeApi(_token: string, attempt: LessonRetakeAttempt): Promise<ApiResponse<LessonProgressRecord>> {
+  try { return { ok: true, message: 'Đã cập nhật điểm chính thức từ lượt học lại.', data: await finalizeFirebaseOfficialRetake(attempt) }; }
+  catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
+}
+
+export async function listLessonRetakesApi(_token: string, lesson_id: string): Promise<ApiResponse<LessonRetakeAttempt[]>> {
+  try { return { ok: true, message: 'Đã tải lịch sử học lại.', data: await listFirebaseLessonRetakes(lesson_id) }; }
+  catch (error) { return { ok: false, message: firebaseErrorMessage(error), error, data: [] }; }
+}
+
 export async function deleteLessonApi(token: string, lesson_id: string) {
   try {
     const deleted = await deleteFirebaseLesson(lesson_id);
@@ -2131,13 +2192,19 @@ export async function moderateLearningResultApi(
     return {
       ok: true,
       message: payload.action === 'allow_retake'
-        ? `Đã hủy kết quả và mở quyền học lại cho ${data.affected_count} học sinh.`
+        ? `Đã cấp 1 quyền học lại để cập nhật điểm cho ${data.affected_count} học sinh.`
         : `Đã hủy kết quả do gian lận và khóa học lại đối với ${data.affected_count} học sinh.`,
       data,
     };
   } catch (error) {
     return { ok: false, message: firebaseErrorMessage(error), error };
   }
+}
+
+
+export async function finalizeDeadlineZerosApi(_token: string, lessons: LessonRow[], students: Account[]) {
+  try { return { ok: true, message: 'Đã đồng bộ điểm 0 quá hạn.', data: await finalizeFirebaseDeadlineZeros(lessons, students) }; }
+  catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
 }
 
 export async function listReviewPracticesApi(token: string, payload: Record<string, unknown> = {}) {

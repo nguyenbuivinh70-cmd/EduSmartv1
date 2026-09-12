@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Clipboard, Cloud, Download, ExternalLink, FileText, History, Loader2, Presentation, Sparkles, X } from 'lucide-react';
+import { Clipboard, Cloud, Download, ExternalLink, FileText, History, KeyRound, Loader2, Presentation, Sparkles, X } from 'lucide-react';
 import { AIConfig, GoogleSlidePromptItem, GoogleSlidesPromptRecord, GoogleSlidesPromptResult, LessonContent, User } from '../types';
 import { generateGoogleSlidesPrompts } from '../services/gemini';
 import { listGoogleSlidesPromptsApi, saveGoogleSlidesPromptApi } from '../services/api';
@@ -158,6 +158,11 @@ export default function GoogleSlidesPromptModal({ isOpen, content, aiConfig, sub
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, user?.token, lessonInfo?.lesson_id]);
 
+  useEffect(() => {
+    if (!aiConfig.apiKey) return;
+    setErrorMessage((current) => /chưa cấu hình API Key/i.test(current) ? '' : current);
+  }, [aiConfig.apiKey]);
+
   const copyText = async (text: string, key: string) => {
     try {
       await navigator.clipboard.writeText(text);
@@ -181,7 +186,7 @@ export default function GoogleSlidesPromptModal({ isOpen, content, aiConfig, sub
       return;
     }
     if (!aiConfig.apiKey) {
-      setErrorMessage('Bạn chưa cấu hình API Key. Hãy mở Cấu hình AI trước khi tạo prompt trình chiếu.');
+      setErrorMessage('Bạn chưa cấu hình API Key. Hãy cấu hình ngay tại cửa sổ này rồi tiếp tục tạo prompt trình chiếu.');
       onOpenConfig('manual');
       return;
     }
@@ -286,7 +291,27 @@ export default function GoogleSlidesPromptModal({ isOpen, content, aiConfig, sub
                     {isGenerating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
                     {isGenerating ? 'AI đang tạo bộ prompt...' : result ? 'Tạo lại prompt bằng AI' : 'AI tạo prompt trình chiếu'}
                   </button>
-                  {errorMessage && <p className="mt-3 rounded-2xl bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-700">{errorMessage}</p>}
+                  {!aiConfig.apiKey && !errorMessage ? (
+                    <div className="mt-3 flex flex-col gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="flex items-start gap-2">
+                        <KeyRound className="mt-0.5 h-4 w-4 shrink-0" />
+                        <span className="font-semibold">Cần Gemini API Key để tạo prompt. Bạn có thể cấu hình ngay mà không đóng cửa sổ Google Slides.</span>
+                      </div>
+                      <button type="button" onClick={() => onOpenConfig('manual')} className="inline-flex shrink-0 items-center justify-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-xs font-black text-white hover:bg-amber-600">
+                        <KeyRound className="h-4 w-4" /> Cấu hình API Key ngay
+                      </button>
+                    </div>
+                  ) : null}
+                  {errorMessage ? (
+                    <div className="mt-3 flex flex-col gap-3 rounded-2xl bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-700 sm:flex-row sm:items-center sm:justify-between">
+                      <span>{errorMessage}</span>
+                      {/api key/i.test(errorMessage) ? (
+                        <button type="button" onClick={() => onOpenConfig(/hết hạn|quota|429|resource_exhausted|rate|limit/i.test(errorMessage) ? 'quota' : 'manual')} className="inline-flex shrink-0 items-center justify-center gap-2 rounded-xl bg-rose-600 px-4 py-2 text-xs font-black text-white hover:bg-rose-700">
+                          <KeyRound className="h-4 w-4" /> {/hết hạn|quota|429|resource_exhausted|rate|limit/i.test(errorMessage) ? 'Đổi API Key ngay' : 'Cấu hình API Key ngay'}
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
                   {driveMessage && <p className="mt-3 rounded-2xl bg-emerald-50 px-4 py-3 text-sm font-semibold text-emerald-700">{driveMessage}</p>}
                 </div>
 

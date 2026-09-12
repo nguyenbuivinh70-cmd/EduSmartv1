@@ -25,8 +25,8 @@ export const DEFAULT_LESSON_BUILDER_SETTINGS: LessonBuilderSettings = {
   include_summary: true,
   allow_retry: true,
   show_explanation: true,
-  interactive_weight: 40,
-  final_quiz_weight: 60,
+  interactive_weight: 0,
+  final_quiz_weight: 100,
   pass_score: 5,
   ai_instructions: '',
   lesson_time_minutes: 45,
@@ -138,14 +138,10 @@ export default function LessonBuilderSettingsPanel({ value, onChange, onSaveDefa
             <span className="text-sm font-semibold text-slate-700">Điểm đạt</span>
             <input type="number" min={1} max={10} step={0.5} value={value.pass_score} onChange={(e) => update('pass_score', Number(e.target.value))} className={fieldClass} />
           </label>
-          <label className="space-y-2">
-            <span className="text-sm font-semibold text-slate-700">Tỉ trọng câu hỏi tương tác (%)</span>
-            <input type="number" min={0} max={100} value={value.interactive_weight} onChange={(e) => update('interactive_weight', Number(e.target.value))} className={fieldClass} />
-          </label>
-          <label className="space-y-2 md:col-span-2">
-            <span className="text-sm font-semibold text-slate-700">Tỉ trọng kiểm tra cuối bài (%)</span>
-            <input type="number" min={0} max={100} value={value.final_quiz_weight} onChange={(e) => update('final_quiz_weight', Number(e.target.value))} className={fieldClass} />
-          </label>
+          <div className="rounded-2xl border border-emerald-100 bg-emerald-50 px-4 py-3 md:col-span-2">
+            <p className="text-sm font-black text-emerald-800">Điểm bài học = 100% kiểm tra cuối bài</p>
+            <p className="mt-1 text-xs font-medium leading-5 text-emerald-700">Các câu hỏi/tương tác trong từng mục chỉ dùng để hoàn thành tiến độ học tập, không tạo điểm và không tham gia điểm chính thức.</p>
+          </div>
         </div>
       </section>
 

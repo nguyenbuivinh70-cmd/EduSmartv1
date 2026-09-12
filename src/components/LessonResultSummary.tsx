@@ -1,99 +1,105 @@
-import { AlertTriangle, Award, BookOpenCheck, CheckCircle2, RotateCcw, XCircle } from 'lucide-react';
+import { AlertTriangle, Award, BookOpenCheck, CheckCircle2, Clock3, RotateCcw, XCircle } from 'lucide-react';
 
 export default function LessonResultSummary({
   score,
+  scoreStatus = 'in_progress',
   passScore,
-  correct,
-  total,
-  interactiveCorrect,
-  interactiveTotal,
   finalCorrect,
   finalTotal,
+  finalExamSubmitted = false,
   completedSections = 0,
   totalSections = 0,
   incompleteSections = [],
-  learningProcessScore = 0,
-  finalExamScore = 0,
-  learningWeight = 40,
-  finalWeight = 60,
-  preparationScore = 0,
-  preparationWeight = 0,
+  finalExamScore,
   preparationStatus = 'not_started',
+  preparationWatchPercent = 0,
   onReviewIncomplete,
   onRetry,
 }: {
   score: number;
+  scoreStatus?: 'in_progress' | 'finalized' | 'not_applicable';
   passScore: number;
-  correct: number;
-  total: number;
-  interactiveCorrect: number;
-  interactiveTotal: number;
   finalCorrect: number;
   finalTotal: number;
+  finalExamSubmitted?: boolean;
   completedSections?: number;
   totalSections?: number;
   incompleteSections?: string[];
-  learningProcessScore?: number;
   finalExamScore?: number;
-  learningWeight?: number;
-  finalWeight?: number;
-  preparationScore?: number;
-  preparationWeight?: number;
   preparationStatus?: string;
+  preparationWatchPercent?: number;
   onReviewIncomplete?: () => void;
   onRetry?: () => void;
 }) {
   const safeScore = Number.isFinite(score) ? score : 0;
-  const safeLearningProcessScore = Number.isFinite(learningProcessScore) ? learningProcessScore : 0;
-  const safeFinalExamScore = Number.isFinite(finalExamScore) ? finalExamScore : 0;
-  const safePreparationScore = Number.isFinite(preparationScore) ? preparationScore : 0;
-  const preparationLabel = preparationStatus === 'prepared' ? 'Có chuẩn bị bài' : preparationStatus === 'late_completed' ? 'Hoàn thành muộn' : preparationStatus === 'in_progress' ? 'Đang chuẩn bị' : 'Chưa chuẩn bị';
+  const safeFinalExamScore = Number.isFinite(Number(finalExamScore)) ? Number(finalExamScore) : undefined;
+  const preparationLabel = preparationStatus === 'prepared'
+    ? 'Đã chuẩn bị bài'
+    : preparationStatus === 'late_completed'
+      ? 'Hoàn thành muộn'
+      : preparationStatus === 'in_progress'
+        ? 'Đang chuẩn bị'
+        : 'Chưa chuẩn bị';
   const hasIncompleteSections = incompleteSections.length > 0;
-  const passed = safeScore >= passScore && !hasIncompleteSections;
-  const statusLabel = passed ? 'Hoàn thành bài học' : hasIncompleteSections ? 'Chưa đủ điều kiện hoàn thành' : 'Cần ôn tập thêm';
+  const finalized = scoreStatus === 'finalized';
+  const noScore = scoreStatus === 'not_applicable' || finalTotal === 0;
+  const passed = finalized && safeScore >= passScore;
+  const statusLabel = noScore
+    ? 'Bài học không có kiểm tra cuối bài'
+    : finalized
+      ? passed ? 'Hoàn thành bài học' : 'Cần ôn tập thêm'
+      : hasIncompleteSections ? 'Chưa đủ điều kiện kiểm tra' : 'Chưa nộp kiểm tra cuối bài';
+  const headlineTone = noScore ? 'text-slate-700' : finalized ? (passed ? 'text-emerald-600' : 'text-rose-600') : 'text-amber-600';
+  const iconTone = noScore ? 'bg-slate-100 text-slate-600' : finalized ? (passed ? 'bg-emerald-50 text-emerald-600' : 'bg-rose-50 text-rose-600') : 'bg-amber-50 text-amber-600';
 
   return (
     <div className="rounded-[28px] bg-white p-6 shadow-sm ring-1 ring-slate-100">
       <div className="flex flex-col items-center text-center">
-        <div className={`flex h-20 w-20 items-center justify-center rounded-[28px] ${passed ? 'bg-emerald-50 text-emerald-600' : hasIncompleteSections ? 'bg-amber-50 text-amber-600' : 'bg-rose-50 text-rose-600'}`}>
-          {passed ? <Award className="h-10 w-10" /> : hasIncompleteSections ? <AlertTriangle className="h-10 w-10" /> : <XCircle className="h-10 w-10" />}
+        <div className={`flex h-20 w-20 items-center justify-center rounded-[28px] ${iconTone}`}>
+          {noScore ? <BookOpenCheck className="h-10 w-10" /> : finalized ? (passed ? <Award className="h-10 w-10" /> : <XCircle className="h-10 w-10" />) : <Clock3 className="h-10 w-10" />}
         </div>
         <h3 className="mt-4 text-2xl font-black text-slate-900">{statusLabel}</h3>
-        <p className={`mt-2 text-3xl font-black ${passed ? 'text-emerald-600' : hasIncompleteSections ? 'text-amber-600' : 'text-rose-600'}`}>{safeScore.toFixed(1)}/10</p>
-        <p className="mt-1 text-sm text-slate-500">Điểm tổng kết = chuẩn bị bài ({preparationWeight}%) + quá trình học ({learningWeight}%) + kiểm tra cuối bài ({finalWeight}%) • Điểm đạt {passScore}/10</p>
+        {noScore ? (
+          <p className="mt-2 text-xl font-black text-slate-500">Không áp dụng điểm số</p>
+        ) : finalized ? (
+          <p className={`mt-2 text-3xl font-black ${headlineTone}`}>{safeScore.toFixed(1)}/10</p>
+        ) : (
+          <p className={`mt-2 text-2xl font-black ${headlineTone}`}>Chưa có điểm chính thức</p>
+        )}
+        <p className="mt-3 max-w-3xl text-sm leading-6 text-slate-500">
+          <b>Điểm duy nhất của bài học là điểm kiểm tra cuối bài.</b> Video chuẩn bị và các mục học tập chỉ ghi nhận trạng thái/tiến độ, không tạo điểm. Mức đạt ≥ {passScore}/10.
+        </p>
       </div>
 
-      <div className="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
-        <div className={`rounded-2xl px-4 py-3 ${preparationStatus === 'prepared' ? 'bg-emerald-50' : 'bg-fuchsia-50'}`}>
-          <p className={`text-xs font-semibold uppercase tracking-[0.15em] ${preparationStatus === 'prepared' ? 'text-emerald-600' : 'text-fuchsia-600'}`}>Chuẩn bị bài</p>
-          <p className={`mt-2 text-xl font-black ${preparationStatus === 'prepared' ? 'text-emerald-900' : 'text-fuchsia-900'}`}>{preparationWeight > 0 ? `${safePreparationScore.toFixed(1)}/10` : 'Không tính'}</p>
-          <p className={`mt-1 text-xs ${preparationStatus === 'prepared' ? 'text-emerald-700' : 'text-fuchsia-700'}`}>{preparationLabel}{preparationWeight > 0 ? ` • ${preparationWeight}%` : ''}</p>
+      <div className="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <div className={`rounded-2xl px-4 py-3 ${preparationStatus === 'prepared' ? 'bg-emerald-50' : preparationStatus === 'late_completed' ? 'bg-amber-50' : 'bg-fuchsia-50'}`}>
+          <p className={`text-xs font-semibold uppercase tracking-[0.15em] ${preparationStatus === 'prepared' ? 'text-emerald-600' : preparationStatus === 'late_completed' ? 'text-amber-600' : 'text-fuchsia-600'}`}>Chuẩn bị bài</p>
+          <p className={`mt-2 text-xl font-black ${preparationStatus === 'prepared' ? 'text-emerald-900' : preparationStatus === 'late_completed' ? 'text-amber-900' : 'text-fuchsia-900'}`}>{preparationLabel}</p>
+          <p className="mt-1 text-xs text-slate-600">Video {Math.max(0, Math.min(100, Math.round(Number(preparationWatchPercent || 0))))}% • Không tính điểm</p>
         </div>
+
         <div className="rounded-2xl bg-indigo-50 px-4 py-3">
-          <p className="text-xs font-semibold uppercase tracking-[0.15em] text-indigo-600">Quá trình học</p>
-          <p className="mt-2 text-xl font-black text-indigo-900">{safeLearningProcessScore.toFixed(1)}/10</p>
-          <p className="mt-1 text-xs text-indigo-700">Nội dung {completedSections}/{totalSections} • Tương tác {interactiveCorrect}/{interactiveTotal}</p>
+          <p className="text-xs font-semibold uppercase tracking-[0.15em] text-indigo-600">Tiến độ học tập</p>
+          <p className="mt-2 text-xl font-black text-indigo-900">{completedSections}/{totalSections} mục</p>
+          <p className="mt-1 text-xs text-indigo-700">{completedSections >= totalSections ? 'Đã hoàn thành tất cả mục' : `Còn ${Math.max(0, totalSections - completedSections)} mục • Không tính điểm`}</p>
         </div>
+
         <div className="rounded-2xl bg-emerald-50 px-4 py-3">
           <p className="text-xs font-semibold uppercase tracking-[0.15em] text-emerald-600">Kiểm tra cuối bài</p>
-          <p className="mt-2 text-xl font-black text-emerald-900">{safeFinalExamScore.toFixed(1)}/10</p>
-          <p className="mt-1 text-xs text-emerald-700">Đúng {finalCorrect}/{finalTotal} câu</p>
+          <p className="mt-2 text-xl font-black text-emerald-900">{finalTotal === 0 ? 'Không áp dụng' : !finalExamSubmitted ? 'Chưa nộp' : safeFinalExamScore === undefined ? 'Chưa có' : `${safeFinalExamScore.toFixed(1)}/10`}</p>
+          <p className="mt-1 text-xs text-emerald-700">{finalTotal > 0 ? `${finalCorrect}/${finalTotal} câu đúng • 100% điểm bài` : 'Bài học không có kiểm tra cuối bài'}</p>
         </div>
-        <div className="rounded-2xl bg-slate-50 px-4 py-3">
-          <p className="text-xs font-semibold uppercase tracking-[0.15em] text-slate-500">Tổng câu đúng</p>
-          <p className="mt-2 text-xl font-black text-slate-900">{correct}/{total}</p>
-          <p className="mt-1 text-xs text-slate-500">Tương tác + kiểm tra</p>
-        </div>
-        <div className="rounded-2xl bg-amber-50 px-4 py-3">
-          <p className="text-xs font-semibold uppercase tracking-[0.15em] text-amber-600">Nội dung học</p>
-          <p className="mt-2 text-xl font-black text-amber-900">{completedSections}/{totalSections}</p>
-          <p className="mt-1 text-xs text-amber-700">Mục có check xanh</p>
+
+        <div className={`rounded-2xl px-4 py-3 ${finalized ? 'bg-amber-50' : 'bg-slate-50'}`}>
+          <p className={`text-xs font-semibold uppercase tracking-[0.15em] ${finalized ? 'text-amber-600' : 'text-slate-500'}`}>Điểm chính thức</p>
+          <p className={`mt-2 text-xl font-black ${finalized ? 'text-amber-900' : 'text-slate-700'}`}>{finalized ? `${safeScore.toFixed(1)}/10` : 'Chưa có'}</p>
+          <p className="mt-1 text-xs text-slate-600">Chỉ chốt khi hoàn thành mọi mục và bấm Nộp bài</p>
         </div>
       </div>
 
       <div className="mt-6 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4 text-sm leading-7 text-slate-700">
-        <p className="font-bold text-slate-900">Cách hiểu kết quả</p>
-        <p className="mt-1">Điểm chuẩn bị bài phản ánh việc hoàn thành video trước hạn; điểm quá trình phản ánh việc học đủ các mục và hoàn thành câu hỏi tương tác; điểm kiểm tra cuối bài phản ánh kết quả sau khi học. Khi học nhóm, phần quá trình và kiểm tra có thể dùng chung cho nhóm nhưng điểm chuẩn bị được áp dụng riêng cho từng học sinh.</p>
+        <p className="font-bold text-slate-900">Cách tính điểm V6.81</p>
+        <p className="mt-1">Các mục học tập không tính điểm. Hệ thống chỉ dùng chúng để xác nhận học sinh đã hoàn thành nội dung. Sau khi hoàn thành toàn bộ mục, học sinh mới được mở kiểm tra cuối bài. Điểm chính thức = số câu đúng / tổng số câu kiểm tra × 10 và chỉ được chốt khi bấm <b>Nộp bài</b>.</p>
       </div>
 
       {hasIncompleteSections ? (
@@ -102,7 +108,7 @@ export default function LessonResultSummary({
             <AlertTriangle className="mt-0.5 h-5 w-5" />
             <div>
               <p className="font-bold">Em còn {incompleteSections.length} nội dung chưa hoàn thành.</p>
-              <p className="mt-1">Hãy quay lại đọc đủ thời gian và trả lời câu hỏi tương tác ở các mục sau:</p>
+              <p className="mt-1">Hoàn thành các mục dưới đây để mở kiểm tra cuối bài. Các mục này không tạo điểm:</p>
               <ul className="mt-2 list-disc space-y-1 pl-5">
                 {incompleteSections.slice(0, 6).map((title) => <li key={title}>{title}</li>)}
               </ul>
@@ -114,23 +120,24 @@ export default function LessonResultSummary({
             </div>
           </div>
         </div>
+      ) : !noScore && !finalized ? (
+        <div className="mt-6 flex items-start gap-3 rounded-2xl bg-amber-50 px-4 py-4 text-sm text-amber-800">
+          <Clock3 className="mt-0.5 h-5 w-5" />
+          <p>{!finalExamSubmitted ? 'Em đã hoàn thành phần học tập. Hãy làm và nộp kiểm tra cuối bài để nhận điểm chính thức.' : 'Bài kiểm tra đang được đồng bộ kết quả.'}</p>
+        </div>
       ) : (
-        <div className={`mt-6 flex items-start gap-3 rounded-2xl px-4 py-4 text-sm ${passed ? 'bg-emerald-50 text-emerald-800' : 'bg-amber-50 text-amber-800'}`}>
+        <div className={`mt-6 flex items-start gap-3 rounded-2xl px-4 py-4 text-sm ${noScore || passed ? 'bg-emerald-50 text-emerald-800' : 'bg-amber-50 text-amber-800'}`}>
           <CheckCircle2 className="mt-0.5 h-5 w-5" />
-          <p>{passed ? 'Bạn đã đạt yêu cầu của bài học. Có thể xem lại phần giải thích để củng cố kiến thức.' : 'Bạn chưa đạt điểm yêu cầu. Hãy xem lại nội dung học và bài kiểm tra cuối bài để làm lại tốt hơn.'}</p>
+          <p>{noScore ? 'Em đã hoàn thành nội dung học tập. Bài này không có kiểm tra cuối bài nên không có điểm.' : passed ? 'Bạn đã đạt yêu cầu của bài học.' : 'Bạn chưa đạt mức yêu cầu. Hãy xem lại bài và luyện tập thêm.'}</p>
         </div>
       )}
 
-      <div className="mt-6 rounded-2xl border border-indigo-100 bg-indigo-50 px-4 py-4 text-sm leading-7 text-indigo-900">
-        <p className="font-black">Gợi ý học tiếp</p>
-        {hasIncompleteSections ? (
-          <p className="mt-1">Hãy bấm “Học tiếp phần còn thiếu”, đọc đủ thời gian và hoàn thành câu hỏi tương tác trước khi xem lại kết quả.</p>
-        ) : safeFinalExamScore < passScore ? (
-          <p className="mt-1">Em đã hoàn thành nội dung học. Hãy xem lại các câu kiểm tra cuối bài bị sai và làm lại nếu giáo viên cho phép.</p>
-        ) : (
-          <p className="mt-1">Em có thể xem lại các phần ghi nhớ và làm thêm câu hỏi tự kiểm tra để củng cố kiến thức.</p>
-        )}
-      </div>
+      {finalTotal > 0 ? (
+        <div className="mt-6 rounded-2xl border border-indigo-100 bg-indigo-50 px-4 py-4 text-sm leading-7 text-indigo-900">
+          <p className="font-black">Kết quả kiểm tra</p>
+          <p className="mt-1">Đúng {finalCorrect}/{finalTotal} câu. Đây là thành phần duy nhất dùng để tính điểm bài học.</p>
+        </div>
+      ) : null}
 
       {onRetry ? (
         <div className="mt-5 flex justify-center">

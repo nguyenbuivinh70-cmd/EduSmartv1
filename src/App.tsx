@@ -54,6 +54,7 @@ import {
   LearningStepProgress,
   SchoolYear,
   LessonProgressRecord,
+  LessonRetakeAttempt,
   LearningResultModerationPayload,
   LessonQuestionAnswerState,
   MoveStudentsPayload,
@@ -70,7 +71,7 @@ import {
 import { AI_MODELS, DEFAULT_ACTIVE_GRADES, DEFAULT_VIDEO_POPUP_CONFIG, VIDEO_POPUP_VIEW_STORAGE_KEY, sortGrades } from './constants';
 import { compareStructuredLessons, resolveLessonIdentity } from './utils/lessonCatalog';
 import { getLessonScheduleAccess, getPreLessonVideoAccess } from './utils/lessonAccess';
-import { calculateLearningProcessScore, deriveSectionScores, finalizeProgressScore, preparationScoreFromStatus } from './utils/learningScoreEngine';
+import { applyProgressScoreModelV3, finalizeProgressScore } from './utils/learningScoreEngine';
 import { canManageGrade, formatManagedGrades, getManagedGradeScope, teacherManagesAllGrades } from './utils/gradeScope';
 import {
   createAccountApi,
@@ -116,6 +117,12 @@ import {
   saveUserConfigApi,
   saveVideoConfigApi,
   setLessonLockApi,
+  setLessonAccessModeApi,
+  startLessonRetakeApi,
+  saveLessonRetakeApi,
+  finalizeOfficialLessonRetakeApi,
+  finalizeDeadlineZerosApi,
+  listLessonRetakesApi,
   setCurrentSchoolYearApi,
   transferSchoolYearApi,
   maskApiKey,
@@ -138,7 +145,7 @@ import {
   updateOwnFirebaseMemberProfile,
   waitForFirebaseUser,
 } from './services/firebase';
-import { clearFirebaseIdentityCache, subscribeFirebaseLessonAccess } from './services/firebaseOperational';
+import { clearFirebaseIdentityCache, subscribeFirebaseLessonAccess, subscribeFirebaseLearningProgress } from './services/firebaseOperational';
 import { downloadTemplate, exportClassesToExcel } from './utils/templateDownloader';
 import type { ImportEntity, ImportPreviewResult } from './utils/importValidators';
 import Login from './components/Login';
@@ -212,6 +219,8 @@ function mapLessonRow(
     cho_phep_hoc_sau_han: row.cho_phep_hoc_sau_han,
     cho_phep_nop_sau_han: row.cho_phep_nop_sau_han,
     is_locked: row.is_locked === true,
+    access_mode: row.access_mode === 'self_study' ? 'self_study' : 'teacher_controlled',
+    allow_retake_after_completion: row.allow_retake_after_completion === true,
     locked_at: row.locked_at || '',
     locked_by_uid: row.locked_by_uid || '',
     locked_by_name: row.locked_by_name || '',
@@ -222,8 +231,8 @@ function mapLessonRow(
     pre_lesson_required: row.pre_lesson_required === true,
     pre_lesson_completion_threshold: Number(row.pre_lesson_completion_threshold || 80),
     pre_lesson_deadline: row.pre_lesson_deadline || '',
-    pre_lesson_score_enabled: row.pre_lesson_score_enabled !== false && row.pre_lesson_enabled !== false,
-    pre_lesson_score_weight: Math.max(0, Math.min(30, Number(row.pre_lesson_score_weight ?? 10))),
+    pre_lesson_score_enabled: false,
+    pre_lesson_score_weight: 0,
     content_schema_version: row.content_schema_version || undefined,
     raw: row,
   };
@@ -488,7 +497,7 @@ function sanitizeProgressRecord(raw: Partial<LessonProgressRecord> | null | unde
     learning_process_score: raw.learning_process_score === undefined ? undefined : Number(raw.learning_process_score),
     final_quiz_score: raw.final_quiz_score === undefined ? undefined : Number(raw.final_quiz_score),
     current_score: raw.current_score === undefined ? undefined : Number(raw.current_score),
-    score_status: raw.score_status === 'finalized' ? 'finalized' : 'in_progress',
+    score_status: raw.score_status === 'finalized' ? 'finalized' : raw.score_status === 'not_applicable' ? 'not_applicable' : 'in_progress',
     score_calculated_at: String(raw.score_calculated_at || ''),
     last_closed_at: String(raw.last_closed_at || ''),
     save_state: raw.save_state === 'save_failed' ? 'save_failed' : raw.save_state === 'saving' ? 'saving' : 'saved',
@@ -498,6 +507,17 @@ function sanitizeProgressRecord(raw: Partial<LessonProgressRecord> | null | unde
     result_group_id: String(raw.result_group_id || ''),
     result_version: Number(raw.result_version || 0),
     retake_allowed: raw.retake_allowed !== false,
+    official_retake_remaining: Number(raw.official_retake_remaining || 0),
+    official_retake_grant_id: String(raw.official_retake_grant_id || ''),
+    official_retake_granted_at: String(raw.official_retake_granted_at || ''),
+    official_retake_granted_by_uid: String(raw.official_retake_granted_by_uid || ''),
+    official_retake_granted_by_name: String(raw.official_retake_granted_by_name || ''),
+    official_retake_last_consumed_at: String(raw.official_retake_last_consumed_at || ''),
+    official_retake_count: Number(raw.official_retake_count || 0),
+    previous_official_score: raw.previous_official_score === undefined ? undefined : Number(raw.previous_official_score),
+    score_reason: String(raw.score_reason || ''),
+    deadline_status: String(raw.deadline_status || ''),
+    deadline_finalized_at: String(raw.deadline_finalized_at || ''),
     invalidated_reason: String(raw.invalidated_reason || ''),
     invalidated_at: String(raw.invalidated_at || ''),
     invalidated_by_uid: String(raw.invalidated_by_uid || ''),
@@ -524,6 +544,9 @@ function sanitizeProgressRecord(raw: Partial<LessonProgressRecord> | null | unde
     preparation_weight: raw.preparation_weight === undefined ? undefined : Number(raw.preparation_weight),
     learning_component_weight: raw.learning_component_weight === undefined ? undefined : Number(raw.learning_component_weight),
     final_component_weight: raw.final_component_weight === undefined ? undefined : Number(raw.final_component_weight),
+    score_model_version: raw.score_model_version === undefined ? undefined : Number(raw.score_model_version),
+    scored_section_count: raw.scored_section_count === undefined ? undefined : Number(raw.scored_section_count),
+    scorable_section_count: raw.scorable_section_count === undefined ? undefined : Number(raw.scorable_section_count),
   };
 }
 
@@ -644,8 +667,12 @@ function recomputeProgress(record: LessonProgressRecord): LessonProgressRecord {
       // Tiến độ nội dung phải tăng khi thời gian/mức hoàn thành mục tăng, không chỉ khi trả lời câu hỏi.
       percent = sectionItems.length ? Math.round(sectionAverage * 0.8 + quizProgress * 0.2) : Math.round(quizProgress);
       const allSectionsCompleted = !sectionItems.length || sectionItems.every((item) => item.status === 'completed');
+      const finalExamStatus = String(detail.finalExam?.status || '');
+      const finalExamExists = Number(detail.finalExam?.total_count || 0) > 0;
+      const finalExamSubmitted = ['submitted', 'auto_submitted', 'expired'].includes(finalExamStatus);
       detail.viewedComplete = allSectionsCompleted;
-      detail.completed = allSectionsCompleted && (total === 0 || answered >= total);
+      // V6.79.0: trả lời hết câu cuối bài chưa đồng nghĩa hoàn thành; phải bấm Nộp bài.
+      detail.completed = allSectionsCompleted && (finalExamExists ? finalExamSubmitted : (total === 0 || answered >= total));
     } else {
       percent = detail.viewedComplete ? 100 : Math.max(0, Number(detail.percent || 0));
       detail.completed = Boolean(detail.viewedComplete);
@@ -660,20 +687,23 @@ function recomputeProgress(record: LessonProgressRecord): LessonProgressRecord {
   const quizTotal = stepDetails.luyen_tap.quizTotal || 0;
   const quizCorrect = stepDetails.luyen_tap.quizCorrect || 0;
   const quizAnswered = stepDetails.luyen_tap.quizAnswered || 0;
-  const completionPercent = Math.min(100, Math.round(weighted));
+  const rawCompletionPercent = Math.min(100, Math.round(weighted));
+  const allTrackedStagesCompleted = completedSteps >= Object.keys(STAGE_WEIGHTS).length;
+  // Không hiển thị 100% khi vẫn còn một bước bắt buộc chưa được chốt.
+  const completionPercent = allTrackedStagesCompleted ? 100 : Math.min(99, rawCompletionPercent);
   const updatedAt = new Date().toISOString();
   const finalExam = stepDetails.luyen_tap.finalExam;
   const finalExamSubmitted = ['submitted', 'auto_submitted', 'expired'].includes(String(finalExam?.status || ''));
-  const sectionScores = deriveSectionScores(stepDetails.luyen_tap.sectionProgress || {});
-  const learningProcessScore = calculateLearningProcessScore(stepDetails.luyen_tap.sectionProgress || {});
-  const finalQuizScore = finalExamSubmitted && Number.isFinite(Number(finalExam?.score)) ? Math.max(0, Math.min(10, Number(finalExam?.score))) : Number(record.final_quiz_score || 0);
+  const sectionScores = {};
+  const learningProcessScore = undefined;
+  const finalQuizScore = finalExamSubmitted && Number.isFinite(Number(finalExam?.score)) ? Math.max(0, Math.min(10, Number(finalExam?.score))) : undefined;
 
   return sanitizeProgressRecord({
     ...record,
     step_details: stepDetails,
     completed_steps: completedSteps,
     completion_percent: completionPercent,
-    status: completionPercent >= 100 ? 'completed' : completionPercent > 0 ? 'in_progress' : 'not_started',
+    status: allTrackedStagesCompleted ? 'completed' : completionPercent > 0 ? 'in_progress' : 'not_started',
     updated_at: updatedAt,
     quiz_total: quizTotal,
     quiz_answered: quizAnswered,
@@ -939,6 +969,13 @@ useEffect(() => {
   const [arenaLesson, setArenaLesson] = useState<Lesson | null>(null);
   const [arenaLessonContent, setArenaLessonContent] = useState<LessonContent | null>(null);
   const [isLessonViewerOpen, setIsLessonViewerOpen] = useState(false);
+  const [lessonViewerMode, setLessonViewerMode] = useState<'official' | 'retake' | 'review'>('official');
+  const [activeRetakeAttempt, setActiveRetakeAttempt] = useState<LessonRetakeAttempt | null>(null);
+  const activeRetakeAttemptRef = useRef<LessonRetakeAttempt | null>(null);
+  const retakeSaveTimerRef = useRef<number | null>(null);
+  const [retakeChoiceLesson, setRetakeChoiceLesson] = useState<Lesson | null>(null);
+  const [retakeHistory, setRetakeHistory] = useState<LessonRetakeAttempt[]>([]);
+  const [lessonAccessModeUpdatingId, setLessonAccessModeUpdatingId] = useState('');
   const [isPreLessonVideoOpen, setIsPreLessonVideoOpen] = useState(false);
   const [preLessonVideoLesson, setPreLessonVideoLesson] = useState<Lesson | null>(null);
   const [viewerStage, setViewerStage] = useState<LessonStageKey>('khoi_dong');
@@ -998,8 +1035,10 @@ useEffect(() => {
   const [analyticsSemesterFilter, setAnalyticsSemesterFilter] = useState('HK1');
   const [analyticsClassFilter, setAnalyticsClassFilter] = useState('Tất cả');
   const [analyticsSubjectFilter, setAnalyticsSubjectFilter] = useState('Tất cả');
+  const analyticsDefaultSubjectAppliedRef = useRef(false);
   const [analyticsSchoolYearFilter, setAnalyticsSchoolYearFilter] = useState(getComputedSchoolYear());
   const [isAnalyticsProgressLoading, setIsAnalyticsProgressLoading] = useState(false);
+  const deadlineSyncSignatureRef = useRef('');
 
   useEffect(() => {
     const ensureCreatedGrade = (value: string, setter: (next: string) => void) => {
@@ -1012,6 +1051,8 @@ useEffect(() => {
     ensureCreatedGrade(subjectGradeFilter, setSubjectGradeFilter);
     ensureCreatedGrade(analyticsGradeFilter, setAnalyticsGradeFilter);
   }, [gradeFilterOptions, lessonGradeFilter, accountGradeFilter, classGradeFilter, subjectGradeFilter, analyticsGradeFilter]);
+
+  useEffect(() => { activeRetakeAttemptRef.current = activeRetakeAttempt; }, [activeRetakeAttempt]);
 
   const [lessonComments, setLessonComments] = useState<LessonComment[]>([]);
   const [isLessonCommentsLoading, setIsLessonCommentsLoading] = useState(false);
@@ -1191,6 +1232,17 @@ useEffect(() => {
   }, [user?.vai_tro, user?.quyen_admin, activeMenu]);
 
   useEffect(() => {
+    if (activeMenu !== 'analytics') {
+      analyticsDefaultSubjectAppliedRef.current = false;
+      return;
+    }
+    if (analyticsDefaultSubjectAppliedRef.current || !subjects.length) return;
+    const tinHoc = subjects.find((item) => String(item.ten_mon || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '') === 'tin hoc');
+    if (tinHoc?.mon_id) setAnalyticsSubjectFilter(tinHoc.mon_id);
+    analyticsDefaultSubjectAppliedRef.current = true;
+  }, [activeMenu, subjects]);
+
+  useEffect(() => {
     if (!user) return;
     if (user.vai_tro === 'student') {
       // Học sinh chỉ dùng các bộ lọc phù hợp với thư viện cá nhân.
@@ -1220,8 +1272,27 @@ useEffect(() => {
           setToast({ message: 'Bài học không còn tồn tại hoặc em không còn quyền truy cập.', type: 'error' });
           return;
         }
+        const latestAccessMode = latest.access_mode === 'self_study' ? 'self_study' : 'teacher_controlled';
+        const accessModeChanged = (selectedLesson.access_mode === 'self_study' ? 'self_study' : 'teacher_controlled') !== latestAccessMode;
         setLessonRows((current) => current.map((item) => item.lesson_id === latest.lesson_id ? { ...item, ...latest } : item));
-        setSelectedLesson((current) => current?.lesson_id === latest.lesson_id ? { ...current, is_locked: latest.is_locked, locked_at: latest.locked_at, locked_by_uid: latest.locked_by_uid, locked_by_name: latest.locked_by_name } : current);
+        setSelectedLesson((current) => current?.lesson_id === latest.lesson_id ? {
+          ...current,
+          is_locked: latest.is_locked,
+          access_mode: latestAccessMode,
+          allow_retake_after_completion: latest.allow_retake_after_completion === true,
+          locked_at: latest.locked_at,
+          locked_by_uid: latest.locked_by_uid,
+          locked_by_name: latest.locked_by_name,
+        } : current);
+        // V6.80.0: đổi teacher-controlled <-> self-study phải có hiệu lực ngay
+        // với học sinh đang mở Viewer, không bắt buộc đóng/mở lại bài.
+        if (accessModeChanged && latest.is_locked !== true) {
+          void getLessonContentApi(user.token, latest.lesson_id).then(async (res) => {
+            if (!res.ok || !res.data?.content) return;
+            const { normalizeLessonContent } = await import('./services/gemini');
+            setSelectedLessonContent(normalizeLessonContent(res.data.content));
+          });
+        }
         if (latest.is_locked === true) {
           setIsLessonViewerOpen(false);
           setSelectedLessonContent(null);
@@ -1234,7 +1305,7 @@ useEffect(() => {
         // vẫn được Firestore Rules kiểm tra.
       },
     );
-  }, [user?.user_id, user?.vai_tro, isLessonViewerOpen, selectedLesson?.lesson_id]);
+  }, [user?.user_id, user?.vai_tro, user?.token, isLessonViewerOpen, selectedLesson?.lesson_id, selectedLesson?.access_mode]);
 
   // Đấu trường dùng cùng trạng thái is_locked với Bài học. Nếu giáo viên khóa bài
   // trong lúc học sinh đang chọn/chơi, đóng ngay phiên đấu trường và trở về danh sách.
@@ -1498,6 +1569,30 @@ useEffect(() => {
     void loadScopedAnalyticsProgress();
   }, [activeMenu, user?.user_id, user?.vai_tro, loadScopedAnalyticsProgress]);
 
+  useEffect(() => {
+    if (!user || user.vai_tro === 'student') return;
+    if (activeMenu !== 'analytics' && activeMenu !== 'learning') return;
+    if (!analyticsHasServerScope) return;
+    const payload: Record<string, unknown> = {};
+    if (analyticsLessonFilter !== 'Tất cả') payload.lesson_id = analyticsLessonFilter;
+    if (analyticsClassFilter !== 'Tất cả') payload.lop_id = analyticsClassFilter;
+    if (analyticsGradeFilter !== 'Tất cả') payload.khoi = analyticsGradeFilter;
+    const unsubscribe = subscribeFirebaseLearningProgress(payload, (liveItems) => {
+      const normalized = liveItems.map((item) => sanitizeProgressRecord(item)).filter(Boolean) as LessonProgressRecord[];
+      setProgressRecordsSync((current) => {
+        const currentById = new Map<string, LessonProgressRecord>(current.map((item) => [item.progress_id, item] as [string, LessonProgressRecord]));
+        const currentPreOnly = current.filter((item) => item.progress_id.startsWith('PRE_'));
+        const mergedLive = normalized.map((item) => ({ ...(currentById.get(item.progress_id) || {}), ...item } as LessonProgressRecord));
+        const realKeys = new Set(mergedLive.map((item) => `${item.user_id}__${item.lesson_id}`));
+        const retainedPreOnly = currentPreOnly.filter((item) => !realKeys.has(`${item.user_id}__${item.lesson_id}`));
+        return [...mergedLive, ...retainedPreOnly];
+      });
+    }, (error) => {
+      console.warn('Realtime analytics progress listener failed:', error);
+    });
+    return unsubscribe;
+  }, [activeMenu, user?.user_id, user?.vai_tro, analyticsHasServerScope, analyticsLessonFilter, analyticsClassFilter, analyticsGradeFilter, setProgressRecordsSync]);
+
   const loadMenuData = async (menu = activeMenu, force = false) => {
     if (!user) return;
     const domains = requiredDataDomains(menu, user, currentUserIsAdmin);
@@ -1574,6 +1669,35 @@ useEffect(() => {
     }
     return lessons;
   }, [currentUserIsAdmin, activeMenu, visibleLessonsForCurrentUser, lessons]);
+
+  useEffect(() => {
+    if (!user || user.vai_tro === 'student' || activeMenu !== 'analytics') return;
+    if (analyticsSubjectFilter === 'Tất cả') return;
+    if (analyticsGradeFilter === 'Tất cả' && analyticsClassFilter === 'Tất cả') return;
+    const signature = [analyticsSchoolYearFilter, analyticsSemesterFilter, analyticsGradeFilter, analyticsClassFilter, analyticsSubjectFilter].join('|');
+    if (deadlineSyncSignatureRef.current === signature) return;
+    const timer = window.setTimeout(async () => {
+      const subject = subjects.find((item) => String(item.mon_id) === String(analyticsSubjectFilter));
+      const scoped = lessonSourcePool.filter((lesson) => {
+        const subjectMatch = String(lesson.mon_id) === String(analyticsSubjectFilter) || String(lesson.mon_hoc) === String(subject?.ten_mon || analyticsSubjectFilter);
+        const yearMatch = !lesson.nam_hoc || String(lesson.nam_hoc) === String(analyticsSchoolYearFilter);
+        const semesterMatch = analyticsSemesterFilter === 'ALL' || !lesson.hoc_ky || String(lesson.hoc_ky) === String(analyticsSemesterFilter);
+        const gradeMatch = analyticsGradeFilter === 'Tất cả' || String(lesson.khoi) === String(analyticsGradeFilter);
+        const classMatch = analyticsClassFilter === 'Tất cả' || !lesson.lop_id || String(lesson.lop_id) === String(analyticsClassFilter);
+        return subjectMatch && yearMatch && semesterMatch && gradeMatch && classMatch;
+      });
+      const scopedStudents = accounts.filter((item) => item.vai_tro === 'student'
+        && (analyticsGradeFilter === 'Tất cả' || String(item.khoi) === String(analyticsGradeFilter))
+        && (analyticsClassFilter === 'Tất cả' || String(item.lop_id) === String(analyticsClassFilter)));
+      if (!scoped.length || !scopedStudents.length) { deadlineSyncSignatureRef.current = signature; return; }
+      const res = await finalizeDeadlineZerosApi(user.token, scoped, scopedStudents);
+      if (res.ok) {
+        deadlineSyncSignatureRef.current = signature;
+        if (Number(res.data?.finalized || 0) > 0) await loadScopedAnalyticsProgress();
+      }
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [user?.user_id, user?.vai_tro, activeMenu, analyticsSchoolYearFilter, analyticsSemesterFilter, analyticsGradeFilter, analyticsClassFilter, analyticsSubjectFilter, lessonSourcePool, accounts, subjects, loadScopedAnalyticsProgress]);
 
   const availableSubjects = useMemo(() => {
     const names = lessonSourcePool.map((item) => item.mon_hoc).filter(Boolean);
@@ -1693,6 +1817,13 @@ useEffect(() => {
           result_state: record.result_state || 'valid',
           result_group_id: record.result_group_id,
           retake_allowed: record.retake_allowed,
+          official_retake_remaining: record.official_retake_remaining,
+          official_retake_grant_id: record.official_retake_grant_id,
+          official_retake_count: record.official_retake_count,
+          previous_official_score: record.previous_official_score,
+          score_reason: record.score_reason,
+          deadline_status: record.deadline_status,
+          deadline_finalized_at: record.deadline_finalized_at,
           study_mode: record.study_mode,
           co_learning_session_id: record.co_learning_session_id,
           co_learner_ids: record.co_learner_ids,
@@ -1712,6 +1843,11 @@ useEffect(() => {
           preparation_weight: record.preparation_weight,
           learning_process_score: record.learning_process_score,
           final_quiz_score: record.final_quiz_score,
+          current_score: record.current_score,
+          score_status: record.score_status,
+          score_model_version: record.score_model_version,
+          scored_section_count: record.scored_section_count,
+          scorable_section_count: record.scorable_section_count,
           updated_at: record.updated_at_display || record.updated_at,
           updated_at_display: record.updated_at_display || record.updated_at,
           updated_at_ts: record.updated_at_ts || getProgressTimeValue(record.updated_at),
@@ -2117,24 +2253,25 @@ useEffect(() => {
     }
   }, [user?.token, clearAuthState]);
 
-  const handleSaveAIConfig = async (config: AIConfig) => {
+  const handleSaveAIConfig = async (config: AIConfig): Promise<boolean> => {
     const normalizedAccountConfig = sanitizeStoredAIConfig(config);
 
     if (!user) {
       setAIConfig(normalizedAccountConfig);
-      return;
+      return true;
     }
 
     const res = await saveUserConfigApi(user.token, normalizedAccountConfig);
     if (!res.ok || !res.data) {
       if (!handleSessionError(res.message)) showToast(res.message || 'Không lưu được cấu hình AI.', 'error');
-      return;
+      return false;
     }
 
     const nextConfig = sanitizeStoredAIConfig(res.data);
     setAIConfig(nextConfig);
     localStorage.removeItem('aiConfig');
-    showToast('Đã lưu cấu hình AI theo tài khoản', 'success');
+    showToast('Đã lưu cấu hình AI theo tài khoản. Bạn có thể tiếp tục chức năng đang mở.', 'success');
+    return true;
   };
 
   const handleDeleteAIConfig = async () => {
@@ -2282,8 +2419,48 @@ useEffect(() => {
     };
   }, [persistProgressRecord]);
 
+  const persistActiveRetake = useCallback(async (attempt: LessonRetakeAttempt, silent = false) => {
+    if (!user || user.vai_tro !== 'student') return false;
+    const res = await saveLessonRetakeApi(user.token, attempt);
+    if (!res.ok || !res.data) {
+      if (!silent && !handleSessionError(res.message)) showToast(res.message || 'Không lưu được phiên học lại.', 'error');
+      return false;
+    }
+    setActiveRetakeAttempt(res.data);
+    activeRetakeAttemptRef.current = res.data;
+    return true;
+  }, [user]);
+
   const applyProgressUpdate = useCallback((lesson: Lesson, updater: (record: LessonProgressRecord) => LessonProgressRecord | null) => {
     if (!user || user.vai_tro !== 'student') return;
+    if (lessonViewerMode === 'review') return;
+    if (lessonViewerMode === 'retake' && activeRetakeAttemptRef.current?.lesson_id === lesson.lesson_id) {
+      const attempt = activeRetakeAttemptRef.current;
+      const existing = sanitizeProgressRecord(attempt.progress) || createEmptyProgressRecord(user.user_id, lesson);
+      const cloned: LessonProgressRecord = { ...existing, step_details: JSON.parse(JSON.stringify(existing.step_details)) };
+      const updated = updater(cloned);
+      if (!updated) return;
+      const recomputedRecord = recomputeProgress(updated);
+      const assessmentConfig = selectedLessonContent?.assessment as any;
+      const learningWeight = Number(assessmentConfig?.learning_process_weight ?? assessmentConfig?.interactive_weight ?? selectedLessonContent?.settings?.interactive_weight ?? 40);
+      const finalWeight = Number(assessmentConfig?.final_quiz_weight ?? selectedLessonContent?.settings?.final_quiz_weight ?? 60);
+      const liveSectionProgress = recomputedRecord.step_details?.luyen_tap?.sectionProgress || {};
+      const contentFinalQuizExists = Number(selectedLessonContent?.final_quiz?.length || 0) > 0;
+      const recordFinalQuizExists = Number(recomputedRecord.step_details?.luyen_tap?.finalExam?.total_count || 0) > 0;
+      const nextProgress = applyProgressScoreModelV3(recomputedRecord, {
+        learningWeight,
+        finalWeight,
+        finalQuizExists: contentFinalQuizExists || recordFinalQuizExists,
+        allRequiredSectionsCompleted: Object.values(liveSectionProgress).every((item) => item.status === 'completed'),
+      });
+      const nextAttempt: LessonRetakeAttempt = { ...attempt, progress: nextProgress, completion_percent: nextProgress.completion_percent, score_status: nextProgress.score_status, reference_score: nextProgress.score_status === 'finalized' ? nextProgress.assessment_score : nextProgress.current_score, updated_at: new Date().toISOString() };
+      setActiveRetakeAttempt(nextAttempt);
+      activeRetakeAttemptRef.current = nextAttempt;
+      if (retakeSaveTimerRef.current) window.clearTimeout(retakeSaveTimerRef.current);
+      const checkpoint = nextProgress.status === 'completed' || nextProgress.completed_steps > existing.completed_steps;
+      retakeSaveTimerRef.current = window.setTimeout(() => { retakeSaveTimerRef.current = null; void persistActiveRetake(nextAttempt, true); }, checkpoint ? 500 : 30000);
+      return;
+    }
     const currentItems = progressRecordsRef.current;
     const existing = sanitizeProgressRecord(currentItems.find((item) => item.progress_id === `${user.user_id}_${lesson.lesson_id}`)) || createEmptyProgressRecord(user.user_id, lesson);
     const cloned: LessonProgressRecord = {
@@ -2292,7 +2469,26 @@ useEffect(() => {
     };
     const updated = updater(cloned);
     if (!updated) return;
-    const baseRecord = recomputeProgress(updated);
+    const recomputedRecord = recomputeProgress(updated);
+    const assessmentConfig = selectedLessonContent?.assessment as any;
+    const learningWeight = Number(assessmentConfig?.learning_process_weight ?? assessmentConfig?.interactive_weight ?? selectedLessonContent?.settings?.interactive_weight ?? 40);
+    const finalWeight = Number(assessmentConfig?.final_quiz_weight ?? selectedLessonContent?.settings?.final_quiz_weight ?? 60);
+    const liveSectionProgress = recomputedRecord.step_details?.luyen_tap?.sectionProgress || {};
+    const contentFinalQuizExists = Number(selectedLessonContent?.final_quiz?.length || 0) > 0;
+    const recordFinalQuizExists = Number(recomputedRecord.step_details?.luyen_tap?.finalExam?.total_count || 0) > 0;
+    const isLegacyFinalizedResult = Number(existing.score_model_version || 0) < 4
+      && existing.status === 'completed'
+      && Number.isFinite(Number(existing.assessment_score));
+    // Không tự viết lại điểm lịch sử V6.78.x chỉ vì học sinh mở lại bài để xem.
+    // Kết quả đã chốt bằng Score Model cũ được giữ nguyên; chỉ lượt học/thi mới dùng V4.
+    const baseRecord = isLegacyFinalizedResult
+      ? { ...recomputedRecord, assessment_score: existing.assessment_score, current_score: existing.current_score, final_quiz_score: existing.final_quiz_score, learning_process_score: existing.learning_process_score, section_scores: existing.section_scores, score_status: existing.score_status, score_model_version: existing.score_model_version }
+      : applyProgressScoreModelV3(recomputedRecord, {
+          learningWeight,
+          finalWeight,
+          finalQuizExists: contentFinalQuizExists || recordFinalQuizExists,
+          allRequiredSectionsCompleted: Object.values(liveSectionProgress).every((item) => item.status === 'completed'),
+        });
     const nextRecord: LessonProgressRecord = activeCoLearningSession && activeCoLearningSession.lesson_id === lesson.lesson_id
       ? {
           ...baseRecord,
@@ -2313,7 +2509,7 @@ useEffect(() => {
       delete progressSaveTimersRef.current[timerKey];
       void persistProgressRecord(nextRecord, true);
     }, isCheckpoint ? 400 : 30000);
-  }, [user, activeCoLearningSession, persistProgressRecord, setProgressRecordsSync]);
+  }, [user, activeCoLearningSession, selectedLessonContent, persistProgressRecord, setProgressRecordsSync, lessonViewerMode, persistActiveRetake]);
 
   const markStepOpened = useCallback((lesson: Lesson, stage: LessonStageKey) => {
     applyProgressUpdate(lesson, (record) => {
@@ -2398,6 +2594,132 @@ useEffect(() => {
     }
   }, [selectedLesson, user, updateQuizMetrics]);
 
+  const handleLessonViewerFinalExamSubmit = useCallback(async (snapshot: LessonCloseSnapshot) => {
+    if (!user || user.vai_tro !== 'student' || !selectedLesson) return false;
+    if (lessonViewerMode === 'review') return true;
+
+    const assessmentConfig = selectedLessonContent?.assessment as any;
+    const learningWeight = Number(assessmentConfig?.learning_process_weight ?? assessmentConfig?.interactive_weight ?? selectedLessonContent?.settings?.interactive_weight ?? 40);
+    const finalWeight = Number(assessmentConfig?.final_quiz_weight ?? selectedLessonContent?.settings?.final_quiz_weight ?? 60);
+
+    // Học lại: chấm ngay khi Nộp bài nhưng chỉ lưu vào retakes, tuyệt đối không
+    // chạm vào learningProgress chính thức.
+    if (lessonViewerMode === 'retake' && activeRetakeAttemptRef.current) {
+      if (retakeSaveTimerRef.current) { window.clearTimeout(retakeSaveTimerRef.current); retakeSaveTimerRef.current = null; }
+      const attempt = activeRetakeAttemptRef.current;
+      const existing = sanitizeProgressRecord(attempt.progress) || createEmptyProgressRecord(user.user_id, selectedLesson);
+      const record: LessonProgressRecord = { ...existing, step_details: JSON.parse(JSON.stringify(existing.step_details || {})) };
+      const detail = record.step_details.luyen_tap || createEmptyStepDetail();
+      record.step_details.luyen_tap = {
+        ...detail,
+        opened: true,
+        quizAnswered: snapshot.answered,
+        quizCorrect: snapshot.correct,
+        quizTotal: snapshot.total,
+        quizAnswers: snapshot.answers,
+        sectionProgress: snapshot.sectionProgress,
+        finalExam: snapshot.finalExam || detail.finalExam,
+        lastVisitedAt: new Date().toISOString(),
+      };
+      const recomputed = recomputeProgress(record);
+      const finalQuizExists = Number(selectedLessonContent?.final_quiz?.length || 0) > 0 || Number(snapshot.finalExam?.total_count || 0) > 0;
+      const scored = applyProgressScoreModelV3(recomputed, {
+        learningWeight,
+        finalWeight,
+        finalQuizExists,
+        allRequiredSectionsCompleted: Object.values(snapshot.sectionProgress || {}).every((item) => item.status === 'completed'),
+      });
+      const finalAttempt: LessonRetakeAttempt = {
+        ...attempt,
+        progress: scored,
+        completion_percent: scored.completion_percent,
+        score_status: scored.score_status,
+        reference_score: scored.score_status === 'finalized' ? scored.assessment_score : scored.current_score,
+        status: scored.score_status === 'finalized' ? 'completed' : 'in_progress',
+        completed_at: scored.score_status === 'finalized' ? new Date().toISOString() : attempt.completed_at,
+        updated_at: new Date().toISOString(),
+      };
+      setActiveRetakeAttempt(finalAttempt);
+      activeRetakeAttemptRef.current = finalAttempt;
+      const saved = await persistActiveRetake(finalAttempt, false);
+      if (!saved) return false;
+      const officialUpdate = finalAttempt.is_official === true || finalAttempt.retake_mode === 'official_update';
+      if (officialUpdate) {
+        const promoted = await finalizeOfficialLessonRetakeApi(user.token, finalAttempt);
+        if (!promoted.ok || !promoted.data) {
+          if (!handleSessionError(promoted.message)) showToast(promoted.message || 'Đã lưu lượt học lại nhưng chưa cập nhật được điểm chính thức.', 'error');
+          return false;
+        }
+        const official = sanitizeProgressRecord(promoted.data);
+        if (official) setProgressRecordsSync((current) => mergeProgressCollections(current.filter((item) => item.progress_id !== official.progress_id), [official]));
+        showToast(`Đã cập nhật điểm chính thức thành ${Number(promoted.data.assessment_score || 0).toFixed(1)}/10. Điểm cũ được giữ trong lịch sử.`, 'success');
+        return true;
+      }
+      showToast(`Đã lưu điểm học lại tham khảo ${Number(finalAttempt.reference_score || 0).toFixed(1)}/10. Điểm chính thức không thay đổi.`, 'success');
+      return true;
+    }
+
+    const progressId = `${user.user_id}_${selectedLesson.lesson_id}`;
+    if (progressSaveTimersRef.current[progressId]) {
+      window.clearTimeout(progressSaveTimersRef.current[progressId]);
+      delete progressSaveTimersRef.current[progressId];
+    }
+    const existing = sanitizeProgressRecord(progressRecordsRef.current.find((item) => item.progress_id === progressId)) || createEmptyProgressRecord(user.user_id, selectedLesson);
+    // Không ghi đè một kết quả chính thức đã chốt trước đó. Trường hợp học lại phải đi
+    // qua nhánh retake ở trên.
+    if (existing.score_status === 'finalized' && Number.isFinite(Number(existing.assessment_score))) return true;
+
+    const record: LessonProgressRecord = { ...existing, step_details: JSON.parse(JSON.stringify(existing.step_details || {})) };
+    const detail = record.step_details.luyen_tap || createEmptyStepDetail();
+    record.step_details.luyen_tap = {
+      ...detail,
+      opened: true,
+      quizAnswered: snapshot.answered,
+      quizCorrect: snapshot.correct,
+      quizTotal: snapshot.total,
+      quizAnswers: snapshot.answers,
+      sectionProgress: snapshot.sectionProgress,
+      finalExam: snapshot.finalExam || detail.finalExam,
+      lastVisitedAt: new Date().toISOString(),
+    };
+    const recomputed = recomputeProgress(record);
+    const finalQuizExists = Number(selectedLessonContent?.final_quiz?.length || 0) > 0 || Number(snapshot.finalExam?.total_count || 0) > 0;
+    let finalRecord = applyProgressScoreModelV3(recomputed, {
+      learningWeight,
+      finalWeight,
+      finalQuizExists,
+      allRequiredSectionsCompleted: Object.values(snapshot.sectionProgress || {}).every((item) => item.status === 'completed'),
+    });
+    finalRecord = {
+      ...finalRecord,
+      score_calculated_at: snapshot.finalExam?.submitted_at || new Date().toISOString(),
+      save_state: 'saving',
+    };
+    if (activeCoLearningSession && activeCoLearningSession.lesson_id === selectedLesson.lesson_id) {
+      finalRecord = {
+        ...finalRecord,
+        study_mode: 'co_learning',
+        co_learning_session_id: activeCoLearningSession.co_learning_session_id,
+        co_learner_ids: getCoLearningSessionUserIds(activeCoLearningSession).join(','),
+        co_learner_user_ids: getCoLearningSessionUserIds(activeCoLearningSession),
+        co_learner_names: getCoLearningSessionNames(activeCoLearningSession),
+        result_group_id: activeCoLearningSession.co_learning_session_id,
+      };
+    }
+
+    progressPendingRecordsRef.current[progressId] = finalRecord;
+    setProgressRecordsSync((current) => mergeProgressCollections(current.filter((item) => item.progress_id !== progressId), [finalRecord]));
+    queuePendingLearningProgress(user.user_id, finalRecord);
+    const saved = await persistProgressRecord(finalRecord, false);
+    if (saved) {
+      const officialScore = Number(finalRecord.assessment_score);
+      showToast(Number.isFinite(officialScore)
+        ? `Đã nộp bài. Điểm chính thức ${officialScore.toFixed(1)}/10 đã cập nhật vào bảng theo dõi của giáo viên.`
+        : 'Đã nộp bài và cập nhật kết quả lên hệ thống.', 'success');
+    }
+    return saved;
+  }, [user, selectedLesson, selectedLessonContent, lessonViewerMode, activeCoLearningSession, persistActiveRetake, persistProgressRecord, setProgressRecordsSync]);
+
   const handleCloseLessonViewer = useCallback(async (snapshot?: LessonCloseSnapshot) => {
     if (!user || !selectedLesson) {
       setIsLessonViewerOpen(false);
@@ -2406,6 +2728,34 @@ useEffect(() => {
     }
     if (user.vai_tro !== 'student') {
       setIsLessonViewerOpen(false);
+      return;
+    }
+    if (lessonViewerMode === 'review') {
+      setIsLessonViewerOpen(false);
+      setSelectedLesson(null);
+      setSelectedLessonContent(null);
+      return;
+    }
+    if (lessonViewerMode === 'retake' && activeRetakeAttemptRef.current) {
+      if (retakeSaveTimerRef.current) { window.clearTimeout(retakeSaveTimerRef.current); retakeSaveTimerRef.current = null; }
+      const attempt = activeRetakeAttemptRef.current;
+      const record: LessonProgressRecord = { ...(sanitizeProgressRecord(attempt.progress) || createEmptyProgressRecord(user.user_id, selectedLesson)), step_details: JSON.parse(JSON.stringify(attempt.progress.step_details || {})) };
+      if (snapshot) {
+        const detail = record.step_details.luyen_tap || createEmptyStepDetail();
+        record.step_details.luyen_tap = { ...detail, opened: true, quizAnswered: snapshot.answered, quizCorrect: snapshot.correct, quizTotal: snapshot.total, quizAnswers: snapshot.answers, sectionProgress: snapshot.sectionProgress, finalExam: snapshot.finalExam || detail.finalExam, lastVisitedAt: new Date().toISOString() };
+      }
+      const assessmentConfig = selectedLessonContent?.assessment as any;
+      const learningWeight = Number(assessmentConfig?.learning_process_weight ?? assessmentConfig?.interactive_weight ?? selectedLessonContent?.settings?.interactive_weight ?? 40);
+      const finalWeight = Number(assessmentConfig?.final_quiz_weight ?? selectedLessonContent?.settings?.final_quiz_weight ?? 60);
+      const recomputed = recomputeProgress(record);
+      const sectionProgress = recomputed.step_details?.luyen_tap?.sectionProgress || {};
+      const finalQuizExists = Number(selectedLessonContent?.final_quiz?.length || 0) > 0 || Number(snapshot?.finalExam?.total_count ?? recomputed.step_details?.luyen_tap?.finalExam?.total_count ?? 0) > 0;
+      const finalProgress = finalizeProgressScore(recomputed, new Date().toISOString(), { learningWeight, finalWeight, finalQuizExists, allRequiredSectionsCompleted: Object.values(sectionProgress).every((item) => item.status === 'completed') });
+      const finalAttempt: LessonRetakeAttempt = { ...attempt, progress: finalProgress, completion_percent: finalProgress.completion_percent, score_status: finalProgress.score_status, reference_score: finalProgress.score_status === 'finalized' ? finalProgress.assessment_score : finalProgress.current_score, status: finalProgress.score_status === 'finalized' ? 'completed' : 'in_progress', completed_at: finalProgress.score_status === 'finalized' ? new Date().toISOString() : attempt.completed_at, updated_at: new Date().toISOString() };
+      const saved = await persistActiveRetake(finalAttempt, false);
+      setIsLessonViewerOpen(false);
+      setActiveRetakeAttempt(null); activeRetakeAttemptRef.current = null; setLessonViewerMode('official');
+      if (saved) showToast(finalProgress.score_status === 'finalized' ? `Đã lưu điểm học lại tham khảo ${Number(finalProgress.assessment_score || 0).toFixed(1)}/10. Điểm chính thức không thay đổi.` : 'Đã lưu tiến độ phiên học lại. Em có thể tiếp tục sau.', 'success');
       return;
     }
 
@@ -2436,30 +2786,33 @@ useEffect(() => {
     const assessmentConfig = selectedLessonContent?.assessment as any;
     const learningWeight = Number(assessmentConfig?.learning_process_weight ?? assessmentConfig?.interactive_weight ?? selectedLessonContent?.settings?.interactive_weight ?? 40);
     const finalWeight = Number(assessmentConfig?.final_quiz_weight ?? selectedLessonContent?.settings?.final_quiz_weight ?? 60);
-    const hasPreparationVideo = Boolean(
-      String(selectedLesson.intro_video_url || '').trim()
-      || String(selectedLesson.intro_video_embed_url || '').trim()
-      || String(selectedLessonContent?.intro_video_url || '').trim()
-      || String(selectedLessonContent?.intro_video_embed_url || '').trim()
-    );
-    const preparationScoreEnabled = hasPreparationVideo
-      && selectedLesson.pre_lesson_enabled !== false
-      && selectedLesson.pre_lesson_score_enabled !== false;
-    const preparationWeight = preparationScoreEnabled
-      ? Math.max(0, Math.min(30, Number(selectedLesson.pre_lesson_score_weight ?? 10)))
-      : 0;
-    const preparationStatus = String(record.pre_lesson_preparation_status || '').trim()
-      || (record.pre_lesson_completed_before_deadline === true ? 'prepared'
-        : record.pre_lesson_status === 'completed' ? 'late_completed'
-          : Number(record.pre_lesson_watch_percent || 0) > 0 ? 'in_progress' : 'not_started');
-    const preparationScore = preparationScoreEnabled ? preparationScoreFromStatus(preparationStatus) : 0;
-    let finalRecord = finalizeProgressScore(recomputeProgress(record), new Date().toISOString(), {
-      learningWeight,
-      finalWeight,
-      preparationWeight,
-      preparationScore,
-      preparationStatus,
-    });
+    const sectionProgress = record.step_details?.luyen_tap?.sectionProgress || {};
+    const allRequiredSectionsCompleted = Object.values(sectionProgress).every((item) => item.status === 'completed');
+    const finalQuizExists = Number(selectedLessonContent?.final_quiz?.length || 0) > 0
+      || Number(snapshot?.finalExam?.total_count ?? record.step_details?.luyen_tap?.finalExam?.total_count ?? 0) > 0;
+    const recomputedOnClose = recomputeProgress(record);
+    const isLegacyFinalizedResult = Number(existing.score_model_version || 0) < 4
+      && existing.status === 'completed'
+      && Number.isFinite(Number(existing.assessment_score));
+    let finalRecord = isLegacyFinalizedResult
+      ? {
+          ...recomputedOnClose,
+          assessment_score: existing.assessment_score,
+          current_score: existing.current_score,
+          final_quiz_score: existing.final_quiz_score,
+          learning_process_score: existing.learning_process_score,
+          section_scores: existing.section_scores,
+          score_status: existing.score_status,
+          score_model_version: existing.score_model_version,
+          last_closed_at: new Date().toISOString(),
+          save_state: 'saving' as const,
+        }
+      : finalizeProgressScore(recomputedOnClose, new Date().toISOString(), {
+          learningWeight,
+          finalWeight,
+          finalQuizExists,
+          allRequiredSectionsCompleted,
+        });
     if (activeCoLearningSession && activeCoLearningSession.lesson_id === selectedLesson.lesson_id) {
       finalRecord = {
         ...finalRecord,
@@ -2478,7 +2831,7 @@ useEffect(() => {
     // không còn phụ thuộc vào tốc độ mạng hoặc permission tạm thời. Cloud save vẫn
     // được thử ngay; nếu quá 2,5 giây thì đóng bài và hàng đợi sẽ tự đồng bộ lại.
     queuePendingLearningProgress(user.user_id, finalRecord);
-    showToast('Đang lưu tiến độ và tính điểm bài học...', 'info');
+    showToast('Đang lưu tiến độ và cập nhật kết quả bài học...', 'info');
     const cloudSavePromise = persistProgressRecord(finalRecord, true);
     const saved = await Promise.race<boolean>([
       cloudSavePromise,
@@ -2486,12 +2839,15 @@ useEffect(() => {
     ]);
     setIsLessonViewerOpen(false);
     setActiveCoLearningSession(null);
+    setLessonViewerMode('official');
+    setActiveRetakeAttempt(null);
+    activeRetakeAttemptRef.current = null;
     if (!saved) {
       showToast('Đã đóng bài. Kết quả đã được giữ an toàn trên thiết bị và hệ thống sẽ tự đồng bộ lại.', 'info');
       return;
     }
-    showToast(wasCoLearning ? 'Đã lưu điểm chung của nhóm và điểm chuẩn bị riêng cho từng học sinh.' : 'Đã lưu điểm và tiến độ bài học.', 'success');
-  }, [user, selectedLesson, selectedLessonContent, activeCoLearningSession, persistProgressRecord, setProgressRecordsSync]);
+    showToast(wasCoLearning ? 'Đã lưu kết quả chung của nhóm; trạng thái chuẩn bị được ghi nhận riêng từng học sinh và không tính điểm.' : 'Đã lưu kết quả và tiến độ bài học.', 'success');
+  }, [user, selectedLesson, selectedLessonContent, activeCoLearningSession, persistProgressRecord, setProgressRecordsSync, lessonViewerMode, persistActiveRetake]);
 
   const flushProgressBeforeStudyModeChange = useCallback(async (lessonId: string): Promise<boolean> => {
     if (!user || user.vai_tro !== 'student') return true;
@@ -2518,7 +2874,7 @@ useEffect(() => {
     setIsCoLearningSubmitting(false);
   }, []);
 
-  const openLessonDirect = async (lesson: Lesson, coSession: CoLearningSession | null = null) => {
+  const openLessonDirect = async (lesson: Lesson, coSession: CoLearningSession | null = null, mode: 'official' | 'retake' | 'review' = 'official', retakeAttempt: LessonRetakeAttempt | null = null) => {
     if (!user) return;
     if (user.vai_tro === 'student') {
       if (lesson.is_locked === true) {
@@ -2542,7 +2898,10 @@ useEffect(() => {
     setSelectedLesson(lesson);
     setSelectedLessonContent(payload?.content ? normalizeLessonContent(payload.content) : null);
     setViewerStage('khoi_dong');
-    setActiveCoLearningSession(coSession);
+    setActiveCoLearningSession(mode === 'retake' ? null : coSession);
+    setLessonViewerMode(mode);
+    setActiveRetakeAttempt(retakeAttempt);
+    activeRetakeAttemptRef.current = retakeAttempt;
     setIsLessonViewerOpen(true);
     void loadLessonComments(lesson.lesson_id);
   };
@@ -2582,10 +2941,19 @@ useEffect(() => {
   const openLesson = async (lesson: Lesson) => {
     if (!user) return;
     if (user.vai_tro === 'student') {
+      const currentProgress = currentStudentProgressByLesson[lesson.lesson_id];
+      const officialFinalized = currentProgress && (currentProgress.score_status === 'finalized' || (currentProgress.status === 'completed' && Number.isFinite(Number(currentProgress.assessment_score))));
+      const officialRetakeGranted = Boolean(officialFinalized && Number(currentProgress?.official_retake_remaining || 0) > 0 && currentProgress?.official_retake_grant_id);
+
+      // V6.84.0: quyền học lại cập nhật điểm do giáo viên cấp là ngoại lệ có kiểm soát.
+      // Mở lựa chọn trước guard lịch/khóa để học sinh có thể làm bù sau deadline.
+      if (officialRetakeGranted) {
+        setRetakeChoiceLesson(lesson);
+        void listLessonRetakesApi(user.token, lesson.lesson_id).then((history) => setRetakeHistory(history.ok ? history.data || [] : []));
+        return;
+      }
+
       const scheduleAccess = getLessonScheduleAccess(lesson);
-      // V6.77.1: quyền XEM video trước bài tách khỏi cờ THEO DÕI nhiệm vụ.
-      // Chỉ cần có video + giáo viên cho phép xem khi khóa/chưa đến giờ thì mở modal.
-      // pre_lesson_enabled chỉ quyết định có ghi nhận tiến độ chuẩn bị bài hay không.
       const preLessonAccess = getPreLessonVideoAccess(lesson, scheduleAccess);
       if (preLessonAccess.canWatchNow) {
         setPreLessonVideoLesson(lesson);
@@ -2600,15 +2968,57 @@ useEffect(() => {
         showToast(`${scheduleAccess.message} Em chưa thể vào học lúc này.`, 'error');
         return;
       }
-      const currentProgress = currentStudentProgressByLesson[lesson.lesson_id];
       if (currentProgress?.result_state === 'invalid_cheating' && currentProgress.retake_allowed === false) {
         showToast(`Kết quả bài “${lesson.tieu_de}” đã bị hủy do gian lận và giáo viên không cho phép làm lại.`, 'error');
+        return;
+      }
+      if (officialFinalized && lesson.allow_retake_after_completion === true) {
+        setRetakeChoiceLesson(lesson);
+        void listLessonRetakesApi(user.token, lesson.lesson_id).then((history) => setRetakeHistory(history.ok ? history.data || [] : []));
+        return;
+      }
+      if (officialFinalized) {
+        await openLessonDirect(lesson, null, 'review', null);
         return;
       }
       await openCoLearningChoice(lesson);
       return;
     }
     await openLessonDirect(lesson, null);
+  };
+
+  const handleReviewOfficialLesson = async () => {
+    const lesson = retakeChoiceLesson;
+    if (!lesson) return;
+    setRetakeChoiceLesson(null);
+    await openLessonDirect(lesson, null, 'review', null);
+  };
+
+  const handleStartReferenceRetake = async () => {
+    const lesson = retakeChoiceLesson;
+    if (!lesson || !user) return;
+    const official = currentStudentProgressByLesson[lesson.lesson_id];
+    if (!official) { showToast('Không tìm thấy kết quả chính thức để học lại.', 'error'); return; }
+    const res = await withLoading('Đang chuẩn bị phiên học lại...', () => startLessonRetakeApi(user.token, lesson.lesson_id, official));
+    if (!res.ok || !res.data) { if (!handleSessionError(res.message)) showToast(res.message || 'Không bắt đầu được phiên học lại.', 'error'); return; }
+    setRetakeChoiceLesson(null);
+    await openLessonDirect(lesson, null, 'retake', res.data);
+    showToast(`Phiên học lại #${res.data.attempt_number}. Điểm lần này chỉ mang tính tham khảo và không thay đổi điểm chính thức.`, 'info');
+  };
+
+  const handleStartOfficialRetake = async () => {
+    const lesson = retakeChoiceLesson;
+    if (!lesson || !user) return;
+    const official = currentStudentProgressByLesson[lesson.lesson_id];
+    if (!official || Number(official.official_retake_remaining || 0) < 1) {
+      showToast('Quyền học lại cập nhật điểm không còn hiệu lực.', 'error');
+      return;
+    }
+    const res = await withLoading('Đang chuẩn bị lượt học lại cập nhật điểm...', () => startLessonRetakeApi(user.token, lesson.lesson_id, official, 'official_update'));
+    if (!res.ok || !res.data) { if (!handleSessionError(res.message)) showToast(res.message || 'Không bắt đầu được lượt học lại cập nhật điểm.', 'error'); return; }
+    setRetakeChoiceLesson(null);
+    await openLessonDirect(lesson, null, 'retake', res.data);
+    showToast(`Lượt học lại chính thức #${res.data.attempt_number}. Điểm của lần nộp mới sẽ thay thế điểm hiện tại.`, 'info');
   };
 
   const openLessonTeacherMode = async (lesson: Lesson) => {
@@ -2638,7 +3048,7 @@ useEffect(() => {
   };
 
   const handleToggleCoLearningClassmate = useCallback((userId: string) => {
-    // V6.78.2: chọn/bỏ chọn hoàn toàn bằng state cục bộ. Không gọi Firestore ở
+    // V6.79.0: chọn/bỏ chọn hoàn toàn bằng state cục bộ. Không gọi Firestore ở
     // bước chọn bạn và luôn dùng functional updater để nhiều click liên tiếp
     // không bị ghi đè bởi state cũ.
     setCoLearningSelectedUserIds((current) => {
@@ -3040,6 +3450,24 @@ useEffect(() => {
     setArenaLesson((current) => current?.lesson_id === lesson.lesson_id ? { ...current, ...res.data } : current);
     setSelectedLesson((current) => current?.lesson_id === lesson.lesson_id ? { ...current, ...res.data } : current);
     showToast(nextLocked ? `Đã khóa “${lesson.tieu_de}” đối với Học tập và Đấu trường tri thức.` : `Đã mở khóa “${lesson.tieu_de}” cho Học tập và Đấu trường tri thức.`, 'success');
+  };
+
+  const handleToggleLessonAccessMode = async (lesson: Lesson) => {
+    if (!user || lessonAccessModeUpdatingId) return;
+    const nextMode = lesson.access_mode === 'self_study' ? 'teacher_controlled' : 'self_study';
+    setLessonAccessModeUpdatingId(lesson.lesson_id);
+    const res = await setLessonAccessModeApi(user.token, lesson.lesson_id, nextMode);
+    setLessonAccessModeUpdatingId('');
+    if (!res.ok || !res.data) {
+      if (!handleSessionError(res.message)) showToast(res.message || 'Không cập nhật được chế độ truy cập bài học.', 'error');
+      return;
+    }
+    const saved = mapLessonRow(res.data, subjects, classes, accounts, user);
+    setLessonRows((current) => current.map((item) => item.lesson_id === lesson.lesson_id ? { ...item, ...res.data } : item));
+    setSelectedLesson((current) => current?.lesson_id === lesson.lesson_id ? { ...current, access_mode: saved.access_mode, is_locked: saved.is_locked } : current);
+    showToast(nextMode === 'self_study'
+      ? `Đã mở tự học nhanh cho “${lesson.tieu_de}”. Học sinh có thể mở tất cả mục mà không cần giáo viên mở từng mục.`
+      : `Đã chuyển “${lesson.tieu_de}” về chế độ giáo viên điều khiển từng mục.`, 'success');
   };
 
   const handleSubmitReview = async (lesson: Lesson) => {
@@ -3733,6 +4161,12 @@ useEffect(() => {
                   {lesson.is_locked ? 'Mở khóa bài học' : 'Khóa bài học'}
                 </button>
               ) : null}
+              {canModify ? (
+                <button onClick={(event) => { stopTileAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); void handleToggleLessonAccessMode(lesson); }} disabled={Boolean(lessonAccessModeUpdatingId)} className={`flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold disabled:cursor-wait disabled:opacity-60 ${lesson.access_mode === 'self_study' ? 'text-violet-700 hover:bg-violet-50' : 'text-indigo-700 hover:bg-indigo-50'}`}>
+                  {lessonAccessModeUpdatingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <BookOpenCheck className="h-3.5 w-3.5" />}
+                  {lesson.access_mode === 'self_study' ? 'Tắt tự học nhanh' : 'Mở tự học nhanh'}
+                </button>
+              ) : null}
               {canSubmitReview ? (
                 <button onClick={(event) => { stopTileAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); void handleSubmitReview(lesson); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold text-amber-700 hover:bg-amber-50">
                   <UploadCloud className="h-3.5 w-3.5" /> Gửi admin duyệt
@@ -3810,6 +4244,18 @@ useEffect(() => {
             >
               {lessonLockUpdatingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 shrink-0 animate-spin" /> : lesson.is_locked ? <Unlock className="h-3.5 w-3.5 shrink-0" /> : <Lock className="h-3.5 w-3.5 shrink-0" />}
               <span className="lesson-action-label">{lesson.is_locked ? 'Mở khóa' : 'Khóa'}</span>
+            </button>
+          )}
+          {canModify && (
+            <button
+              onClick={(event) => { stopCardAction(event); void handleToggleLessonAccessMode(lesson); }}
+              disabled={Boolean(lessonAccessModeUpdatingId)}
+              className={`lesson-action-button disabled:cursor-wait disabled:opacity-60 ${lesson.access_mode === 'self_study' ? 'bg-violet-50 text-violet-700 hover:bg-violet-100' : 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100'}`}
+              aria-label={lesson.access_mode === 'self_study' ? 'Tắt tự học nhanh' : 'Mở tự học nhanh'}
+              title={lesson.access_mode === 'self_study' ? 'Tắt tự học nhanh' : 'Mở tự học nhanh'}
+            >
+              {lessonAccessModeUpdatingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 shrink-0 animate-spin" /> : <BookOpenCheck className="h-3.5 w-3.5 shrink-0" />}
+              <span className="lesson-action-label">{lesson.access_mode === 'self_study' ? 'Tắt tự học' : 'Tự học'}</span>
             </button>
           )}
           {(canModify || canSubmitReview) && (
@@ -4045,6 +4491,7 @@ useEffect(() => {
       : [];
     const validStudentScores = studentProgressItems
       .filter((item) => item.result_state !== 'invalid_cheating' && item.result_state !== 'cancelled_retake')
+      .filter((item) => Number(item.score_model_version || 0) < 3 || item.score_status === 'finalized')
       .map((item) => item.assessment_score)
       .filter((score): score is number => score !== undefined && Number.isFinite(Number(score)));
     const studentAverageScore = validStudentScores.length
@@ -5213,10 +5660,15 @@ useEffect(() => {
         onOpenConfig={openAIConfigModal}
         onClose={handleCloseLessonViewer}
         onStageChange={setViewerStage}
-        progress={selectedLesson && user.vai_tro === 'student' ? currentStudentProgressByLesson[selectedLesson.lesson_id] || null : null}
+        progress={selectedLesson && user.vai_tro === 'student' ? (lessonViewerMode === 'retake' ? activeRetakeAttempt?.progress || null : currentStudentProgressByLesson[selectedLesson.lesson_id] || null) : null}
+        attemptMode={lessonViewerMode}
+        officialScore={selectedLesson && user.vai_tro === 'student' ? currentStudentProgressByLesson[selectedLesson.lesson_id]?.assessment_score : undefined}
+        retakeAttemptNumber={activeRetakeAttempt?.attempt_number}
+        retakeIsOfficial={activeRetakeAttempt?.is_official === true || activeRetakeAttempt?.retake_mode === 'official_update'}
         onStepOpened={handleLessonViewerStepOpened}
         onStepViewedComplete={handleLessonViewerStepViewedComplete}
         onQuizMetricsChange={handleLessonViewerQuizMetricsChange}
+        onFinalExamSubmit={handleLessonViewerFinalExamSubmit}
         coLearningGroupSize={activeCoLearningSession && selectedLesson?.lesson_id === activeCoLearningSession.lesson_id ? getCoLearningSessionUserIds(activeCoLearningSession).length : 1}
         onManageCoLearning={handleManageActiveCoLearning}
         onOpenPreLessonVideo={user.vai_tro === 'student' && selectedLesson ? () => {
@@ -5372,6 +5824,28 @@ useEffect(() => {
         accountOperation={confirmDialog.accountOperation}
         onConfirm={(credentials) => void confirmDialog.onConfirm(credentials)}
       />
+
+      <AnimatePresence>
+        {retakeChoiceLesson ? (
+          <div className="fixed inset-0 z-[12500] flex items-center justify-center p-4">
+            <motion.button type="button" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setRetakeChoiceLesson(null)} className="absolute inset-0 bg-slate-950/55 backdrop-blur-sm" aria-label="Đóng" />
+            <motion.div initial={{ opacity: 0, scale: 0.96, y: 12 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.96, y: 8 }} className="relative z-10 w-full max-w-xl rounded-[28px] bg-white p-6 shadow-2xl">
+              <div className="flex items-start justify-between gap-4"><div><p className="text-xs font-black uppercase tracking-[0.16em] text-violet-600">Bài đã hoàn thành</p><h3 className="mt-2 text-xl font-black text-slate-900">{retakeChoiceLesson.tieu_de}</h3></div><button type="button" onClick={() => setRetakeChoiceLesson(null)} className="rounded-xl bg-slate-100 p-2 text-slate-500 hover:bg-slate-200"><XCircle className="h-5 w-5" /></button></div>
+              {Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.official_retake_remaining || 0) > 0 ? (
+                <div className="mt-5 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm leading-6 text-emerald-900"><b>Giáo viên đã cấp 1 lượt học lại cập nhật điểm.</b> Điểm của lần nộp mới sẽ thay thế điểm chính thức hiện tại{Number.isFinite(Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.assessment_score)) ? ` ${Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.assessment_score).toFixed(1)}/10` : ''}. Điểm cũ vẫn được lưu trong lịch sử.</div>
+              ) : (
+                <div className="mt-5 rounded-2xl border border-violet-100 bg-violet-50 p-4 text-sm leading-6 text-violet-900"><b>Học lại để luyện tập.</b> Điểm học lại được lưu riêng và không thay thế điểm chính thức{Number.isFinite(Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.assessment_score)) ? ` ${Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.assessment_score).toFixed(1)}/10` : ''}.</div>
+              )}
+              {retakeHistory.length ? <p className="mt-3 text-xs font-semibold text-slate-500">Đã có {retakeHistory.length} phiên học lại{retakeHistory[0]?.reference_score !== undefined ? ` • gần nhất ${Number(retakeHistory[0].reference_score).toFixed(1)}/10` : ''}.</p> : null}
+              <div className="mt-6 grid gap-3 sm:grid-cols-2">
+                <button type="button" onClick={() => void handleReviewOfficialLesson()} className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-black text-slate-700 hover:bg-slate-50">Xem lại bài chính thức</button>
+                {Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.official_retake_remaining || 0) > 0 ? <button type="button" onClick={() => void handleStartOfficialRetake()} className="rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-black text-white shadow-lg shadow-emerald-200 hover:bg-emerald-700">Học lại để cập nhật điểm</button> : null}
+                {retakeChoiceLesson.allow_retake_after_completion === true ? <button type="button" onClick={() => void handleStartReferenceRetake()} className="rounded-2xl bg-violet-600 px-4 py-3 text-sm font-black text-white shadow-lg shadow-violet-200 hover:bg-violet-700">Học lại luyện tập</button> : null}
+              </div>
+            </motion.div>
+          </div>
+        ) : null}
+      </AnimatePresence>
 
       {isAIConfigOpen && <AIConfigModal
         isOpen={isAIConfigOpen}

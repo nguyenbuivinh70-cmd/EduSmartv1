@@ -75,6 +75,22 @@ function getProgressStatusTone(progress?: LessonProgressRecord | null) {
 
 function getScore(progress?: LessonProgressRecord | null) {
   if (!progress || progress.result_state === 'invalid_cheating' || progress.result_state === 'cancelled_retake') return null;
+  if (Number(progress.score_model_version || 0) >= 4) {
+    if (progress.score_status === 'finalized' && progress.assessment_score !== undefined && Number.isFinite(Number(progress.assessment_score))) {
+      return { value: Math.max(0, Math.min(10, Number(progress.assessment_score))), provisional: false };
+    }
+    // Score Model V4 không có điểm tạm: chỉ Nộp kiểm tra cuối bài mới có điểm.
+    return null;
+  }
+  if (Number(progress.score_model_version || 0) >= 3) {
+    if (progress.score_status === 'finalized' && progress.assessment_score !== undefined && Number.isFinite(Number(progress.assessment_score))) {
+      return { value: Math.max(0, Math.min(10, Number(progress.assessment_score))), provisional: false };
+    }
+    if (progress.score_status === 'in_progress' && progress.current_score !== undefined && Number.isFinite(Number(progress.current_score))) {
+      return { value: Math.max(0, Math.min(10, Number(progress.current_score))), provisional: true };
+    }
+    return null;
+  }
   if (progress.assessment_score !== undefined && Number.isFinite(Number(progress.assessment_score))) {
     return { value: Math.max(0, Math.min(10, Number(progress.assessment_score))), provisional: false };
   }
@@ -378,6 +394,8 @@ export default function LessonCard({ lesson, onClick, actions, highlight = false
               <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                 <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.08em] text-slate-600">{STATUS_LABELS[lesson.trang_thai] || lesson.trang_thai}</span>
                 {score?.provisional ? <span className="rounded-full bg-amber-50 px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.08em] text-amber-700">Điểm tạm</span> : null}
+                {lesson.access_mode === 'self_study' ? <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.08em] text-indigo-700"><BookOpenCheck className="h-3 w-3" /> Tự học</span> : null}
+                {progress?.status === 'completed' && lesson.allow_retake_after_completion ? <span className="inline-flex items-center gap-1 rounded-full bg-violet-50 px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.08em] text-violet-700">Có thể học lại</span> : null}
                 {canPreviewPreLesson ? <span className="inline-flex items-center gap-1 rounded-full bg-fuchsia-50 px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.08em] text-fuchsia-700"><PlayCircle className="h-3 w-3" /> Video trước bài</span> : null}
               </div>
 
@@ -442,7 +460,7 @@ export default function LessonCard({ lesson, onClick, actions, highlight = false
             </div>
           ) : null}
 
-          <div className="flex items-center justify-between border-t border-slate-100 pt-4 text-sm"><span className="max-w-[55%] truncate font-semibold text-slate-600">{lesson.nguoi_tao}</span><span className={`flex items-center gap-1 font-black ${accessLocked || resultLocked ? 'text-amber-700' : 'text-indigo-700'}`}>{accessLocked ? 'Bài đang khóa' : resultLocked ? 'Đã khóa kết quả' : progress?.status === 'in_progress' ? 'Tiếp tục học' : progress?.assessment_score !== undefined ? 'Xem kết quả' : 'Mở học tập'}<ChevronRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" /></span></div>
+          <div className="flex items-center justify-between border-t border-slate-100 pt-4 text-sm"><span className="max-w-[55%] truncate font-semibold text-slate-600">{lesson.nguoi_tao}</span><span className={`flex items-center gap-1 font-black ${accessLocked || resultLocked ? 'text-amber-700' : 'text-indigo-700'}`}>{accessLocked ? 'Bài đang khóa' : resultLocked ? 'Đã khóa kết quả' : progress?.status === 'in_progress' ? 'Tiếp tục học' : (Number(progress?.score_model_version || 0) >= 3 ? progress?.score_status === 'finalized' : progress?.assessment_score !== undefined) ? 'Xem kết quả' : progress?.status === 'completed' ? 'Xem lại bài' : 'Mở học tập'}<ChevronRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" /></span></div>
         </div>
       </button>
       {actions ? <div className="border-t border-slate-100 bg-slate-50 px-5 py-4">{actions}</div> : null}
