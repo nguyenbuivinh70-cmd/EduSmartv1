@@ -1,6 +1,6 @@
 import { AI_MODELS, BACKEND_URL, DEFAULT_VIDEO_POPUP_CONFIG, VIDEO_CONFIG_STORAGE_KEY } from '../constants';
 import { normalizeGradeScope } from '../utils/gradeScope';
-import { AIConfig, Account, ApiResponse, CatalogClass, CatalogResponse, CoLearningPartnerCredential, CoLearningSession, GoogleSlidesPromptDetailResponse, GoogleSlidesPromptRecord, GoogleSlidesPromptSaveResponse, LearningResultModerationPayload, LearningResultModerationSummary, LessonBuilderDefaultsResponse, LessonBuilderSettings, LessonComment, LessonComposerValues, LessonContentResponse, LessonProgressRecord, LessonRow, PendingShareItem, ReviewPracticeAttempt, ReviewPracticeContentResponse, ReviewPracticeResultStudent, ReviewPracticeResultsResponse, ReviewPracticeRow, SchoolYear, SchoolYearTransferPayload, SchoolYearTransferSummary, MoveStudentsPayload, MoveStudentsSummary, StudentLearningAnalyticsRow, Subject, SystemDiagnostics, SystemDiagnosticIssue, SystemDiagnosticSection, User, VideoPopupConfig, PreLessonProgress, TeachingSession, LessonRetakeAttempt, LessonAccessMode } from '../types';
+import { AIConfig, Account, ApiResponse, CatalogClass, CatalogResponse, CoLearningPartnerCredential, CoLearningSession, GoogleSlidesPromptDetailResponse, GoogleSlidesPromptRecord, GoogleSlidesPromptSaveResponse, LearningResultModerationPayload, LearningResultModerationSummary, LessonBuilderDefaultsResponse, LessonBuilderSettings, LessonComment, LessonComposerValues, LessonContentResponse, LessonProgressRecord, LessonRow, PendingShareItem, ReviewPracticeAttempt, ReviewPracticeContentResponse, ReviewPracticeResultStudent, ReviewPracticeResultsResponse, ReviewPracticeRow, SchoolYear, SchoolYearTransferPayload, SchoolYearTransferSummary, MoveStudentsPayload, MoveStudentsSummary, StudentLearningAnalyticsRow, Subject, SystemDiagnostics, SystemDiagnosticIssue, SystemDiagnosticSection, User, VideoPopupConfig, PreLessonProgress, PreLessonSubmission, TeachingSession, LessonRetakeAttempt, LessonAccessMode, SelfStudyScope } from '../types';
 import {
   FIREBASE_SCHOOL_ID,
   getFirebaseIdToken,
@@ -21,6 +21,9 @@ import {
   saveFirebaseHostConsent,
   cleanupFirebaseCoLearningConsents,
   deleteFirebaseLesson,
+  purgeFirebaseArchivedLesson,
+  analyzeFirebaseArchivedLessonPurge,
+  continueFirebaseArchivedLessonPurge,
   repairFirebaseLessonIntegrity,
   getFirebaseLesson,
   findFirebaseReusableCoLearningSession,
@@ -30,6 +33,7 @@ import {
   saveFirebaseLesson,
   setFirebaseLessonLock,
   setFirebaseLessonAccessMode,
+  setFirebaseLessonSelfStudyAccess,
   startFirebaseLessonRetake,
   saveFirebaseLessonRetake,
   finalizeFirebaseOfficialRetake,
@@ -49,6 +53,9 @@ import {
   getFirebaseConfig,
   getFirebaseIdentity,
   getFirebaseUserAIConfig,
+  getFirebaseUserAISecret,
+  saveFirebaseUserAISecret,
+  deleteFirebaseUserAISecret,
   getFirebaseReview,
   getFirebaseSlidesPrompt,
   importFirebaseStudentAccountsBatch,
@@ -73,6 +80,9 @@ import {
   getFirebasePreLessonProgress,
   saveFirebasePreLessonProgress,
   listFirebasePreLessonProgress,
+  getFirebasePreLessonSubmission,
+  submitFirebasePreLessonSubmission,
+  listFirebasePreLessonSubmissions,
   getFirebaseTeachingSession,
   saveFirebaseTeachingSession,
   setFirebaseTeachingActivityAccess,
@@ -447,6 +457,10 @@ function normalizeLessonRow(raw: any): LessonRow {
     cho_phep_nop_sau_han: raw?.cho_phep_nop_sau_han,
     is_locked: raw?.is_locked === true,
     access_mode: raw?.access_mode === 'self_study' ? 'self_study' : 'teacher_controlled',
+    self_study_scope: raw?.self_study_scope === 'classes' || raw?.self_study_scope === 'all' || raw?.self_study_scope === 'none'
+      ? raw.self_study_scope
+      : (raw?.access_mode === 'self_study' ? 'all' : 'none'),
+    self_study_class_ids: Array.isArray(raw?.self_study_class_ids) ? raw.self_study_class_ids.map(toCleanString).filter(Boolean) : [],
     allow_retake_after_completion: raw?.allow_retake_after_completion === true,
     locked_at: toCleanString(raw?.locked_at),
     locked_by_uid: toCleanString(raw?.locked_by_uid),
@@ -458,6 +472,7 @@ function normalizeLessonRow(raw: any): LessonRow {
     pre_lesson_required: raw?.pre_lesson_required === true,
     pre_lesson_completion_threshold: Number.isFinite(Number(raw?.pre_lesson_completion_threshold)) ? Math.max(50, Math.min(100, Number(raw?.pre_lesson_completion_threshold))) : 80,
     pre_lesson_deadline: toCleanString(raw?.pre_lesson_deadline),
+    pre_lesson_video_revision: Number.isFinite(Number(raw?.pre_lesson_video_revision)) ? Math.max(1, Math.floor(Number(raw.pre_lesson_video_revision))) : 1,
     // V6.79.0: video chuẩn bị chỉ tạo trạng thái, không còn là thành phần điểm.
     pre_lesson_score_enabled: false,
     pre_lesson_score_weight: 0,
@@ -522,6 +537,23 @@ function normalizeReviewPracticeRow(raw: any): ReviewPracticeRow {
     nguoi_tao_id: toCleanString(raw?.nguoi_tao_id || raw?.created_by),
     created_at: toCleanString(raw?.created_at),
     updated_at: toCleanString(raw?.updated_at),
+    source_type: toCleanString(raw?.source_type),
+    practice_schema_version: raw?.practice_schema_version === undefined ? '' : Number(raw.practice_schema_version || 0),
+    activity_count: raw?.activity_count === undefined ? '' : Number(raw.activity_count || 0),
+    max_score: raw?.max_score === undefined ? '' : Number(raw.max_score || 0),
+    source_file_name: toCleanString(raw?.source_file_name),
+    lesson_id: toCleanString(raw?.lesson_id),
+    time_limit_minutes: Number(raw?.time_limit_minutes ?? raw?.thoi_gian ?? 0),
+    max_attempts: Number(raw?.max_attempts ?? 0),
+    pass_score: Number(raw?.pass_score ?? 5),
+    auto_submit_on_timeout: normalizeBoolean(raw?.auto_submit_on_timeout, true),
+    allow_solo: normalizeBoolean(raw?.allow_solo, true),
+    allow_co_learning: normalizeBoolean(raw?.allow_co_learning, true),
+    show_answers_mode: toCleanString(raw?.show_answers_mode) || 'after_submit',
+    available_from: toCleanString(raw?.available_from),
+    available_until: toCleanString(raw?.available_until),
+    target_class_ids: Array.isArray(raw?.target_class_ids) ? raw.target_class_ids.map(toCleanString).filter(Boolean) : [],
+    locked_class_ids: Array.isArray(raw?.locked_class_ids) ? raw.locked_class_ids.map(toCleanString).filter(Boolean) : [],
   };
 }
 
@@ -542,6 +574,10 @@ function normalizeReviewPracticeAttempt(raw: any): ReviewPracticeAttempt {
     submitted_at: toCleanString(raw?.submitted_at),
     auto_submitted: normalizeBoolean(raw?.auto_submitted, false),
     time_spent_seconds: raw?.time_spent_seconds === '' || raw?.time_spent_seconds === undefined ? '' : Number(raw?.time_spent_seconds || 0),
+    study_mode: toCleanString(raw?.study_mode) || 'single',
+    co_learning_session_id: toCleanString(raw?.co_learning_session_id),
+    participant_user_ids: Array.isArray(raw?.participant_user_ids) ? raw.participant_user_ids.map(toCleanString).filter(Boolean) : [],
+    participant_names: Array.isArray(raw?.participant_names) ? raw.participant_names.map(toCleanString).filter(Boolean) : [],
   };
 }
 
@@ -715,7 +751,7 @@ function normalizeLessonProgressRecord(raw: any): LessonProgressRecord {
     learning_process_score: raw?.learning_process_score === undefined || raw?.learning_process_score === null ? undefined : Number(raw.learning_process_score),
     final_quiz_score: raw?.final_quiz_score === undefined || raw?.final_quiz_score === null ? undefined : Number(raw.final_quiz_score),
     current_score: raw?.current_score === undefined || raw?.current_score === null ? undefined : Number(raw.current_score),
-    score_status: ['finalized', 'not_applicable'].includes(toCleanString(raw?.score_status))
+    score_status: ['finalized', 'retake_pending', 'not_applicable'].includes(toCleanString(raw?.score_status))
       ? toCleanString(raw.score_status) as any
       : 'in_progress',
     score_model_version: Number(raw?.score_model_version || 0) || undefined,
@@ -737,6 +773,7 @@ function normalizeLessonProgressRecord(raw: any): LessonProgressRecord {
     official_retake_last_consumed_at: toCleanString(raw?.official_retake_last_consumed_at),
     official_retake_count: Number(raw?.official_retake_count || 0),
     previous_official_score: raw?.previous_official_score === undefined || raw?.previous_official_score === null ? undefined : Number(raw.previous_official_score),
+    previous_official_completed_at: toCleanString(raw?.previous_official_completed_at),
     score_reason: toCleanString(raw?.score_reason),
     deadline_status: toCleanString(raw?.deadline_status),
     deadline_finalized_at: toCleanString(raw?.deadline_finalized_at),
@@ -1179,32 +1216,68 @@ export async function logoutApi(_token: string) {
 }
 
 export async function getUserConfigApi(token: string): Promise<ApiResponse<AIConfig>> {
-  // V6.78.0: API key thật lưu trong Apps Script PropertiesService; Firestore/Sheet
-  // chỉ giữ metadata hoặc giá trị đã che. Tự di chuyển document userAIConfigs cũ
-  // của chính người đang đăng nhập sang server store rồi xóa bản raw trên Firestore.
-  let res = await apiRequest<Record<string, unknown>>('getUserConfig', {}, token);
-  if (!res.ok || !res.data) return { ...res, data: undefined } as ApiResponse<AIConfig>;
-
+  // V6.88.2: Firestore userAISecrets/{firebaseUid} là nguồn cấu hình AI chuẩn.
+  // Document này chỉ chính UID hiện tại được Rules cho phép đọc/ghi.
   try {
-    const legacy = await getFirebaseUserAIConfig();
-    const legacyKey = toCleanString((legacy as any)?.api_key);
-    const legacyModel = toCleanString((legacy as any)?.model_ai) || AI_MODELS[0];
-    const serverHasKey = normalizeBoolean((res.data as any)?.has_api_key, false);
-    if (legacyKey && !serverHasKey) {
-      const migrated = await apiRequest<Record<string, unknown>>('saveUserConfig', {
-        api_key: legacyKey,
-        model_ai: AI_MODELS.includes(legacyModel) ? legacyModel : AI_MODELS[0],
-      }, token);
-      if (migrated.ok && migrated.data) res = migrated;
+    const secret = await getFirebaseUserAISecret();
+    if (secret) {
+      return {
+        ok: true,
+        message: 'Đã tải cấu hình AI theo tài khoản từ Firestore.',
+        data: normalizeAIConfig(secret),
+      };
     }
-    if (legacy) await deleteFirebaseUserAIConfig();
-  } catch {
-    // Migration là best-effort; cấu hình server vẫn dùng bình thường nếu cleanup cũ lỗi.
+  } catch (error) {
+    return {
+      ok: false,
+      message: `${firebaseErrorMessage(error)} Hãy xác minh Firestore Rules hiện hành đã được deploy.`,
+      error,
+    };
   }
 
-  return { ...res, data: normalizeAIConfig(res.data) };
-}
+  // Migration best-effort từ document Firestore legacy của chính UID.
+  try {
+    const legacyFirestore = await getFirebaseUserAIConfig();
+    const legacyFirestoreKey = toCleanString((legacyFirestore as any)?.api_key);
+    const legacyFirestoreModel = toCleanString((legacyFirestore as any)?.model_ai) || AI_MODELS[0];
+    if (legacyFirestoreKey) {
+      const migrated = await saveFirebaseUserAISecret(
+        legacyFirestoreKey,
+        AI_MODELS.includes(legacyFirestoreModel) ? legacyFirestoreModel : AI_MODELS[0],
+      );
+      await deleteFirebaseUserAIConfig().catch(() => undefined);
+      return { ok: true, message: 'Đã chuyển cấu hình AI Firestore cũ sang kho theo tài khoản.', data: normalizeAIConfig(migrated) };
+    }
+  } catch {
+    // Legacy document không tồn tại/không đọc được thì tiếp tục thử Apps Script cũ.
+  }
 
+  // Migration best-effort từ cơ chế Apps Script cũ. Không để backend legacy làm
+  // treo màn hình cấu hình: quá thời gian ngắn sẽ dùng trạng thái chưa cấu hình.
+  try {
+    const legacyPromise = apiRequest<Record<string, unknown>>('getUserConfig', {}, token);
+    const timeoutPromise = new Promise<ApiResponse<Record<string, unknown>>>((resolve) => {
+      globalThis.setTimeout(() => resolve({ ok: false, message: 'LEGACY_AI_CONFIG_TIMEOUT' }), 3500);
+    });
+    const legacyRes = await Promise.race([legacyPromise, timeoutPromise]);
+    const legacyKey = legacyRes.ok && legacyRes.data ? toCleanString((legacyRes.data as any).api_key) : '';
+    const legacyModel = legacyRes.ok && legacyRes.data ? toCleanString((legacyRes.data as any).model_ai) || AI_MODELS[0] : AI_MODELS[0];
+    if (legacyKey) {
+      const migrated = await saveFirebaseUserAISecret(legacyKey, AI_MODELS.includes(legacyModel) ? legacyModel : AI_MODELS[0]);
+      void apiRequest<Record<string, unknown>>('deleteMyAIConfig', { model_ai: legacyModel }, token).catch(() => undefined);
+      try { await deleteFirebaseUserAIConfig(); } catch { /* cleanup legacy Firestore is best-effort */ }
+      return { ok: true, message: 'Đã chuyển cấu hình AI cũ sang tài khoản Firebase.', data: normalizeAIConfig(migrated) };
+    }
+  } catch {
+    // Không có cấu hình legacy không phải lỗi. Người dùng có thể nhập key mới.
+  }
+
+  return {
+    ok: true,
+    message: 'Tài khoản hiện tại chưa cấu hình Gemini API Key.',
+    data: { apiKey: '', model: AI_MODELS[0], apiKeyMasked: '', hasServerKey: false, updatedAt: '' },
+  };
+}
 
 export async function getVideoConfigApi(_token: string): Promise<ApiResponse<VideoPopupConfig>> {
   try {
@@ -1708,15 +1781,24 @@ export async function getLessonContentApi(token: string, lesson_id: string) {
   }
 }
 
-export async function saveUserConfigApi(token: string, config: AIConfig): Promise<ApiResponse<AIConfig>> {
-  const apiKey = config.clearApiKey === true ? '' : toCleanString(config.apiKey);
-  const res = await apiRequest<Record<string, unknown>>('saveUserConfig', {
-    api_key: apiKey,
-    clear_api_key: config.clearApiKey === true,
-    model_ai: AI_MODELS.includes(config.model) ? config.model : AI_MODELS[0],
-  }, token);
-  if (!res.ok || !res.data) return { ...res, data: undefined } as ApiResponse<AIConfig>;
-  return { ...res, data: normalizeAIConfig(res.data) };
+export async function saveUserConfigApi(_token: string, config: AIConfig): Promise<ApiResponse<AIConfig>> {
+  try {
+    if (config.clearApiKey === true) {
+      await deleteFirebaseUserAISecret();
+      return {
+        ok: true,
+        message: 'Đã xóa API key của tài khoản hiện tại.',
+        data: { apiKey: '', model: AI_MODELS.includes(config.model) ? config.model : AI_MODELS[0], apiKeyMasked: '', hasServerKey: false, updatedAt: new Date().toISOString() },
+      };
+    }
+    const apiKey = toCleanString(config.apiKey);
+    if (!apiKey) return { ok: false, message: 'Vui lòng nhập Gemini API Key.' };
+    const model = AI_MODELS.includes(config.model) ? config.model : AI_MODELS[0];
+    const saved = await saveFirebaseUserAISecret(apiKey, model);
+    return { ok: true, message: 'Đã lưu cấu hình AI theo tài khoản trên Firestore.', data: normalizeAIConfig(saved) };
+  } catch (error) {
+    return { ok: false, message: `${firebaseErrorMessage(error)} Hãy xác minh Firestore Rules hiện hành đã được deploy.`, error };
+  }
 }
 
 export async function getLessonBuilderDefaultsApi(token: string): Promise<ApiResponse<LessonBuilderDefaultsResponse>> {
@@ -1737,14 +1819,18 @@ export async function resetLessonBuilderDefaultsApi(token: string): Promise<ApiR
   catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
 }
 
-export async function deleteUserConfigApi(token: string, model = AI_MODELS[0]): Promise<ApiResponse<AIConfig>> {
-  const res = await apiRequest<Record<string, unknown>>('deleteMyAIConfig', {
-    model_ai: AI_MODELS.includes(model) ? model : AI_MODELS[0],
-  }, token);
-  if (!res.ok || !res.data) return { ...res, data: undefined } as ApiResponse<AIConfig>;
-  return { ...res, data: normalizeAIConfig(res.data) };
+export async function deleteUserConfigApi(_token: string, model = AI_MODELS[0]): Promise<ApiResponse<AIConfig>> {
+  try {
+    await deleteFirebaseUserAISecret();
+    return {
+      ok: true,
+      message: 'Đã xóa API key của tài khoản hiện tại trên Firestore.',
+      data: { apiKey: '', model: AI_MODELS.includes(model) ? model : AI_MODELS[0], apiKeyMasked: '', hasServerKey: false, updatedAt: new Date().toISOString() },
+    };
+  } catch (error) {
+    return { ok: false, message: `${firebaseErrorMessage(error)} Hãy xác minh Firestore Rules hiện hành đã được deploy.`, error };
+  }
 }
-
 
 
 type CoLearningProgressReporter = (message: string) => void;
@@ -1832,7 +1918,7 @@ export async function startCoLearningSessionApi(_token: string, lesson_id: strin
       partners.push(partner);
     }
     const now = new Date().toISOString();
-    const hostPreparation = await getFirebasePreLessonProgress(lesson_id).catch(() => null);
+    const hostPreparation = await getFirebasePreLessonSubmission(lesson_id).catch(() => null);
     const hostPreparationStatus = toCleanString(hostPreparation?.preparation_status) || 'not_started';
     const participantUserIds = [toCleanString(me.userId), ...partners.map((item) => toCleanString(item.userId))];
     const participantUids = [toCleanString(me.uid), ...partners.map((item) => toCleanString(item.uid))];
@@ -1942,7 +2028,7 @@ export async function updateCoLearningSessionApi(_token: string, lesson_id: stri
         preparationPercent: Number(verified.preLessonWatchPercent || 0),
       });
     }
-    const hostPreparation = await getFirebasePreLessonProgress(lesson_id).catch(() => null);
+    const hostPreparation = await getFirebasePreLessonSubmission(lesson_id).catch(() => null);
     const hostPreparationStatus = toCleanString(hostPreparation?.preparation_status) || 'not_started';
     const participantUserIds = [toCleanString(me.userId), ...partners.map((item) => item.userId)];
     const participantUids = [toCleanString(me.uid), ...partners.map((item) => item.uid)];
@@ -2016,6 +2102,25 @@ export async function listPreLessonProgressApi(_token: string, filters: Record<s
   catch (error) { return { ok: false, message: firebaseErrorMessage(error), error, data: [] }; }
 }
 
+export async function getPreLessonSubmissionApi(_token: string, lesson_id: string): Promise<ApiResponse<PreLessonSubmission | null>> {
+  try { return { ok: true, message: 'Đã tải kết quả chuẩn bị bài đã gửi.', data: await getFirebasePreLessonSubmission(lesson_id) }; }
+  catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
+}
+
+export async function submitPreLessonPreparationApi(
+  _token: string,
+  lesson_id: string,
+  payload: Pick<PreLessonSubmission, 'watch_percent' | 'watched_seconds' | 'duration_seconds'>,
+): Promise<ApiResponse<PreLessonSubmission>> {
+  try { return { ok: true, message: 'Đã ghi nhận kết quả chuẩn bị bài.', data: await submitFirebasePreLessonSubmission(lesson_id, payload) }; }
+  catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
+}
+
+export async function listPreLessonSubmissionsApi(_token: string, filters: Record<string, unknown> = {}): Promise<ApiResponse<PreLessonSubmission[]>> {
+  try { return { ok: true, message: 'Đã tải kết quả chuẩn bị bài đã gửi.', data: await listFirebasePreLessonSubmissions(filters) }; }
+  catch (error) { return { ok: false, message: firebaseErrorMessage(error), error, data: [] }; }
+}
+
 export async function getTeachingSessionApi(_token: string, lesson_id: string, class_id?: string): Promise<ApiResponse<TeachingSession | null>> {
   try { return { ok: true, message: 'Đã tải trạng thái hoạt động dạy học.', data: await getFirebaseTeachingSession(lesson_id, class_id) }; }
   catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
@@ -2068,6 +2173,22 @@ export async function setLessonAccessModeApi(_token: string, lesson_id: string, 
   }
 }
 
+
+export async function setLessonSelfStudyAccessApi(_token: string, lesson_id: string, scope: SelfStudyScope, class_ids: string[] = []): Promise<ApiResponse<LessonRow>> {
+  try {
+    const saved = await setFirebaseLessonSelfStudyAccess(lesson_id, scope, class_ids);
+    const count = Array.isArray(saved.self_study_class_ids) ? saved.self_study_class_ids.length : 0;
+    const message = scope === 'all'
+      ? 'Đã mở tự học cho tất cả lớp thuộc phạm vi bài học.'
+      : scope === 'none'
+        ? 'Đã khóa tự học cho tất cả lớp; bài học trở về chế độ giáo viên điều khiển.'
+        : `Đã mở tự học cho ${count} lớp đã chọn.`;
+    return { ok: true, message, data: normalizeLessonRow(saved) };
+  } catch (error) {
+    return { ok: false, message: firebaseErrorMessage(error), error };
+  }
+}
+
 export async function startLessonRetakeApi(_token: string, lesson_id: string, officialProgress: LessonProgressRecord, mode: 'reference' | 'official_update' = 'reference'): Promise<ApiResponse<LessonRetakeAttempt>> {
   try { return { ok: true, message: mode === 'official_update' ? 'Đã bắt đầu lượt học lại cập nhật điểm.' : 'Đã bắt đầu phiên học lại tham khảo.', data: await startFirebaseLessonRetake(lesson_id, officialProgress, mode) }; }
   catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
@@ -2089,19 +2210,52 @@ export async function listLessonRetakesApi(_token: string, lesson_id: string): P
   catch (error) { return { ok: false, message: firebaseErrorMessage(error), error, data: [] }; }
 }
 
-export async function deleteLessonApi(token: string, lesson_id: string) {
+export async function deleteLessonApi(_token: string, lesson_id: string) {
   try {
-    const deleted = await deleteFirebaseLesson(lesson_id);
-    if (!deleted) return { ok: false, message: 'Không tìm thấy bài học trên Firebase.' };
-
-    // Firestore là nguồn vận hành chính. Chạy cleanup legacy Google Sheet/Drive
-    // theo kiểu best-effort để không giữ popup/UI chờ Apps Script phản hồi.
-    void apiRequest('deleteLesson', { lesson_id }, token).catch(() => undefined);
-
+    const archived = await deleteFirebaseLesson(lesson_id);
+    if (!archived) return { ok: false, message: 'Không tìm thấy bài học trên Firebase.' };
     return {
       ok: true,
-      message: 'Đã xóa bài học và dữ liệu liên quan trên Firebase.',
-      data: deleted,
+      message: 'Đã lưu trữ an toàn bài học. Bài được ẩn khỏi học sinh và lịch sử kết quả được giữ nguyên.',
+      data: archived,
+    };
+  } catch (error) {
+    return { ok: false, message: firebaseErrorMessage(error), error };
+  }
+}
+
+export async function analyzeLessonPurgeApi(_token: string, lesson_id: string) {
+  try {
+    const analysis = await analyzeFirebaseArchivedLessonPurge(lesson_id);
+    if (!analysis) return { ok: false, message: 'Không tìm thấy bài học đã lưu trữ trên Firebase.' };
+    return { ok: true, message: 'Đã phân tích dữ liệu liên quan trước khi xóa.', data: analysis };
+  } catch (error) {
+    return { ok: false, message: firebaseErrorMessage(error), error };
+  }
+}
+
+export async function purgeLessonApi(_token: string, lesson_id: string, mode: 'preserve_grades' | 'purge_all' = 'preserve_grades') {
+  try {
+    const job = await purgeFirebaseArchivedLesson(lesson_id, mode);
+    if (!job) return { ok: false, message: 'Không tìm thấy bài học đã lưu trữ trên Firebase.' };
+    return { ok: true, message: 'Đã tạo/khôi phục tiến trình xóa vĩnh viễn bài học.', data: job };
+  } catch (error) {
+    return { ok: false, message: firebaseErrorMessage(error), error };
+  }
+}
+
+export async function continueLessonPurgeApi(_token: string, lesson_id: string) {
+  try {
+    const job = await continueFirebaseArchivedLessonPurge(lesson_id);
+    if (!job) return { ok: false, message: 'Không tìm thấy tiến trình xóa vĩnh viễn.', data: null };
+    return {
+      ok: true,
+      message: job.status === 'completed'
+        ? 'Đã xóa vĩnh viễn bài học.'
+        : job.status === 'retryable'
+          ? 'Tiến trình tạm dừng và có thể tiếp tục.'
+          : 'Đang tiếp tục xóa dữ liệu bài học.',
+      data: job,
     };
   } catch (error) {
     return { ok: false, message: firebaseErrorMessage(error), error };
@@ -2154,10 +2308,12 @@ export async function reviewSharedLessonApi(token: string, lesson_id: string, ap
 
 
 export async function listLearningProgressApi(token: string, payload: Record<string, unknown> = {}) {
-  const items = (await listFirebaseProgress(payload).catch(() => [] as LessonProgressRecord[])).map(normalizeLessonProgressRecord);
-  return {
-    ok: true, message: 'Đã tải tiến trình học tập từ Firebase.', data: { items, total: items.length },
-  };
+  try {
+    const items = (await listFirebaseProgress(payload)).map(normalizeLessonProgressRecord);
+    return { ok: true, message: 'Đã tải tiến trình học tập từ Firebase.', data: { items, total: items.length } };
+  } catch (error) {
+    return { ok: false, message: firebaseErrorMessage(error), error, data: { items: [] as LessonProgressRecord[], total: 0 } };
+  }
 }
 
 export async function listLessonCommentsApi(token: string, lesson_id: string) {
@@ -2189,11 +2345,14 @@ export async function moderateLearningResultApi(
 ): Promise<ApiResponse<LearningResultModerationSummary>> {
   try {
     const data = await moderateFirebaseLearningResult(payload);
+    const auditSuffix = data.audit_saved === false
+      ? ' Quyền xử lý đã được lưu và xác minh; lịch sử thao tác chưa ghi được, hệ thống sẽ không yêu cầu bạn cấp lại quyền.'
+      : '';
     return {
       ok: true,
-      message: payload.action === 'allow_retake'
+      message: (payload.action === 'allow_retake'
         ? `Đã cấp 1 quyền học lại để cập nhật điểm cho ${data.affected_count} học sinh.`
-        : `Đã hủy kết quả do gian lận và khóa học lại đối với ${data.affected_count} học sinh.`,
+        : `Đã hủy kết quả do gian lận và khóa học lại đối với ${data.affected_count} học sinh.`) + auditSuffix,
       data,
     };
   } catch (error) {
@@ -2236,12 +2395,37 @@ export async function createReviewPracticeApi(token: string, payload: Record<str
   catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
 }
 
+export async function createInteractivePracticeApi(_token: string, payload: Record<string, unknown>) {
+  try {
+    const manifest = payload.practice_manifest;
+    if (!manifest || typeof manifest !== 'object') return { ok: false, message: 'Thiếu Practice Manifest đã chuẩn hóa.' };
+    const data = await saveFirebaseReview(payload);
+    return { ok: true, message: 'Đã tạo bài luyện tập tương tác trên Firebase.', data: normalizeReviewPracticeRow(data) };
+  } catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
+}
+
+export async function updateInteractivePracticeApi(_token: string, review_id: string, payload: Record<string, unknown>) {
+  try {
+    const existing = await getFirebaseReview(review_id);
+    if (!existing) return { ok: false, message: 'Không tìm thấy bài luyện tập cần cập nhật.' };
+    const data = await saveFirebaseReview({ ...existing, ...payload, review_id });
+    return { ok: true, message: 'Đã cập nhật cấu hình bài luyện tập.', data: normalizeReviewPracticeRow(data) };
+  } catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
+}
+
+export async function listMyReviewAttemptsApi(_token: string) {
+  try {
+    const attempts = (await listFirebaseReviewAttempts({})).map(normalizeReviewPracticeAttempt);
+    return { ok: true, message: 'Đã tải kết quả luyện tập của học sinh.', data: { items: attempts, total: attempts.length } };
+  } catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
+}
+
 export async function getReviewPracticeApi(token: string, review_id: string) {
   const firebaseReview = await getFirebaseReview(review_id).catch(() => null);
   if (firebaseReview) {
     const source = (firebaseReview as any).questions || (firebaseReview as any).questions_json || [];
     const questions = typeof source === 'string' ? (() => { try { return JSON.parse(source); } catch { return []; } })() : source;
-    return { ok: true, message: 'Đã tải bài ôn tập từ Firebase.', data: { review: normalizeReviewPracticeRow(firebaseReview), lessons: [], questions: Array.isArray(questions) ? questions : [], config: (firebaseReview as any).config || (firebaseReview as any).cau_hinh } };
+    return { ok: true, message: 'Đã tải bài ôn tập từ Firebase.', data: { review: normalizeReviewPracticeRow(firebaseReview), lessons: [], questions: Array.isArray(questions) ? questions : [], config: (firebaseReview as any).config || (firebaseReview as any).cau_hinh, practice_manifest: (firebaseReview as any).practice_manifest } };
   }
   return { ok: false, message: 'Không tìm thấy bài ôn tập trên Firebase.' };
 }
@@ -2262,9 +2446,12 @@ export async function getReviewPracticeResultsApi(token: string, payload: Record
     const members = await listFirebaseMembers().catch(() => []);
     const targetClass = normalizeClassId(payload.lop_id || (firebaseReview as any).lop_id);
     const targetGrade = normalizeGrade((firebaseReview as any).khoi);
+    const targetClasses = Array.isArray((firebaseReview as any).target_class_ids) ? (firebaseReview as any).target_class_ids.map(normalizeClassId).filter(Boolean) : [];
     const students = members.map(firebaseMemberToAccount).filter(item => item.vai_tro === 'student'
-      && (!targetClass || item.lop_id === targetClass) && (!targetGrade || item.khoi === targetGrade)).map(item => {
-        const own = attempts.filter(attempt => attempt.user_id === item.user_id).sort((a, b) => toTimestamp(b.submitted_at) - toTimestamp(a.submitted_at));
+      && (!targetClass || item.lop_id === targetClass)
+      && (!targetClasses.length || targetClasses.includes(item.lop_id))
+      && (!targetGrade || item.khoi === targetGrade)).map(item => {
+        const own = attempts.filter(attempt => attempt.user_id === item.user_id || attempt.participant_user_ids?.includes(item.user_id)).sort((a, b) => toTimestamp(b.submitted_at) - toTimestamp(a.submitted_at));
         const ownScores = own.map(attempt => Number(attempt.diem || 0));
         const best = ownScores.length ? Math.max(...ownScores) : 0;
         const bestAttempt = own.find(attempt => Number(attempt.diem || 0) === best);
@@ -2275,11 +2462,13 @@ export async function getReviewPracticeResultsApi(token: string, payload: Record
           auto_submitted_count: own.filter(attempt => attempt.auto_submitted).length });
       });
     const completedStudents = students.filter(item => item.status === 'completed').length;
+    const bestScores = students.map(item => Number(item.best_score)).filter(Number.isFinite);
+    const latestScores = students.map(item => Number(item.latest_score)).filter(Number.isFinite);
     return { ok: true, message: 'Đã tải kết quả ôn tập từ Firebase.', data: {
       review: normalizeReviewPracticeRow(firebaseReview), items: attempts, attempts, students, summary: { review_id: toCleanString(payload.review_id), total_students: students.length,
         completed_students: completedStudents, not_started_students: Math.max(0, students.length - completedStudents), total_attempts: attempts.length,
-        average_best_score: scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : 0,
-        average_latest_score: scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : 0,
+        average_best_score: bestScores.length ? bestScores.reduce((a, b) => a + b, 0) / bestScores.length : 0,
+        average_latest_score: latestScores.length ? latestScores.reduce((a, b) => a + b, 0) / latestScores.length : 0,
         highest_score: scores.length ? Math.max(...scores) : 0, lowest_score: scores.length ? Math.min(...scores) : 0 }, total: attempts.length,
     } };
   }

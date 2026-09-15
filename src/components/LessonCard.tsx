@@ -56,6 +56,7 @@ const STATUS_LABELS: Record<string, string> = {
 };
 
 function getProgressStatusLabel(progress?: LessonProgressRecord | null) {
+  if (progress?.score_status === 'retake_pending' || Number(progress?.official_retake_remaining || 0) > 0) return 'Chờ học lại';
   if (progress?.result_state === 'invalid_cheating') return 'Đã hủy';
   if (progress?.result_state === 'cancelled_retake') return 'Chờ học lại';
   if (!progress) return 'Chưa học';
@@ -65,6 +66,7 @@ function getProgressStatusLabel(progress?: LessonProgressRecord | null) {
 }
 
 function getProgressStatusTone(progress?: LessonProgressRecord | null) {
+  if (progress?.score_status === 'retake_pending' || Number(progress?.official_retake_remaining || 0) > 0) return 'bg-indigo-50 text-indigo-700';
   if (progress?.result_state === 'invalid_cheating') return 'bg-rose-50 text-rose-700';
   if (progress?.result_state === 'cancelled_retake') return 'bg-indigo-50 text-indigo-700';
   if (!progress) return 'bg-slate-100 text-slate-600';
@@ -74,7 +76,7 @@ function getProgressStatusTone(progress?: LessonProgressRecord | null) {
 }
 
 function getScore(progress?: LessonProgressRecord | null) {
-  if (!progress || progress.result_state === 'invalid_cheating' || progress.result_state === 'cancelled_retake') return null;
+  if (!progress || progress.result_state === 'invalid_cheating' || progress.result_state === 'cancelled_retake' || progress.score_status === 'retake_pending' || Number(progress.official_retake_remaining || 0) > 0) return null;
   if (Number(progress.score_model_version || 0) >= 4) {
     if (progress.score_status === 'finalized' && progress.assessment_score !== undefined && Number.isFinite(Number(progress.assessment_score))) {
       return { value: Math.max(0, Math.min(10, Number(progress.assessment_score))), provisional: false };
@@ -120,6 +122,7 @@ export default function LessonCard({ lesson, onClick, actions, highlight = false
   const groupCount = progress?.co_learner_user_ids?.length || String(progress?.co_learner_ids || '').split(',').filter(Boolean).length;
   const resultLocked = progress?.result_state === 'invalid_cheating' && progress.retake_allowed === false;
   const accessLocked = lesson.is_locked === true;
+  const retakePending = progress?.score_status === 'retake_pending' || Number(progress?.official_retake_remaining || 0) > 0;
   const lessonDate = formatLessonDate(lesson.updated_at || lesson.ngay_tao);
   const lessonNumber = getLessonNumber(lesson);
   const lessonDisplayName = lessonNumber ? getLessonName(lesson) || lesson.tieu_de : lesson.tieu_de;
@@ -256,13 +259,15 @@ export default function LessonCard({ lesson, onClick, actions, highlight = false
           ? 'Chưa đến giờ'
           : scheduleAccess.reason === 'after_end'
             ? 'Đã hết giờ'
-            : progress?.status === 'in_progress'
-              ? 'Tiếp tục học'
-              : progress?.status === 'completed'
-                ? 'Xem lại bài'
-                : score
-                  ? 'Xem kết quả'
-                  : 'Bắt đầu học';
+            : retakePending
+              ? 'Học lại cập nhật điểm'
+              : progress?.status === 'in_progress'
+                ? 'Tiếp tục học'
+                : progress?.status === 'completed'
+                  ? 'Xem lại bài'
+                  : score
+                    ? 'Xem kết quả'
+                    : 'Bắt đầu học';
     const progressLabel = canPreviewPreLesson
       ? (trackPreLessonProgress
         ? (preLessonCompleted
@@ -273,11 +278,13 @@ export default function LessonCard({ lesson, onClick, actions, highlight = false
         ? 'Giáo viên chưa mở bài'
         : scheduleBlocked
           ? scheduleAccess.message
-          : progress?.status === 'completed'
-            ? 'Đã hoàn thành bài học'
-            : progress
-              ? `Tiến độ ${progressPercent}%`
-              : 'Chưa bắt đầu';
+          : retakePending
+            ? 'Đang chờ hoàn thành lượt học lại'
+            : progress?.status === 'completed'
+              ? 'Đã hoàn thành bài học'
+              : progress
+                ? `Tiến độ ${progressPercent}%`
+                : 'Chưa bắt đầu';
     const PrimaryTopicIcon = topicVisual.PrimaryIcon;
     const SecondaryTopicIcon = topicVisual.SecondaryIcon;
     const TertiaryTopicIcon = topicVisual.TertiaryIcon;
@@ -288,6 +295,8 @@ export default function LessonCard({ lesson, onClick, actions, highlight = false
         ? 'bg-white/92 text-amber-700'
       : scheduleAccess.reason === 'after_end'
         ? 'bg-white/92 text-rose-700'
+        : retakePending
+          ? 'bg-white/92 text-indigo-700'
         : progress?.status === 'completed'
           ? 'bg-white/92 text-emerald-700'
           : progress?.status === 'in_progress'
@@ -395,7 +404,7 @@ export default function LessonCard({ lesson, onClick, actions, highlight = false
                 <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.08em] text-slate-600">{STATUS_LABELS[lesson.trang_thai] || lesson.trang_thai}</span>
                 {score?.provisional ? <span className="rounded-full bg-amber-50 px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.08em] text-amber-700">Điểm tạm</span> : null}
                 {lesson.access_mode === 'self_study' ? <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.08em] text-indigo-700"><BookOpenCheck className="h-3 w-3" /> Tự học</span> : null}
-                {progress?.status === 'completed' && lesson.allow_retake_after_completion ? <span className="inline-flex items-center gap-1 rounded-full bg-violet-50 px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.08em] text-violet-700">Có thể học lại</span> : null}
+                {progress?.status === 'completed' && !retakePending && lesson.allow_retake_after_completion ? <span className="inline-flex items-center gap-1 rounded-full bg-violet-50 px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.08em] text-violet-700">Có thể học lại</span> : null}
                 {canPreviewPreLesson ? <span className="inline-flex items-center gap-1 rounded-full bg-fuchsia-50 px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.08em] text-fuchsia-700"><PlayCircle className="h-3 w-3" /> Video trước bài</span> : null}
               </div>
 
@@ -460,7 +469,7 @@ export default function LessonCard({ lesson, onClick, actions, highlight = false
             </div>
           ) : null}
 
-          <div className="flex items-center justify-between border-t border-slate-100 pt-4 text-sm"><span className="max-w-[55%] truncate font-semibold text-slate-600">{lesson.nguoi_tao}</span><span className={`flex items-center gap-1 font-black ${accessLocked || resultLocked ? 'text-amber-700' : 'text-indigo-700'}`}>{accessLocked ? 'Bài đang khóa' : resultLocked ? 'Đã khóa kết quả' : progress?.status === 'in_progress' ? 'Tiếp tục học' : (Number(progress?.score_model_version || 0) >= 3 ? progress?.score_status === 'finalized' : progress?.assessment_score !== undefined) ? 'Xem kết quả' : progress?.status === 'completed' ? 'Xem lại bài' : 'Mở học tập'}<ChevronRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" /></span></div>
+          <div className="flex items-center justify-between border-t border-slate-100 pt-4 text-sm"><span className="max-w-[55%] truncate font-semibold text-slate-600">{lesson.nguoi_tao}</span><span className={`flex items-center gap-1 font-black ${accessLocked || resultLocked ? 'text-amber-700' : 'text-indigo-700'}`}>{accessLocked ? 'Bài đang khóa' : resultLocked ? 'Đã khóa kết quả' : retakePending ? 'Học lại cập nhật điểm' : progress?.status === 'in_progress' ? 'Tiếp tục học' : (Number(progress?.score_model_version || 0) >= 3 ? progress?.score_status === 'finalized' : progress?.assessment_score !== undefined) ? 'Xem kết quả' : progress?.status === 'completed' ? 'Xem lại bài' : 'Mở học tập'}<ChevronRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" /></span></div>
         </div>
       </button>
       {actions ? <div className="border-t border-slate-100 bg-slate-50 px-5 py-4">{actions}</div> : null}

@@ -9,7 +9,7 @@ import LearningChatPanel from './LearningChatPanel';
 import { getLessonContentApi, getTeachingSessionApi, saveTeachingSessionApi, setTeachingActivityAccessApi } from '../services/api';
 import { calculateFairAssessmentScore, calculateSectionProgress } from '../utils/learningScoreEngine';
 import { getFirebaseCurrentMemberClassId, subscribeFirebaseTeachingSession } from '../services/firebaseOperational';
-import { sanitizeSingleChoiceQuestion } from '../utils/quizSanitizer';
+import { isQuizQuestionQualityAcceptable, resolveCorrectOption, sanitizeQuizQuestion } from '../utils/quizSanitizer';
 
 interface LessonViewerProps {
   isOpen: boolean;
@@ -134,7 +134,7 @@ function buildFillInBlankQuestion(question: QuizQuestion, fallbackId: string): Q
 
 function normalizeQuestion(question: QuizQuestion, fallbackId: string): QuizQuestion {
   const qType = question.type === 'short_answer' ? 'fill_in_blank' : question.type;
-  if (qType === 'fill_in_blank') return buildFillInBlankQuestion({ ...question, type: 'fill_in_blank' }, fallbackId);
+  if (qType === 'fill_in_blank') return sanitizeQuizQuestion(buildFillInBlankQuestion({ ...question, type: 'fill_in_blank' }, fallbackId));
   const isTrueFalse = qType === 'true_false';
   const base: QuizQuestion = {
     ...question,
@@ -153,7 +153,7 @@ function normalizeQuestion(question: QuizQuestion, fallbackId: string): QuizQues
   // V6.81.0: dữ liệu cũ/AI có thể đã nhúng sẵn A./B./C./D. vào nội dung
   // đáp án. Chuẩn hóa trước khi hiển thị để không còn dạng "A. B. Dữ liệu" và
   // loại các lựa chọn trùng nội dung nhưng vẫn giữ đúng đáp án chuẩn.
-  return base.type === 'single_choice' ? sanitizeSingleChoiceQuestion(base) : base;
+  return sanitizeQuizQuestion(base);
 }
 
 function normalizeSection(section: LessonSectionV2, index: number): LessonSectionV2 {
@@ -174,7 +174,9 @@ function normalizeSection(section: LessonSectionV2, index: number): LessonSectio
     summary: cleanText(section.source_note || section.summary || ''),
     source_note: cleanText(section.source_note || section.summary || ''),
     examples: (section.examples || []).map((item) => cleanText(item)).filter(Boolean),
-    interactive_questions: (section.interactive_questions || []).map((question, qIndex) => normalizeQuestion(question, `IQ${index + 1}_${qIndex + 1}`)).filter((question) => question.question),
+    interactive_questions: (section.interactive_questions || [])
+      .map((question, qIndex) => normalizeQuestion(question, `IQ${index + 1}_${qIndex + 1}`))
+      .filter((question) => question.question && isQuizQuestionQualityAcceptable(question)),
     pages: Array.isArray(section.pages) ? section.pages.map((page, pageIndex) => ({
       ...page,
       page_id: page.page_id || `${section.section_id || `S${index + 1}`}_P${pageIndex + 1}`,
@@ -237,8 +239,10 @@ function toV2Sections(content: LessonContent | null): LessonSectionV2[] {
 
 function toFinalQuiz(content: LessonContent | null): QuizQuestion[] {
   if (!content) return [];
-  if (content.final_quiz?.length) return content.final_quiz.map((question, index) => normalizeQuestion(question, `FQ${index + 1}`));
-  return (content.luyen_tap?.trac_nghiem || []).map((question, index) => normalizeQuestion(question, `FQ${index + 1}`));
+  const source = content.final_quiz?.length ? content.final_quiz : (content.luyen_tap?.trac_nghiem || []);
+  return source
+    .map((question, index) => normalizeQuestion(question, `FQ${index + 1}`))
+    .filter((question) => isQuizQuestionQualityAcceptable(question));
 }
 
 function splitLongTextIntoLearningChunks(text: string, maxLength = 520) {
@@ -530,20 +534,9 @@ function shuffleArray<T>(items: T[]) {
   return copy;
 }
 
-function extractOptionKeyLocal(value?: string) {
-  const match = String(value || '').trim().match(/^([A-D])\s*[.)-]?/i);
-  return match ? match[1].toUpperCase() : '';
-}
-
 function resolveCorrectAnswerText(question: QuizQuestion) {
   const options = question.options || [];
-  const correct = String(question.correctAnswer || '').trim();
-  const key = extractOptionKeyLocal(correct);
-  if (key) {
-    const index = key.charCodeAt(0) - 65;
-    if (options[index]) return options[index];
-  }
-  return correct;
+  return resolveCorrectOption(options, question.correctAnswer) || String(question.correctAnswer || '').trim();
 }
 
 function prepareExamQuestions(questions: QuizQuestion[], shuffleQuestions: boolean, shuffleOptions: boolean) {
@@ -600,6 +593,7 @@ export default function LessonViewer({
   const sections = useMemo(() => toV2Sections(effectiveContent), [effectiveContent]);
   const finalQuiz = useMemo(() => toFinalQuiz(effectiveContent), [effectiveContent]);
   const [activeStep, setActiveStep] = useState<string>('intro');
+  const lessonMainRef = useRef<HTMLElement | null>(null);
   const [teachingClassId, setTeachingClassId] = useState('');
   const [teachingSession, setTeachingSession] = useState<TeachingSession | null>(null);
   const [teachingSessionBusy, setTeachingSessionBusy] = useState(false);
@@ -1009,6 +1003,18 @@ export default function LessonViewer({
     else setTeachingSessionError(res.message || 'Không chuyển được mục đang trình bày.');
   };
 
+  const scrollLessonContentToTop = (behavior: ScrollBehavior = 'smooth') => {
+    // V6.84.4: vùng nội dung bài học là một scroll container độc lập.
+    // Khi chuyển mục phải đưa học sinh về đầu nội dung mới thay vì giữ nguyên
+    // vị trí cuộn của mục trước. Hai requestAnimationFrame giúp đợi React render
+    // và drawer mobile đóng xong trước khi cuộn.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        lessonMainRef.current?.scrollTo({ top: 0, left: 0, behavior });
+      });
+    });
+  };
+
   const selectStep = (step: string) => {
     const targetSection = sections.find((section) => section.section_id === step);
     if (targetSection && isSectionLockedForStudent(targetSection)) {
@@ -1020,11 +1026,19 @@ export default function LessonViewer({
     if (step === 'final_quiz' && finalQuizLockedForStudent) {
       setMobileMenuOpen(false);
       const firstIncomplete = sections.find((section) => computedSectionProgress[section.section_id]?.status !== 'completed');
-      if (firstIncomplete) setActiveStep(firstIncomplete.section_id);
+      if (firstIncomplete) {
+        const alreadyActive = activeStep === firstIncomplete.section_id;
+        setActiveStep(firstIncomplete.section_id);
+        if (alreadyActive) scrollLessonContentToTop('smooth');
+      }
       return;
     }
+    const alreadyActive = activeStep === step;
     setActiveStep(step);
     setMobileMenuOpen(false);
+    // Nếu học sinh bấm lại chính mục đang học, React không đổi state nên effect
+    // bên dưới không chạy; vẫn cần đưa nội dung về đầu mục.
+    if (alreadyActive) scrollLessonContentToTop('smooth');
     if (step === 'final_quiz') {
       setLessonChatOpen(false);
       setLessonChatPrompt(null);
@@ -1036,6 +1050,13 @@ export default function LessonViewer({
     if (step === 'intro') onStepViewedComplete?.('khoi_dong');
     if (step === 'result' && incompleteSectionTitles.length === 0 && metrics.answered >= metrics.total) onStepViewedComplete?.('tong_ket');
   };
+
+  useEffect(() => {
+    if (!isOpen) return;
+    // Bao phủ các lần đổi mục không đi qua selectStep(), ví dụ giáo viên
+    // chuyển hoạt động đang trình bày cho học sinh trong teachingSession.
+    scrollLessonContentToTop('smooth');
+  }, [activeStep, isOpen]);
 
   const handleAnswerStateChange = (payload: LessonQuestionAnswerState) => {
     setAnswerStates((prev) => {
@@ -2042,7 +2063,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                 </div>
               </div>
             </aside>
-            <main className={`lesson-viewer-main-mobile overflow-y-auto bg-slate-50/70 p-3 transition-all sm:p-4 lg:p-5 ${lessonChatOpen && activeStep !== 'final_quiz' ? 'xl:pr-[600px]' : ''}`}>{renderActiveContent()}</main>
+            <main ref={lessonMainRef} className={`lesson-viewer-main-mobile overflow-y-auto bg-slate-50/70 p-3 transition-all sm:p-4 lg:p-5 ${lessonChatOpen && activeStep !== 'final_quiz' ? 'xl:pr-[600px]' : ''}`}>{renderActiveContent()}</main>
           </div>
 
           <AnimatePresence>

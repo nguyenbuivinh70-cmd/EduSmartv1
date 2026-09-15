@@ -262,8 +262,10 @@ export function firebaseErrorMessage(error: unknown) {
     'auth/user-disabled': 'Tài khoản Firebase đã bị vô hiệu hóa.',
     'auth/too-many-requests': 'Đăng nhập sai quá nhiều lần. Vui lòng thử lại sau.',
     'auth/network-request-failed': 'Không kết nối được Firebase. Vui lòng kiểm tra Internet.',
-    'permission-denied': 'Firestore từ chối thao tác. Hãy Publish Firestore Rules V6.84.0. Với học sinh, hãy kiểm tra hồ sơ đang active và thông tin lớp/khối; với giáo viên, hãy kiểm tra trường và phạm vi khối được phân công.',
-    'firestore/permission-denied': 'Firestore từ chối thao tác. Hãy Publish Firestore Rules V6.84.0. Với học sinh, hãy kiểm tra hồ sơ đang active và thông tin lớp/khối; với giáo viên, hãy kiểm tra trường và phạm vi khối được phân công.',
+    'permission-denied': 'Firestore từ chối thao tác theo điều kiện bảo mật hiện tại. Hãy tải lại dữ liệu, kiểm tra tài khoản đang active và phạm vi lớp/khối; nếu chức năng vừa được nâng cấp, hãy xác minh đúng phiên bản Firestore Rules đã được triển khai.',
+    'firestore/permission-denied': 'Firestore từ chối thao tác theo điều kiện bảo mật hiện tại. Hãy tải lại dữ liệu, kiểm tra tài khoản đang active và phạm vi lớp/khối; nếu chức năng vừa được nâng cấp, hãy xác minh đúng phiên bản Firestore Rules đã được triển khai.',
+    'resource-exhausted': 'Firestore đã chạm giới hạn quota/tài nguyên hiện tại. Dữ liệu chưa bị xóa. Với bài học, tiến trình xóa theo batch đã được lưu; hãy thử Tiếp tục xóa sau khi quota khôi phục.',
+    'firestore/resource-exhausted': 'Firestore đã chạm giới hạn quota/tài nguyên hiện tại. Dữ liệu chưa bị xóa. Với bài học, tiến trình xóa theo batch đã được lưu; hãy thử Tiếp tục xóa sau khi quota khôi phục.',
   };
   if (messages[code]) return messages[code];
   if (code.includes('api-key-not-valid') || (error instanceof Error && error.message.includes('api-key-not-valid'))) {
@@ -308,8 +310,8 @@ export async function loadValidatedCurrentFirebaseMember() {
   }
 
   const member = normalizeMember(memberSnapshot.data(), uid, signedInEmail);
-  if (member.authUid !== uid) throw new Error('Hồ sơ thành viên thiếu/sai authUid. Hãy Publish Firestore Rules V6.84.0 rồi đăng nhập lại.');
-  if (member.schoolId !== FIREBASE_SCHOOL_ID) throw new Error(`Hồ sơ thành viên thiếu/sai schoolId (cần ${FIREBASE_SCHOOL_ID}). Hãy Publish Firestore Rules V6.84.0 rồi đăng nhập lại.`);
+  if (member.authUid !== uid) throw new Error('Hồ sơ thành viên thiếu/sai authUid. Hãy xác minh Firestore Rules hiện hành rồi đăng nhập lại.');
+  if (member.schoolId !== FIREBASE_SCHOOL_ID) throw new Error(`Hồ sơ thành viên thiếu/sai schoolId (cần ${FIREBASE_SCHOOL_ID}). Hãy xác minh Firestore Rules hiện hành rồi đăng nhập lại.`);
   if (member.status !== 'active') throw new Error('Tài khoản thành viên đang bị khóa hoặc chưa kích hoạt.');
   if (!member.userId) throw new Error('Hồ sơ thành viên chưa có trường userId.');
   return { uid, ...member };
@@ -390,8 +392,8 @@ export async function signInAndLoadMember(email: string, password: string): Prom
     }
 
     const member = normalizeMember(memberSnapshot.data(), uid, signedInEmail);
-    if (member.authUid !== uid) throw new Error('Hồ sơ thành viên thiếu/sai authUid. Hãy Publish Firestore Rules V6.84.0 rồi đăng nhập lại.');
-    if (member.schoolId !== FIREBASE_SCHOOL_ID) throw new Error(`Hồ sơ thành viên thiếu/sai schoolId (cần ${FIREBASE_SCHOOL_ID}). Hãy Publish Firestore Rules V6.84.0 rồi đăng nhập lại.`);
+    if (member.authUid !== uid) throw new Error('Hồ sơ thành viên thiếu/sai authUid. Hãy xác minh Firestore Rules hiện hành rồi đăng nhập lại.');
+    if (member.schoolId !== FIREBASE_SCHOOL_ID) throw new Error(`Hồ sơ thành viên thiếu/sai schoolId (cần ${FIREBASE_SCHOOL_ID}). Hãy xác minh Firestore Rules hiện hành rồi đăng nhập lại.`);
     if (member.status !== 'active') throw new Error('Tài khoản thành viên đang bị khóa hoặc chưa kích hoạt.');
     if (!member.userId) throw new Error('Hồ sơ thành viên chưa có trường userId.');
 
@@ -473,7 +475,7 @@ export async function verifyOrActivateFirebaseClassmateInIsolation(
       } catch (rosterError) {
         const rosterCode = rosterError instanceof FirebaseError ? rosterError.code : '';
         if (rosterCode === 'permission-denied' || rosterCode === 'firestore/permission-denied') {
-          throw new Error('Chưa thể kiểm tra bạn cùng lớp. Hãy triển khai Firestore Rules V6.84.0 rồi thử lại.');
+          throw new Error('Chưa thể kiểm tra bạn cùng lớp. Hãy xác minh Firestore Rules hiện hành rồi thử lại.');
         }
         throw rosterError;
       }
@@ -556,7 +558,7 @@ export async function verifyOrActivateFirebaseClassmateInIsolation(
 
     const member = normalizeMember(memberSnapshot.data(), uid, signedInEmail);
     if (member.authUid !== uid || member.schoolId !== FIREBASE_SCHOOL_ID) {
-      throw new Error('Hồ sơ Firebase của bạn học cùng thiếu/sai authUid hoặc schoolId. Hãy Publish Firestore Rules V6.84.0.');
+      throw new Error('Hồ sơ Firebase của bạn học cùng thiếu/sai authUid hoặc schoolId. Hãy xác minh Firestore Rules hiện hành.');
     }
     if (member.role !== 'student') throw new Error('Tài khoản được nhập không phải tài khoản học sinh.');
     if (member.status !== 'active') throw new Error('Tài khoản bạn học cùng đang bị khóa hoặc chưa kích hoạt.');
@@ -571,35 +573,26 @@ export async function verifyOrActivateFirebaseClassmateInIsolation(
       if (member.classId !== consent.classId || member.grade !== consent.grade || uid === consent.hostUid) {
         throw new Error('Bạn học cùng phải thuộc đúng lớp/khối và khác người tạo nhóm.');
       }
-      // V6.84.0: chụp trạng thái chuẩn bị bài ngay tại thời điểm chính bạn học
-      // xác nhận mật khẩu. Dữ liệu này được ghi trong consent dưới UID của bạn đó,
-      // nên người tạo nhóm không thể tự nâng điểm chuẩn bị cho thành viên khác.
+      // V6.88.0: kết quả chuẩn bị nằm dưới lesson/{lessonId}/preparationSubmissions
+      // và dùng Firebase Auth UID + video revision làm document ID. Không còn
+      // phụ thuộc metadata lớp/khối lặp lại trong submission.
       try {
-        const canonical = await getDoc(doc(isolatedDb, 'schools', FIREBASE_SCHOOL_ID, 'preLessonProgress', `${member.userId}_${consent.lessonId}`));
-        let raw: any = canonical.exists() ? canonical.data() : null;
-        if (!raw) {
-          const legacy = await getDocs(query(
-            collection(isolatedDb, 'schools', FIREBASE_SCHOOL_ID, 'preLessonProgress'),
-            where('user_id', '==', member.userId),
-          ));
-          const candidates = legacy.docs
-            .map((item) => item.data() as any)
-            .filter((item) => cleanText(item.lesson_id) === cleanText(consent.lessonId))
-            .sort((a, b) => Number(b.watch_percent || 0) - Number(a.watch_percent || 0));
-          raw = candidates[0] || null;
-        }
+        const lessonSnap = await getDoc(doc(isolatedDb, 'schools', FIREBASE_SCHOOL_ID, 'lessons', consent.lessonId));
+        const lessonRaw: any = lessonSnap.exists() ? lessonSnap.data() : null;
+        const revision = Math.max(1, Math.floor(Number(lessonRaw?.pre_lesson_video_revision || 1)));
+        const submission = await getDoc(doc(isolatedDb, 'schools', FIREBASE_SCHOOL_ID, 'lessons', consent.lessonId, 'preparationSubmissions', `${uid}_r${revision}`));
+        const raw: any = submission.exists() ? submission.data() : null;
         if (raw) {
-          preLessonWatchPercent = Math.max(0, Math.min(100, Number(raw.watch_percent || 0)));
-          const rawStatus = cleanText(raw.preparation_status);
-          preLessonPreparationStatus = (['not_started', 'in_progress', 'prepared', 'late_completed'].includes(rawStatus)
-            ? rawStatus
-            : raw.video_status === 'completed'
-              ? (raw.completed_before_deadline === false ? 'late_completed' : 'prepared')
-              : preLessonWatchPercent > 0 ? 'in_progress' : 'not_started') as FirebaseVerifiedClassmate['preLessonPreparationStatus'];
+          preLessonWatchPercent = Math.max(0, Math.min(100, Number(raw.watchPercent ?? raw.watch_percent ?? 0)));
+          const submittedAt = raw?.submittedAt?.toDate instanceof Function ? raw.submittedAt.toDate() : null;
+          const deadlineText = cleanText(lessonRaw?.pre_lesson_deadline || lessonRaw?.thoi_gian_bat_dau);
+          const deadline = deadlineText ? new Date(deadlineText) : null;
+          const onTime = !deadline || Number.isNaN(deadline.getTime()) || !submittedAt || submittedAt.getTime() <= deadline.getTime();
+          preLessonPreparationStatus = (onTime ? 'prepared' : 'late_completed') as FirebaseVerifiedClassmate['preLessonPreparationStatus'];
           preLessonPreparationScore = preLessonPreparationStatus === 'prepared' ? 10 : 0;
         }
       } catch {
-        // Nếu trạng thái cũ chưa đọc được, dùng 0 điểm thay vì làm gián đoạn xác nhận nhóm.
+        // Nếu kết quả chưa đọc được, dùng trạng thái chưa gửi thay vì làm gián đoạn xác nhận nhóm.
       }
       await setDoc(doc(isolatedDb, 'schools', FIREBASE_SCHOOL_ID, 'coLearningConsents', `${consent.sessionId}_${uid}`), {
         schoolId: FIREBASE_SCHOOL_ID, schemaVersion: 1, sessionId: consent.sessionId,

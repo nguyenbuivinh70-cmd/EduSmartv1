@@ -12,14 +12,13 @@ interface AIConfigModalProps {
   user?: User | null;
   onSave: (config: AIConfig) => Promise<boolean | void> | boolean | void;
   onDelete?: () => void;
-  setLoading: (loading: boolean) => void;
   showToast: (msg: string, type: 'success' | 'error') => void;
   openReason?: AIConfigOpenReason;
 }
 
 const fieldClassName = 'w-full rounded-2xl border border-slate-200 bg-white py-3.5 px-4 outline-none transition-all focus:border-primary focus:ring-4 focus:ring-primary/15';
 
-export default function AIConfigModal({ isOpen, onClose, config, user, onSave, onDelete, setLoading, showToast, openReason = 'manual' }: AIConfigModalProps) {
+export default function AIConfigModal({ isOpen, onClose, config, user, onSave, onDelete, showToast, openReason = 'manual' }: AIConfigModalProps) {
   const [apiKey, setApiKey] = useState(config.apiKey);
   const [model, setModel] = useState(config.model || AI_MODELS[0]);
   const [isTesting, setIsTesting] = useState(false);
@@ -53,13 +52,14 @@ export default function AIConfigModal({ isOpen, onClose, config, user, onSave, o
       return;
     }
     setIsSaving(true);
-    setLoading(true);
     try {
-      const saved = await onSave({ apiKey, model });
+      const saved = await onSave({ apiKey: apiKey.trim(), model });
       if (saved === false) return;
+      setTestResult('success');
       onClose();
     } finally {
-      setLoading(false);
+      // V6.88.2: không dùng LoadingOverlay toàn ứng dụng cho thao tác lưu API key.
+      // Modal có trạng thái isSaving riêng nên tránh hiện nhầm thông báo của tác vụ trước.
       setIsSaving(false);
     }
   };
@@ -143,7 +143,7 @@ export default function AIConfigModal({ isOpen, onClose, config, user, onSave, o
                 <section className="app-modal-section">
                   <div className="mb-4">
                     <p className="app-modal-section-title">Thông tin kết nối</p>
-                    <p className="app-modal-section-description">Sau khi lưu, cấu hình sẽ được đồng bộ lên hệ thống để dùng lại trên thiết bị khác sau khi đăng nhập.</p>
+                    <p className="app-modal-section-description">API key được lưu riêng theo Firebase UID hiện tại và chỉ tài khoản đó được phép đọc/ghi. Sau khi đăng nhập trên thiết bị khác, cấu hình sẽ được tải lại tự động.</p>
                   </div>
                   <div className="space-y-4">
                     <div className="space-y-2">

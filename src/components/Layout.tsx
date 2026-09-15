@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import {
   Menu, X, LayoutDashboard, Users, BookOpen, GraduationCap,
   Settings, LogOut, User as UserIcon, CheckSquare,
-  Bell, Search, FolderKanban, Trophy, BarChart3, MonitorPlay, CalendarDays, WifiOff
+  Bell, Search, FolderKanban, Trophy, BarChart3, MonitorPlay, CalendarDays, WifiOff, BookOpenCheck
 } from 'lucide-react';
 import { User } from '../types';
 import { formatManagedGrades } from '../utils/gradeScope';
@@ -56,6 +56,7 @@ export default function Layout({ user, onLogout, children, activeMenu, setActive
     { id: 'classes', label: 'Lớp học', icon: <GraduationCap className="h-5 w-5" /> },
     { id: 'subjects', label: 'Môn học', icon: <BookOpen className="h-5 w-5" /> },
     { id: 'lessons', label: 'Bài học', icon: <FolderKanban className="h-5 w-5" /> },
+    { id: 'practice', label: 'Luyện tập', icon: <BookOpenCheck className="h-5 w-5" /> },
     { id: 'approvals', label: 'Duyệt chia sẻ', icon: <CheckSquare className="h-5 w-5" /> },
     { id: 'arena', label: 'Đấu trường tri thức', icon: <Trophy className="h-5 w-5" /> },
     { id: 'analytics', label: 'Theo dõi học tập', icon: <BarChart3 className="h-5 w-5" /> },
@@ -65,10 +66,11 @@ export default function Layout({ user, onLogout, children, activeMenu, setActive
   ];
 
   // V6.74.2: giáo viên dùng chung đúng các màn hình quản lý của Admin,
-  // nhưng sidebar chỉ hiển thị 5 chức năng nghiệp vụ được giao. Không còn
+  // nhưng sidebar chỉ hiển thị các chức năng nghiệp vụ được giao. Không còn
   // các route/giao diện riêng như Học tập, Bài học của tôi, Tạo bài học.
   const teacherMenu = [
     { id: 'lessons', label: 'Bài học', icon: <FolderKanban className="h-5 w-5" /> },
+    { id: 'practice', label: 'Luyện tập', icon: <BookOpenCheck className="h-5 w-5" /> },
     { id: 'arena', label: 'Đấu trường tri thức', icon: <Trophy className="h-5 w-5" /> },
     { id: 'analytics', label: 'Theo dõi học tập', icon: <BarChart3 className="h-5 w-5" /> },
     { id: 'ai_config', label: 'Cấu hình AI', icon: <Settings className="h-5 w-5" /> },
@@ -79,6 +81,7 @@ export default function Layout({ user, onLogout, children, activeMenu, setActive
 
   const studentMenu = [
     { id: 'learning', label: 'Bài học', icon: <BookOpen className="h-5 w-5" /> },
+    { id: 'practice', label: 'Luyện tập', icon: <BookOpenCheck className="h-5 w-5" /> },
     { id: 'arena', label: 'Đấu trường tri thức', icon: <Trophy className="h-5 w-5" /> },
     { id: 'ai_config', label: 'Cấu hình AI', icon: <Settings className="h-5 w-5" /> },
     { id: 'profile', label: 'Hồ sơ cá nhân', icon: <UserIcon className="h-5 w-5" /> },
@@ -226,7 +229,7 @@ export default function Layout({ user, onLogout, children, activeMenu, setActive
         </main>
 
         {isMobile && user.vai_tro === 'student' && !adminLike ? (
-          <nav className="fixed inset-x-0 bottom-0 z-30 grid grid-cols-4 border-t border-slate-200 bg-white/95 px-2 pt-2 pb-[calc(0.5rem+env(safe-area-inset-bottom))] shadow-[0_-12px_30px_rgba(15,23,42,0.08)] backdrop-blur-xl" aria-label="Điều hướng học sinh">
+          <nav className="fixed inset-x-0 bottom-0 z-30 grid grid-cols-5 border-t border-slate-200 bg-white/95 px-2 pt-2 pb-[calc(0.5rem+env(safe-area-inset-bottom))] shadow-[0_-12px_30px_rgba(15,23,42,0.08)] backdrop-blur-xl" aria-label="Điều hướng học sinh">
             {studentMenu.map(item => (
               <button
                 key={item.id}

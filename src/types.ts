@@ -8,6 +8,7 @@ export type LessonSchemaVersion = 'lesson_v1' | 'lesson_v2' | 'lesson_v3';
 export type LearningStatus = 'not_started' | 'in_progress' | 'completed';
 export type StudyMode = 'single' | 'co_learning';
 export type LessonAccessMode = 'teacher_controlled' | 'self_study';
+export type SelfStudyScope = 'none' | 'classes' | 'all';
 export type LearningResultState = 'valid' | 'cancelled_retake' | 'invalid_cheating';
 export type LearningResultActionType = 'allow_retake' | 'invalidate_cheating';
 
@@ -170,6 +171,8 @@ export interface LessonRow {
   cho_phep_nop_sau_han?: boolean | string;
   is_locked?: boolean;
   access_mode?: LessonAccessMode;
+  self_study_scope?: SelfStudyScope;
+  self_study_class_ids?: string[];
   allow_retake_after_completion?: boolean;
   locked_at?: string;
   locked_by_uid?: string;
@@ -181,6 +184,7 @@ export interface LessonRow {
   pre_lesson_required?: boolean;
   pre_lesson_completion_threshold?: number;
   pre_lesson_deadline?: string;
+  pre_lesson_video_revision?: number;
   pre_lesson_score_enabled?: boolean;
   pre_lesson_score_weight?: number;
   content_schema_version?: LessonSchemaVersion;
@@ -218,6 +222,8 @@ export interface Lesson {
   cho_phep_nop_sau_han?: boolean | string;
   is_locked?: boolean;
   access_mode?: LessonAccessMode;
+  self_study_scope?: SelfStudyScope;
+  self_study_class_ids?: string[];
   allow_retake_after_completion?: boolean;
   locked_at?: string;
   locked_by_uid?: string;
@@ -229,6 +235,7 @@ export interface Lesson {
   pre_lesson_required?: boolean;
   pre_lesson_completion_threshold?: number;
   pre_lesson_deadline?: string;
+  pre_lesson_video_revision?: number;
   pre_lesson_score_enabled?: boolean;
   pre_lesson_score_weight?: number;
   content_schema_version?: LessonSchemaVersion;
@@ -373,6 +380,81 @@ export interface LessonBuilderDefaultsResponse {
   has_defaults?: boolean;
 }
 
+
+export type InteractivePracticeActivityType = 'classification' | 'sequence' | 'categorization' | 'scenario_reasoning' | 'reflection';
+
+export interface InteractivePracticeCategory {
+  id: string;
+  label: string;
+  icon?: string;
+}
+
+export interface InteractivePracticeItem {
+  id: string;
+  label: string;
+  icon?: string;
+  correctCategory?: string;
+  explanation?: string;
+  correctAbility?: string;
+  options?: string[];
+}
+
+export interface InteractivePracticeSequenceScenario {
+  id: string;
+  title: string;
+  steps: string[];
+}
+
+export interface InteractivePracticeScenario {
+  id: string;
+  prompt: string;
+  correctImpact: 'positive' | 'negative' | 'both' | 'depends' | string;
+  reasons: string[];
+  correctReasonIndex: number;
+  correctReasonIndices?: number[];
+}
+
+export interface InteractivePracticeActivity {
+  id: string;
+  type: InteractivePracticeActivityType;
+  title: string;
+  instructions?: string;
+  maxScore: number;
+  categories?: InteractivePracticeCategory[];
+  items?: InteractivePracticeItem[];
+  sequences?: InteractivePracticeSequenceScenario[];
+  abilities?: string[];
+  scenarios?: InteractivePracticeScenario[];
+  prompt?: string;
+  placeholder?: string;
+  minExamples?: number;
+}
+
+export interface InteractivePracticeManifest {
+  schemaVersion: 'practice_v1';
+  title: string;
+  description?: string;
+  sourceFormat: 'edusmart_manifest' | 'legacy_html_t7' | 'legacy_html_t9' | 'legacy_html_generic';
+  sourceFileName?: string;
+  subject?: string;
+  grade?: string;
+  lessonId?: string;
+  lessonNumber?: number;
+  maxScore: number;
+  activities: InteractivePracticeActivity[];
+  importedAt?: string;
+  importWarnings?: string[];
+}
+
+export interface InteractivePracticeImportSummary {
+  title: string;
+  sourceFormat: InteractivePracticeManifest['sourceFormat'];
+  activityCount: number;
+  scoredItemCount: number;
+  maxScore: number;
+  warnings: string[];
+}
+
 export interface ReviewPracticeRow {
   review_id: string;
   tieu_de: string;
@@ -393,6 +475,23 @@ export interface ReviewPracticeRow {
   nguoi_tao_id?: string;
   created_at?: string;
   updated_at?: string;
+  source_type?: string;
+  practice_schema_version?: number | string;
+  activity_count?: number | string;
+  max_score?: number | string;
+  source_file_name?: string;
+  lesson_id?: string;
+  time_limit_minutes?: number | string;
+  max_attempts?: number | string;
+  pass_score?: number | string;
+  auto_submit_on_timeout?: boolean | string;
+  allow_solo?: boolean | string;
+  allow_co_learning?: boolean | string;
+  show_answers_mode?: 'after_submit' | 'after_close' | 'never' | string;
+  available_from?: string;
+  available_until?: string;
+  target_class_ids?: string[];
+  locked_class_ids?: string[];
 }
 
 export interface ReviewPracticeConfig {
@@ -402,8 +501,18 @@ export interface ReviewPracticeConfig {
   shuffle_questions?: boolean;
   shuffle_options?: boolean;
   show_answers_after_submit?: boolean;
+  show_answers_mode?: 'after_submit' | 'after_close' | 'never';
   allow_retry?: boolean;
-  source_mode?: 'random' | 'balanced' | 'manual';
+  max_attempts?: number;
+  pass_score?: number;
+  auto_submit_on_timeout?: boolean;
+  allow_solo?: boolean;
+  allow_co_learning?: boolean;
+  available_from?: string;
+  available_until?: string;
+  target_class_ids?: string[];
+  locked_class_ids?: string[];
+  source_mode?: 'random' | 'balanced' | 'manual' | 'interactive_file';
   include_interactive?: boolean;
 }
 
@@ -412,6 +521,7 @@ export interface ReviewPracticeContentResponse {
   lessons: LessonRow[];
   questions: QuizQuestion[];
   config?: ReviewPracticeConfig;
+  practice_manifest?: InteractivePracticeManifest;
 }
 
 export interface ReviewPracticeAttempt {
@@ -430,6 +540,10 @@ export interface ReviewPracticeAttempt {
   submitted_at?: string;
   auto_submitted?: boolean | string;
   time_spent_seconds?: number | string;
+  study_mode?: 'single' | 'co_learning' | string;
+  co_learning_session_id?: string;
+  participant_user_ids?: string[];
+  participant_names?: string[];
 }
 
 export interface ReviewPracticeResultStudent {
@@ -552,6 +666,26 @@ export interface TeachingSession {
   updated_by_name?: string;
 }
 
+export interface PreLessonSubmission {
+  submission_id: string;
+  lesson_id: string;
+  user_id: string;
+  ownerUid?: string;
+  schoolId?: string;
+  khoi: string;
+  lop_id?: string;
+  video_id?: string;
+  video_revision: number;
+  required_percent: number;
+  watch_percent: number;
+  watched_seconds: number;
+  duration_seconds: number;
+  preparation_status: 'prepared' | 'late_completed';
+  submitted_at?: string;
+  completed_before_deadline?: boolean;
+  schemaVersion?: number;
+}
+
 export interface PreLessonProgress {
   progress_id: string;
   lesson_id: string;
@@ -576,6 +710,7 @@ export interface PreLessonProgress {
   preparation_status?: 'not_started' | 'in_progress' | 'prepared' | 'late_completed';
   started_at?: string;
   last_watched_at?: string;
+  updated_at?: string;
   completed_at?: string;
   completed_before_deadline?: boolean;
   schemaVersion?: number;
@@ -769,6 +904,7 @@ export interface LessonComposerValues {
   pre_lesson_required?: boolean;
   pre_lesson_completion_threshold?: number;
   pre_lesson_deadline?: string;
+  pre_lesson_video_revision?: number;
   pre_lesson_score_enabled?: boolean;
   pre_lesson_score_weight?: number;
   section_video_links?: string;
@@ -782,6 +918,8 @@ export interface LessonComposerValues {
   cho_phep_hoc_sau_han?: boolean;
   cho_phep_nop_sau_han?: boolean;
   access_mode?: LessonAccessMode;
+  self_study_scope?: SelfStudyScope;
+  self_study_class_ids?: string[];
   allow_retake_after_completion?: boolean;
 }
 
@@ -920,7 +1058,7 @@ export interface LessonProgressRecord {
   learning_process_score?: number;
   final_quiz_score?: number;
   current_score?: number;
-  score_status?: 'in_progress' | 'finalized' | 'not_applicable';
+  score_status?: 'in_progress' | 'finalized' | 'retake_pending' | 'not_applicable';
   score_calculated_at?: string;
   last_closed_at?: string;
   save_state?: 'saving' | 'saved' | 'save_failed';
@@ -928,7 +1066,7 @@ export interface LessonProgressRecord {
   result_group_id?: string;
   result_version?: number;
   retake_allowed?: boolean;
-  /** V6.84.0: quyền học lại chính thức do giáo viên cấp; 1 quyền = 1 lần nộp mới. */
+  /** V6.84.1: quyền học lại chính thức do giáo viên cấp; 1 quyền = 1 lần nộp mới. */
   official_retake_remaining?: number;
   official_retake_grant_id?: string;
   official_retake_granted_at?: string;
@@ -937,6 +1075,7 @@ export interface LessonProgressRecord {
   official_retake_last_consumed_at?: string;
   official_retake_count?: number;
   previous_official_score?: number;
+  previous_official_completed_at?: string;
   score_reason?: 'submitted' | 'deadline_missed' | 'official_retake' | string;
   deadline_status?: 'not_due' | 'on_time' | 'missed' | 'overridden' | string;
   deadline_finalized_at?: string;
@@ -957,6 +1096,7 @@ export interface LessonProgressRecord {
   pre_lesson_completed_at?: string;
   pre_lesson_completed_before_deadline?: boolean;
   pre_lesson_preparation_status?: 'not_started' | 'in_progress' | 'prepared' | 'late_completed';
+  pre_lesson_last_watched_at?: string;
   preparation_score?: number;
   preparation_weight?: number;
   learning_component_weight?: number;
@@ -983,7 +1123,7 @@ export interface LessonRetakeAttempt {
   learning_process_score?: number;
   final_quiz_score?: number;
   completion_percent: number;
-  score_status?: 'in_progress' | 'finalized' | 'not_applicable';
+  score_status?: 'in_progress' | 'finalized' | 'retake_pending' | 'not_applicable';
   score_model_version?: number;
   progress: LessonProgressRecord;
   started_at: string;
@@ -1055,7 +1195,7 @@ export interface ScoreTrackingConfig {
   updated_at?: string;
   /** Chỉ dùng phía client để báo cấu hình lớp đang kế thừa cấu hình chung khối/môn. */
   inherited_from_grade?: boolean;
-  /** V6.84.0: governance cho mốc điểm. */
+  /** V6.84.1: governance cho mốc điểm. */
   milestone_status?: Partial<Record<AssessmentMilestoneKey, 'draft' | 'locked'>>;
   milestone_locked_at?: Partial<Record<AssessmentMilestoneKey, string>>;
   milestone_locked_by_name?: Partial<Record<AssessmentMilestoneKey, string>>;
@@ -1085,6 +1225,7 @@ export interface StudentLearningAnalyticsRow {
   official_retake_grant_id?: string;
   official_retake_count?: number;
   previous_official_score?: number;
+  previous_official_completed_at?: string;
   score_reason?: string;
   deadline_status?: string;
   deadline_finalized_at?: string;
@@ -1107,12 +1248,13 @@ export interface StudentLearningAnalyticsRow {
   pre_lesson_completed_at?: string;
   pre_lesson_completed_before_deadline?: boolean;
   pre_lesson_preparation_status?: 'not_started' | 'in_progress' | 'prepared' | 'late_completed';
+  pre_lesson_last_watched_at?: string;
   preparation_score?: number;
   preparation_weight?: number;
   learning_process_score?: number;
   final_quiz_score?: number;
   current_score?: number;
-  score_status?: 'in_progress' | 'finalized' | 'not_applicable';
+  score_status?: 'in_progress' | 'finalized' | 'retake_pending' | 'not_applicable';
   score_model_version?: number;
   scored_section_count?: number;
   scorable_section_count?: number;
@@ -1130,4 +1272,6 @@ export interface LearningResultModerationSummary {
   affected_user_ids: string[];
   affected_count: number;
   result_group_id?: string;
+  audit_saved?: boolean;
+  audit_warning?: string;
 }

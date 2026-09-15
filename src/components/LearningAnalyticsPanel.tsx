@@ -7,6 +7,7 @@ import {
   BookOpen,
   CalendarDays,
   CheckCircle2,
+  Clock3,
   ChevronDown,
   ClipboardList,
   Download,
@@ -129,21 +130,20 @@ function getMilestoneLessonIds(config: ScoreTrackingConfig | null, key: Assessme
 function getPreparationEvaluation(lesson: Lesson, row?: StudentLearningAnalyticsRow) {
   const threshold = Math.max(50, Math.min(100, Number(lesson.pre_lesson_completion_threshold || 80)));
   const watchPercent = Math.max(0, Math.min(100, Math.round(Number(row?.pre_lesson_watch_percent || 0))));
-  const completed = row?.pre_lesson_preparation_status === 'prepared'
-    || row?.pre_lesson_preparation_status === 'late_completed'
-    || row?.pre_lesson_status === 'completed';
   const late = row?.pre_lesson_preparation_status === 'late_completed'
-    || (completed && row?.pre_lesson_completed_before_deadline === false);
+    || (row?.pre_lesson_status === 'completed' && row?.pre_lesson_completed_before_deadline === false);
   const prepared = !late && (row?.pre_lesson_preparation_status === 'prepared'
     || (row?.pre_lesson_status === 'completed' && watchPercent >= threshold));
-  const detail = prepared
-    ? 'Đạt yêu cầu'
-    : late
-      ? 'Hoàn thành sau hạn'
-      : watchPercent > 0
-        ? `Chưa đạt ngưỡng ${threshold}%`
-        : 'Chưa xem video';
-  return { prepared, watchPercent, threshold, detail };
+  const state: 'prepared' | 'late_completed' | 'not_started' = prepared ? 'prepared' : late ? 'late_completed' : 'not_started';
+  const detail = state === 'prepared'
+    ? `Đã gửi kết quả đúng hạn • ${watchPercent}%`
+    : state === 'late_completed'
+      ? `Đã gửi kết quả sau hạn • ${watchPercent}%`
+      : 'Chưa gửi kết quả chuẩn bị bài';
+  const statusLabel = state === 'prepared' ? 'Đã chuẩn bị'
+    : state === 'late_completed' ? 'Hoàn thành muộn'
+      : 'Chưa gửi';
+  return { prepared, watchPercent, threshold, detail, state, statusLabel };
 }
 
 
@@ -236,6 +236,7 @@ function getLessonScoreWithDeadline(row: StudentLearningAnalyticsRow | undefined
   const official = getLessonScore(row);
   if (official !== undefined) return official;
   if (row?.result_state === 'invalid_cheating') return undefined;
+  if (row?.score_status === 'retake_pending' || Number(row?.official_retake_remaining || 0) > 0) return undefined;
   return lessonDeadlineZeroApplies(lesson) ? 0 : undefined;
 }
 
@@ -252,6 +253,7 @@ function getProvisionalLessonScore(row?: StudentLearningAnalyticsRow) {
 
 function getLearningResultLabel(row?: StudentLearningAnalyticsRow) {
   if (row?.result_state === 'invalid_cheating') return 'Đã hủy do gian lận';
+  if (row?.score_status === 'retake_pending' || Number(row?.official_retake_remaining || 0) > 0) return 'Chờ học lại cập nhật điểm';
   if (row?.result_state === 'cancelled_retake') return 'Được phép học lại';
   return STATUS_LABELS[row?.status || 'not_started'] || row?.status || 'Chưa học';
 }
@@ -266,11 +268,10 @@ function hasStartedMainLesson(row?: StudentLearningAnalyticsRow) {
 }
 
 function getPreLessonStatusLabel(row?: StudentLearningAnalyticsRow) {
-  if (row?.pre_lesson_preparation_status === 'prepared') return 'Có chuẩn bị';
-  if (row?.pre_lesson_preparation_status === 'late_completed') return 'Chưa chuẩn bị • Đã xem muộn';
-  if (row?.pre_lesson_status === 'completed') return row.pre_lesson_completed_before_deadline === false ? 'Chưa chuẩn bị • Đã xem muộn' : 'Có chuẩn bị';
-  if (row?.pre_lesson_preparation_status === 'in_progress' || row?.pre_lesson_status === 'in_progress' || Number(row?.pre_lesson_watch_percent || 0) > 0) return `Chưa chuẩn bị • Đang xem ${Math.round(Number(row?.pre_lesson_watch_percent || 0))}%`;
-  return 'Chưa chuẩn bị';
+  if (row?.pre_lesson_preparation_status === 'prepared') return 'Đã chuẩn bị';
+  if (row?.pre_lesson_preparation_status === 'late_completed') return 'Hoàn thành muộn';
+  if (row?.pre_lesson_status === 'completed') return row.pre_lesson_completed_before_deadline === false ? 'Hoàn thành muộn' : 'Đã chuẩn bị';
+  return 'Chưa gửi';
 }
 
 function average(values: number[]) {
@@ -581,19 +582,25 @@ export default function LearningAnalyticsPanel({
   const preparationSummaryRows = useMemo(() => preparationLessons.map((lesson) => {
     const lessonStudents = visibleStudents.filter((student) => lessonAppliesToStudent(lesson, student));
     const evaluations = lessonStudents.map((student) => getPreparationEvaluation(lesson, progressMap.get(`${student.user_id}__${lesson.lesson_id}`)));
-    const prepared = evaluations.filter((item) => item.prepared).length;
-    return { lesson, total: lessonStudents.length, prepared, notPrepared: Math.max(0, lessonStudents.length - prepared), rate: lessonStudents.length ? Math.round((prepared / lessonStudents.length) * 100) : 0 };
+    const prepared = evaluations.filter((item) => item.state === 'prepared').length;
+    const lateCompleted = evaluations.filter((item) => item.state === 'late_completed').length;
+    const notStarted = evaluations.filter((item) => item.state === 'not_started').length;
+    return { lesson, total: lessonStudents.length, prepared, lateCompleted, notStarted, notPrepared: Math.max(0, lessonStudents.length - prepared), rate: lessonStudents.length ? Math.round((prepared / lessonStudents.length) * 100) : 0 };
   }), [preparationLessons, visibleStudents, progressMap]);
 
   const preparationStats = useMemo(() => {
     if (!selectedPreparationLesson) {
       const total = preparationSummaryRows.reduce((sum, item) => sum + item.total, 0);
       const prepared = preparationSummaryRows.reduce((sum, item) => sum + item.prepared, 0);
-      return { total, prepared, notPrepared: Math.max(0, total - prepared), rate: total ? Math.round((prepared / total) * 100) : 0 };
+      const lateCompleted = preparationSummaryRows.reduce((sum, item) => sum + item.lateCompleted, 0);
+      const notStarted = preparationSummaryRows.reduce((sum, item) => sum + item.notStarted, 0);
+      return { total, prepared, lateCompleted, notStarted, notPrepared: Math.max(0, total - prepared), rate: total ? Math.round((prepared / total) * 100) : 0 };
     }
     const total = preparationDetailRowsAll.length;
-    const prepared = preparationDetailRowsAll.filter((item) => item.evaluation.prepared).length;
-    return { total, prepared, notPrepared: Math.max(0, total - prepared), rate: total ? Math.round((prepared / total) * 100) : 0 };
+    const prepared = preparationDetailRowsAll.filter((item) => item.evaluation.state === 'prepared').length;
+    const lateCompleted = preparationDetailRowsAll.filter((item) => item.evaluation.state === 'late_completed').length;
+    const notStarted = preparationDetailRowsAll.filter((item) => item.evaluation.state === 'not_started').length;
+    return { total, prepared, lateCompleted, notStarted, notPrepared: Math.max(0, total - prepared), rate: total ? Math.round((prepared / total) * 100) : 0 };
   }, [selectedPreparationLesson, preparationSummaryRows, preparationDetailRowsAll]);
 
   const gradebookRows = useMemo(() => {
@@ -833,15 +840,16 @@ export default function LearningAnalyticsPanel({
         'Bài học': selectedPreparationLesson.tieu_de,
         'Tỷ lệ video %': item.evaluation.watchPercent,
         'Ngưỡng yêu cầu %': item.evaluation.threshold,
-        'Đánh giá': item.evaluation.prepared ? 'Đã chuẩn bị bài' : 'Chưa chuẩn bị bài',
+        'Đánh giá': item.evaluation.state === 'prepared' ? 'Đã chuẩn bị' : item.evaluation.state === 'late_completed' ? 'Hoàn thành muộn' : 'Chưa gửi',
         'Chi tiết': item.evaluation.detail,
-        'Hoàn thành lúc': formatDateTime(item.progress?.pre_lesson_completed_at),
+        'Gửi lúc': formatDateTime(item.progress?.pre_lesson_completed_at),
       }));
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(rowsForExport), 'ChuanBiBai');
       const summary = [{
         'Tổng học sinh': preparationStats.total,
         'Đã chuẩn bị': preparationStats.prepared,
-        'Chưa chuẩn bị': preparationStats.notPrepared,
+        'Hoàn thành muộn': preparationStats.lateCompleted,
+        'Chưa gửi': preparationStats.notStarted,
         'Tỷ lệ chuẩn bị': `${preparationStats.rate}%`,
       }];
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(summary), 'TongHop');
@@ -854,7 +862,8 @@ export default function LearningAnalyticsPanel({
         'Ngưỡng yêu cầu %': item.lesson.pre_lesson_completion_threshold || 80,
         'Tổng học sinh': item.total,
         'Đã chuẩn bị': item.prepared,
-        'Chưa chuẩn bị': item.notPrepared,
+        'Hoàn thành muộn': item.lateCompleted,
+        'Chưa gửi': item.notStarted,
         'Tỷ lệ chuẩn bị': `${item.rate}%`,
       }));
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(rowsForExport), 'TongHopChuanBi');
@@ -1064,7 +1073,7 @@ export default function LearningAnalyticsPanel({
             </h2>
             <p className="mt-1 max-w-3xl text-sm text-slate-500">
               {analyticsModule === 'preparation'
-                ? 'Đánh giá Đã chuẩn bị/Chưa chuẩn bị theo tỷ lệ video mà bài học cấu hình; kết quả này không tham gia điểm.'
+                ? 'Chỉ ghi nhận khi học sinh xem đủ ngưỡng và chủ động bấm Gửi kết quả chuẩn bị bài; kết quả không tham gia điểm.'
                 : activeTab === 'class'
                   ? 'Chọn một lớp cụ thể để xem điểm chính thức và tính trung bình theo các mốc đã cấu hình.'
                   : activeTab === 'grade'
@@ -1077,8 +1086,8 @@ export default function LearningAnalyticsPanel({
               <>
                 <StatCard icon={<Users className="h-4 w-4" />} label="Học sinh/lượt" value={preparationStats.total} tone="indigo" />
                 <StatCard icon={<CheckCircle2 className="h-4 w-4" />} label="Đã chuẩn bị" value={preparationStats.prepared} tone="emerald" />
-                <StatCard icon={<UserX className="h-4 w-4" />} label="Chưa chuẩn bị" value={preparationStats.notPrepared} tone="amber" />
-                <StatCard icon={<Trophy className="h-4 w-4" />} label="Tỷ lệ" value={`${preparationStats.rate}%`} tone="sky" />
+                <StatCard icon={<Clock3 className="h-4 w-4" />} label="Hoàn thành muộn" value={preparationStats.lateCompleted} tone="sky" />
+                <StatCard icon={<UserX className="h-4 w-4" />} label="Chưa gửi" value={preparationStats.notStarted} tone="amber" />
               </>
             ) : (
               <>
@@ -1181,7 +1190,7 @@ export default function LearningAnalyticsPanel({
               <Select value={preparationStatusFilter} onChange={(value) => setPreparationStatusFilter(value as 'all' | 'prepared' | 'not_prepared')}>
                 <option value="all">Tất cả trạng thái chuẩn bị</option>
                 <option value="prepared">Đã chuẩn bị bài</option>
-                <option value="not_prepared">Chưa chuẩn bị bài</option>
+                <option value="not_prepared">Chưa gửi kết quả</option>
               </Select>
             )}
             {activeTab === 'lesson' && analyticsModule === 'results' && (
@@ -1419,7 +1428,7 @@ export default function LearningAnalyticsPanel({
               )}
               <label className={`flex cursor-pointer gap-3 rounded-2xl border p-4 ${moderationAction === 'allow_retake' ? 'border-indigo-300 bg-indigo-50' : 'border-slate-200'}`}>
                 <input type="radio" name="moderation-action" checked={moderationAction === 'allow_retake'} onChange={() => setModerationAction('allow_retake')} className="mt-1 h-4 w-4 accent-indigo-600" />
-                <span><span className="flex items-center gap-2 font-bold text-slate-900"><RotateCcw className="h-4 w-4 text-indigo-600" /> Cho học lại để cập nhật điểm</span><span className="mt-1 block text-sm text-slate-500">Giữ nguyên điểm hiện tại và cấp đúng 1 lượt nộp mới. Điểm lần nộp mới sẽ thay điểm chính thức; điểm cũ vẫn được lưu lịch sử.</span></span>
+                <span><span className="flex items-center gap-2 font-bold text-slate-900"><RotateCcw className="h-4 w-4 text-indigo-600" /> Cho học lại để cập nhật điểm</span><span className="mt-1 block text-sm text-slate-500">Chuyển điểm hiện tại vào lịch sử, tạm ẩn điểm khỏi bảng điểm và cấp đúng 1 lượt nộp mới. Khi học sinh nộp lại, điểm mới sẽ trở thành điểm chính thức.</span></span>
               </label>
               <label className={`flex cursor-pointer gap-3 rounded-2xl border p-4 ${moderationAction === 'invalidate_cheating' ? 'border-rose-300 bg-rose-50' : 'border-slate-200'}`}>
                 <input type="radio" name="moderation-action" checked={moderationAction === 'invalidate_cheating'} onChange={() => setModerationAction('invalidate_cheating')} className="mt-1 h-4 w-4 accent-rose-600" />
@@ -1477,24 +1486,25 @@ function GradeSummaryTable({ rows, grade, onSelectClass }: { rows: Array<any>; g
 }
 
 
-function PreparationSummaryTable({ rows, onSelectLesson }: { rows: Array<{ lesson: Lesson; total: number; prepared: number; notPrepared: number; rate: number }>; onSelectLesson: (lessonId: string) => void }) {
+function PreparationSummaryTable({ rows, onSelectLesson }: { rows: Array<{ lesson: Lesson; total: number; prepared: number; lateCompleted: number; notStarted: number; notPrepared: number; rate: number }>; onSelectLesson: (lessonId: string) => void }) {
   if (!rows.length) return <EmptyState title="Chưa có dữ liệu chuẩn bị bài" description="Các bài có video chuẩn bị sẽ xuất hiện tại đây." />;
   return (
     <div className="overflow-hidden rounded-[30px] bg-white shadow-sm ring-1 ring-slate-100">
       <div className="border-b border-fuchsia-100 bg-fuchsia-50 px-5 py-4">
         <h3 className="font-bold text-slate-900">Tổng hợp chuẩn bị bài theo bài học</h3>
-        <p className="mt-1 text-xs font-semibold text-slate-500">Đã chuẩn bị chỉ khi học sinh đạt ngưỡng video cấu hình và hoàn thành đúng hạn (nếu bài có hạn chuẩn bị).</p>
+        <p className="mt-1 text-xs font-semibold text-slate-500">Đã chuẩn bị chỉ khi học sinh xem đủ ngưỡng và bấm gửi kết quả. Học sinh chưa gửi sẽ không có dữ liệu tiến độ trên Firestore.</p>
       </div>
       <div className="overflow-x-auto">
         <table className="min-w-full text-sm">
-          <thead className="bg-slate-50 text-left text-slate-500"><tr>{['Bài học', 'Ngưỡng', 'Học sinh', 'Đã chuẩn bị', 'Chưa chuẩn bị', 'Tỷ lệ', 'Chi tiết'].map((item) => <th key={item} className="px-4 py-3 font-semibold">{item}</th>)}</tr></thead>
+          <thead className="bg-slate-50 text-left text-slate-500"><tr>{['Bài học', 'Ngưỡng', 'Học sinh', 'Đã chuẩn bị', 'Hoàn thành muộn', 'Chưa gửi', 'Tỷ lệ', 'Chi tiết'].map((item) => <th key={item} className="px-4 py-3 font-semibold">{item}</th>)}</tr></thead>
           <tbody>{rows.map((item) => (
             <tr key={item.lesson.lesson_id} className="border-t border-slate-100 hover:bg-slate-50/60">
               <td className="min-w-[280px] px-4 py-4"><p className="font-bold text-slate-900">{getLessonColumnLabel(item.lesson)} • {item.lesson.tieu_de}</p><p className="mt-1 text-xs text-slate-500">{item.lesson.mon_hoc || item.lesson.mon_id} • Khối {item.lesson.khoi}</p></td>
               <td className="px-4 py-4 font-semibold text-fuchsia-700">{item.lesson.pre_lesson_completion_threshold || 80}%</td>
               <td className="px-4 py-4 font-semibold text-slate-700">{item.total}</td>
               <td className="px-4 py-4"><span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-black text-emerald-700">{item.prepared}</span></td>
-              <td className="px-4 py-4"><span className="rounded-full bg-rose-50 px-3 py-1 text-xs font-black text-rose-700">{item.notPrepared}</span></td>
+              <td className="px-4 py-4"><span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-black text-amber-700">{item.lateCompleted}</span></td>
+              <td className="px-4 py-4"><span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-black text-slate-600">{item.notStarted}</span></td>
               <td className="px-4 py-4"><span className="font-black text-indigo-700">{item.rate}%</span></td>
               <td className="px-4 py-4"><button type="button" onClick={() => onSelectLesson(item.lesson.lesson_id)} className="rounded-xl bg-fuchsia-600 px-3 py-2 text-xs font-bold text-white hover:bg-fuchsia-700">Xem học sinh</button></td>
             </tr>
@@ -1510,22 +1520,26 @@ function PreparationDetailTable({ lesson, rows, classDisplayMap }: { lesson: Les
     <div className="overflow-hidden rounded-[30px] bg-white shadow-sm ring-1 ring-slate-100">
       <div className="border-b border-fuchsia-100 bg-gradient-to-r from-fuchsia-50 via-white to-indigo-50 p-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div><p className="text-xs font-black uppercase tracking-[0.16em] text-fuchsia-600">Chuẩn bị bài • Video</p><h3 className="mt-1 text-xl font-bold text-slate-900">{lesson.tieu_de}</h3><p className="mt-1 text-sm text-slate-500">Ngưỡng đạt: {lesson.pre_lesson_completion_threshold || 80}% • Kết quả chuẩn bị không tính vào điểm.</p></div>
+          <div><p className="text-xs font-black uppercase tracking-[0.16em] text-fuchsia-600">Chuẩn bị bài • Video</p><h3 className="mt-1 text-xl font-bold text-slate-900">{lesson.tieu_de}</h3><p className="mt-1 text-sm text-slate-500">Ngưỡng gửi: {lesson.pre_lesson_completion_threshold || 80}% • Chỉ kết quả đã gửi mới được giáo viên ghi nhận.</p></div>
           <span className="rounded-full bg-white px-4 py-2 text-xs font-black text-fuchsia-700 ring-1 ring-fuchsia-100">{rows.length} học sinh</span>
         </div>
       </div>
       <div className="overflow-x-auto">
         <table className="min-w-full text-sm">
-          <thead className="bg-slate-50 text-left text-slate-500"><tr>{['STT', 'Học sinh', 'Lớp', 'Video', 'Đánh giá', 'Chi tiết', 'Hoàn thành lúc'].map((item) => <th key={item} className="px-4 py-3 font-semibold">{item}</th>)}</tr></thead>
+          <thead className="bg-slate-50 text-left text-slate-500"><tr>{['STT', 'Học sinh', 'Lớp', 'Video khi gửi', 'Đánh giá', 'Chi tiết', 'Gửi lúc'].map((item) => <th key={item} className="px-4 py-3 font-semibold">{item}</th>)}</tr></thead>
           <tbody>{rows.map((item) => (
             <tr key={item.student.user_id} className="border-t border-slate-100 hover:bg-slate-50/60">
               <td className="px-4 py-4 font-semibold text-slate-500">{item.index}</td>
               <td className="min-w-[230px] px-4 py-4"><p className="font-bold text-slate-900">{item.student.ho_ten}</p><p className="text-xs text-slate-500">{item.student.ma_hoc_sinh || item.student.user_id}</p></td>
               <td className="px-4 py-4 text-slate-600">{getStudentClassName(item.student, classDisplayMap)}</td>
               <td className="min-w-[150px] px-4 py-4"><div className="flex items-center gap-2"><div className="h-2 w-24 overflow-hidden rounded-full bg-slate-100"><div className={`h-full rounded-full ${item.evaluation.prepared ? 'bg-emerald-500' : 'bg-fuchsia-500'}`} style={{ width: `${item.evaluation.watchPercent}%` }} /></div><span className="font-bold text-slate-700">{item.evaluation.watchPercent}%</span></div></td>
-              <td className="px-4 py-4">{item.evaluation.prepared ? <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-black text-emerald-700">Đã chuẩn bị bài</span> : <span className="rounded-full bg-rose-50 px-3 py-1 text-xs font-black text-rose-700">Chưa chuẩn bị bài</span>}</td>
+              <td className="px-4 py-4">{item.evaluation.state === 'prepared'
+                ? <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-black text-emerald-700">Đã chuẩn bị</span>
+                : item.evaluation.state === 'late_completed'
+                  ? <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-black text-amber-700">Hoàn thành muộn</span>
+                  : <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-black text-slate-600">Chưa gửi</span>}</td>
               <td className="px-4 py-4 text-xs font-semibold text-slate-500">{item.evaluation.detail}</td>
-              <td className="px-4 py-4 text-slate-500">{formatDateTime(item.progress?.pre_lesson_completed_at)}</td>
+              <td className="px-4 py-4 text-slate-500"><div>{formatDateTime(item.progress?.pre_lesson_completed_at)}</div></td>
             </tr>
           ))}</tbody>
         </table>
@@ -1669,7 +1683,7 @@ function ClassGradebookTable({
     if (!onBulkOfficialRetake || isBulkGranting) return;
     const targets = [...bulkSelected].map((id) => eligibleByStudent.get(id)).filter((item): item is { student: Account; progress: StudentLearningAnalyticsRow } => Boolean(item));
     if (!targets.length) return;
-    if (!window.confirm(`Cấp 1 lượt học lại để cập nhật điểm cho ${targets.length} học sinh đã chọn? Điểm lần nộp mới sẽ thay điểm chính thức hiện tại.`)) return;
+    if (!window.confirm(`Cấp 1 lượt học lại để cập nhật điểm cho ${targets.length} học sinh đã chọn? Điểm hiện tại sẽ được chuyển vào lịch sử và tạm ẩn khỏi bảng điểm cho đến khi học sinh nộp lại.`)) return;
     setIsBulkGranting(true);
     setBulkMessage('');
     try {
@@ -1907,13 +1921,16 @@ function ScoreCell({ value, status, resultState, scoreReason, previousScore, off
   const hasScore = value !== undefined;
   const retaken = scoreReason === 'official_retake';
   const deadlineZero = scoreReason === 'deadline_missed' && hasScore && Number(value) === 0;
+  const retakePending = Number(officialRetakeRemaining || 0) > 0 && !hasScore;
   const statusText = resultState === 'invalid_cheating'
     ? 'Gian lận'
     : resultState === 'cancelled_retake'
       ? 'Học lại'
-      : !hasScore && status === 'in_progress' ? 'Đang học'
-      : !hasScore ? '-'
-      : `${retaken ? '↻ ' : ''}${cleanScore(value)}`;
+      : retakePending
+        ? '↻ Học lại'
+        : !hasScore && status === 'in_progress' ? 'Đang học'
+        : !hasScore ? '-'
+        : `${retaken ? '↻ ' : ''}${cleanScore(value)}`;
   const lowScore = hasScore && value < 5;
   const mediumScore = hasScore && value >= 5 && value < 6.5;
   const tone = emphasize
@@ -1921,6 +1938,8 @@ function ScoreCell({ value, status, resultState, scoreReason, previousScore, off
     : resultState === 'invalid_cheating'
       ? 'bg-rose-50 text-rose-700 font-bold'
       : resultState === 'cancelled_retake'
+        ? 'bg-indigo-50 text-indigo-700 font-bold'
+      : retakePending
         ? 'bg-indigo-50 text-indigo-700 font-bold'
       : deadlineZero
         ? 'bg-rose-100 text-rose-800 font-black'
@@ -1935,7 +1954,7 @@ function ScoreCell({ value, status, resultState, scoreReason, previousScore, off
           : status === 'in_progress'
             ? 'bg-amber-50 text-amber-700 font-semibold'
             : 'text-slate-400';
-  const tooltip = [title, deadlineZero ? '0 điểm do quá hạn chưa hoàn thành' : '', retaken && previousScore !== undefined ? `Điểm trước: ${cleanScore(previousScore)}` : '', Number(officialRetakeRemaining || 0) > 0 ? 'Đã được cấp 1 lượt học lại cập nhật điểm' : ''].filter(Boolean).join(' • ');
+  const tooltip = [title, deadlineZero ? '0 điểm do quá hạn chưa hoàn thành' : '', (retaken || retakePending) && previousScore !== undefined ? `Điểm trước: ${cleanScore(previousScore)}` : '', Number(officialRetakeRemaining || 0) > 0 ? 'Đã được cấp 1 lượt học lại cập nhật điểm; điểm hiện tại đang tạm ẩn' : ''].filter(Boolean).join(' • ');
   return (
     <td title={tooltip || title} className={`px-4 py-4 text-center ${tone}`}>
       {onModerate ? (

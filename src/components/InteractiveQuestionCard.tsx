@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertCircle, CheckCircle2, HelpCircle, RefreshCcw, Sparkles } from 'lucide-react';
 import { LessonQuestionAnswerState, QuizQuestion, QuizQuestionType } from '../types';
 import { getVietnameseLevelLabel } from '../services/gemini';
+import { resolveCorrectOption } from '../utils/quizSanitizer';
 
 interface InteractiveQuestionCardProps {
   key?: any;
@@ -29,12 +30,13 @@ function extractOptionKey(value: string) {
   return match ? match[1].toUpperCase() : '';
 }
 
-function isCorrectSelection(option: string, correctAnswer?: string) {
+function isCorrectSelection(option: string, correctAnswer?: string, options: string[] = []) {
   if (!correctAnswer) return false;
+  const resolved = resolveCorrectOption(options, correctAnswer) || correctAnswer;
   const optionKey = extractOptionKey(option);
-  const correctKey = extractOptionKey(correctAnswer);
+  const correctKey = extractOptionKey(resolved);
   if (optionKey && correctKey) return optionKey === correctKey;
-  return normalizeText(option) === normalizeText(correctAnswer);
+  return normalizeText(option) === normalizeText(resolved);
 }
 
 function sentenceParts(sentence: string, blankCount: number) {
@@ -100,6 +102,14 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
   const [activeBlankIndex, setActiveBlankIndex] = useState(0);
 
   const levelLabel = useMemo(() => getVietnameseLevelLabel(question.level), [question.level]);
+  const scoringOptions = useMemo(() => {
+    if (type === 'true_false') return ['Đúng', 'Sai'];
+    return question.options || [];
+  }, [type, question.options]);
+  const resolvedCorrectAnswer = useMemo(
+    () => resolveCorrectOption(scoringOptions, question.correctAnswer) || question.correctAnswer || '',
+    [scoringOptions, question.correctAnswer],
+  );
   const defaultFillSelections = useMemo(() => (question.correctAnswers?.length ? question.correctAnswers : ['']).map(() => ''), [question.correctAnswers]);
   const draftSyncTimerRef = useRef<number | null>(null);
   const lastReportedStateRef = useRef('');
@@ -131,8 +141,8 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
       return expected.length > 0 && expected.length === actual.length && expected.every((item, idx) => item === actual[idx]);
     }
     if (!selectedOption) return false;
-    return isCorrectSelection(selectedOption, question.correctAnswer);
-  }, [submitted, selectedOption, question.correctAnswer, fillSelections, question.correctAnswers, type, textAnswer]);
+    return isCorrectSelection(selectedOption, resolvedCorrectAnswer, scoringOptions);
+  }, [submitted, selectedOption, resolvedCorrectAnswer, scoringOptions, fillSelections, question.correctAnswers, type, textAnswer]);
 
   useEffect(() => {
     const payload: LessonQuestionAnswerState = {
@@ -158,21 +168,19 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
     setSubmitted(true);
   };
 
-  const handleFillSelection = (blankIndex: number, value: string) => {
-    setFillSelections((prev) => prev.map((item, idx) => (idx === blankIndex ? value : item)));
-  };
-
   const handleChoiceClick = (choice: string) => {
     const nextBlankIndex = fillSelections.findIndex((item) => !item.trim());
-    const targetIndex = fillSelections[activeBlankIndex]?.trim() ? (nextBlankIndex >= 0 ? nextBlankIndex : activeBlankIndex) : activeBlankIndex;
-    handleFillSelection(targetIndex >= 0 ? targetIndex : 0, choice);
-    const nextIndex = fillSelections.findIndex((item, idx) => idx > targetIndex && !item.trim());
+    const targetIndex = fillSelections[activeBlankIndex]?.trim()
+      ? (nextBlankIndex >= 0 ? nextBlankIndex : activeBlankIndex)
+      : activeBlankIndex;
+    const safeTargetIndex = targetIndex >= 0 ? targetIndex : 0;
+    const nextSelections = fillSelections.map((item, idx) => (idx === safeTargetIndex ? choice : item));
+    setFillSelections(nextSelections);
+    // V6.84.5: chọn đủ từ/cụm từ là đã trả lời. Không cần nút "Kiểm tra đáp án".
+    // Trong chế độ thi, feedback vẫn bị ẩn cho tới khi học sinh nộp toàn bài.
+    setSubmitted(nextSelections.every((item) => item.trim()));
+    const nextIndex = nextSelections.findIndex((item, idx) => idx > safeTargetIndex && !item.trim());
     if (nextIndex >= 0) setActiveBlankIndex(nextIndex);
-  };
-
-  const handleSubmitFill = () => {
-    if (!fillSelections.every((item) => item.trim())) return;
-    setSubmitted(true);
   };
 
   const handleSubmitShortAnswer = () => {
@@ -220,7 +228,7 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
       `Câu ${index + 1}: "${baseQuestion}".`,
       `Các đáp án: ${optionsText || 'không có'}.`,
       hasChoice ? `Học sinh đã chọn: "${selectedOption}".` : 'Học sinh chưa chọn đáp án.',
-      hasChoice ? `Đáp án đúng để đối chiếu sau khi học sinh đã chọn: "${question.correctAnswer}".` : '',
+      hasChoice ? `Đáp án đúng để đối chiếu sau khi học sinh đã chọn: "${resolvedCorrectAnswer}".` : '',
       hasChoice
         ? 'Hãy giải thích vì sao lựa chọn của học sinh đúng/sai, nêu điểm dễ nhầm và nhắc lại kiến thức liên quan.'
         : 'Hãy hướng dẫn phân tích yêu cầu câu hỏi và cách loại trừ đáp án sai, chưa nêu đáp án đúng trực tiếp.',
@@ -235,7 +243,7 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
 
     const correctAnswerText = type === 'fill_in_blank'
       ? (question.correctAnswers || []).join(', ')
-      : question.correctAnswer;
+      : resolvedCorrectAnswer;
 
     return (
       <div className={[
@@ -274,7 +282,7 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
     <div className="mt-4 grid gap-3">
       {(question.options || []).map((option, optionIndex) => {
         const selected = selectedOption === option;
-        const optionIsCorrect = isCorrectSelection(option, question.correctAnswer);
+        const optionIsCorrect = isCorrectSelection(option, resolvedCorrectAnswer, scoringOptions);
         const allowAnswerFeedback = !hideFeedback;
         const showCorrect = allowAnswerFeedback && submitted && optionIsCorrect;
         const showWrong = allowAnswerFeedback && submitted && selected && !optionIsCorrect;
@@ -400,22 +408,13 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
   };
 
   const renderActionToolbar = () => {
-    const canSubmitFill = fillSelections.every((item) => item.trim());
     const needsChoiceHint = !examMode && !submitted && type !== 'fill_in_blank';
     const needsFillHint = !examMode && !submitted && type === 'fill_in_blank';
+    const hasToolbarActions = !disableReset || !disableAI || needsChoiceHint || needsFillHint;
+    if (!hasToolbarActions) return null;
 
     return (
       <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-100 pt-3">
-        {type === 'fill_in_blank' ? (
-          <button
-            type="button"
-            onClick={handleSubmitFill}
-            disabled={!canSubmitFill}
-            className="inline-flex items-center gap-2 rounded-full bg-indigo-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <CheckCircle2 className="h-3.5 w-3.5" /> Kiểm tra đáp án
-          </button>
-        ) : null}
         {!disableReset ? (
           <button
             type="button"
@@ -441,7 +440,7 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
         ) : null}
         {needsFillHint ? (
           <span className="inline-flex items-center gap-2 rounded-full bg-slate-100 px-3 py-2 text-xs font-medium text-slate-600">
-            <HelpCircle className="h-3.5 w-3.5" /> Chọn đủ ô trống rồi kiểm tra.
+            <HelpCircle className="h-3.5 w-3.5" /> Chọn đủ từ/cụm từ; hệ thống sẽ tự ghi nhận câu trả lời.
           </span>
         ) : null}
       </div>

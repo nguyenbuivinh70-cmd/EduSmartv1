@@ -50,6 +50,7 @@ import {
   ReviewPracticeResultStudent,
   ReviewPracticeResultSummary,
   ReviewPracticeRow,
+  InteractivePracticeManifest,
   QuizQuestion,
   LearningStepProgress,
   SchoolYear,
@@ -72,12 +73,15 @@ import { AI_MODELS, DEFAULT_ACTIVE_GRADES, DEFAULT_VIDEO_POPUP_CONFIG, VIDEO_POP
 import { compareStructuredLessons, resolveLessonIdentity } from './utils/lessonCatalog';
 import { getLessonScheduleAccess, getPreLessonVideoAccess } from './utils/lessonAccess';
 import { applyProgressScoreModelV3, finalizeProgressScore } from './utils/learningScoreEngine';
+import { formatPracticeDateTime, getPracticeAccessState, practiceAttemptSummary, resolvePracticeConfig } from './utils/practiceAccess';
 import { canManageGrade, formatManagedGrades, getManagedGradeScope, teacherManagesAllGrades } from './utils/gradeScope';
 import {
   createAccountApi,
   createClassApi,
   createLessonApi,
   createReviewPracticeApi,
+  createInteractivePracticeApi,
+  updateInteractivePracticeApi,
   createSchoolYearApi,
   createSubjectApi,
   deleteAccountApi,
@@ -85,6 +89,9 @@ import {
   batchResetPasswordsApi,
   batchDeleteClassesApi,
   deleteLessonApi,
+  analyzeLessonPurgeApi,
+  purgeLessonApi,
+  continueLessonPurgeApi,
   repairLessonIntegrityApi,
   deleteReviewPracticeApi,
   deleteSubjectApi,
@@ -104,6 +111,7 @@ import {
   listLearningProgressApi,
   listLessonsApi,
   listReviewPracticesApi,
+  listMyReviewAttemptsApi,
   listPendingSharesApi,
   listLessonCommentsApi,
   listSchoolYearsApi,
@@ -118,6 +126,7 @@ import {
   saveVideoConfigApi,
   setLessonLockApi,
   setLessonAccessModeApi,
+  setLessonSelfStudyAccessApi,
   startLessonRetakeApi,
   saveLessonRetakeApi,
   finalizeOfficialLessonRetakeApi,
@@ -145,7 +154,7 @@ import {
   updateOwnFirebaseMemberProfile,
   waitForFirebaseUser,
 } from './services/firebase';
-import { clearFirebaseIdentityCache, subscribeFirebaseLessonAccess, subscribeFirebaseLearningProgress } from './services/firebaseOperational';
+import { clearFirebaseIdentityCache, subscribeFirebaseLessonAccess, subscribeFirebaseLearningProgress, subscribeFirebasePreLessonSubmissionChanges } from './services/firebaseOperational';
 import { downloadTemplate, exportClassesToExcel } from './utils/templateDownloader';
 import type { ImportEntity, ImportPreviewResult } from './utils/importValidators';
 import Login from './components/Login';
@@ -173,6 +182,9 @@ const LessonComposer = lazy(() => import('./components/LessonComposer'));
 const ReviewPracticeModal = lazy(() => import('./components/ReviewPracticeModal'));
 const ReviewPracticeViewer = lazy(() => import('./components/ReviewPracticeViewer'));
 const ReviewPracticeResultsModal = lazy(() => import('./components/ReviewPracticeResultsModal'));
+const InteractivePracticeImportModal = lazy(() => import('./components/InteractivePracticeImportModal'));
+const InteractivePracticeViewer = lazy(() => import('./components/InteractivePracticeViewer'));
+const PracticeSettingsModal = lazy(() => import('./components/PracticeSettingsModal'));
 const ImportDataModal = lazy(() => import('./components/ImportDataModal'));
 const KnowledgeArena = lazy(() => import('./components/KnowledgeArena'));
 const LearningAnalyticsPanel = lazy(() => import('./components/LearningAnalyticsPanel'));
@@ -220,6 +232,10 @@ function mapLessonRow(
     cho_phep_nop_sau_han: row.cho_phep_nop_sau_han,
     is_locked: row.is_locked === true,
     access_mode: row.access_mode === 'self_study' ? 'self_study' : 'teacher_controlled',
+    self_study_scope: row.self_study_scope === 'classes' || row.self_study_scope === 'all' || row.self_study_scope === 'none'
+      ? row.self_study_scope
+      : (row.access_mode === 'self_study' ? 'all' : 'none'),
+    self_study_class_ids: Array.isArray(row.self_study_class_ids) ? row.self_study_class_ids.filter(Boolean) : [],
     allow_retake_after_completion: row.allow_retake_after_completion === true,
     locked_at: row.locked_at || '',
     locked_by_uid: row.locked_by_uid || '',
@@ -231,6 +247,7 @@ function mapLessonRow(
     pre_lesson_required: row.pre_lesson_required === true,
     pre_lesson_completion_threshold: Number(row.pre_lesson_completion_threshold || 80),
     pre_lesson_deadline: row.pre_lesson_deadline || '',
+    pre_lesson_video_revision: Number(row.pre_lesson_video_revision || 1),
     pre_lesson_score_enabled: false,
     pre_lesson_score_weight: 0,
     content_schema_version: row.content_schema_version || undefined,
@@ -250,6 +267,8 @@ function getFriendlyStatus(status: string) {
       return 'Nháp';
     case 'rejected':
       return 'Bị từ chối';
+    case 'archived':
+      return 'Đã lưu trữ';
     default:
       return status || 'Không rõ';
   }
@@ -423,6 +442,43 @@ const DEFAULT_CONFIRM: ConfirmDialogState = {
   onConfirm: async () => {},
 };
 
+type LessonPurgeMode = 'preserve_grades' | 'purge_all';
+
+interface LessonPurgeProgressState {
+  lessonId: string;
+  lessonTitle: string;
+  mode: LessonPurgeMode;
+  status: 'running' | 'retryable' | 'completed';
+  phase: string;
+  processed: number;
+  total: number;
+  archivedGrades: number;
+  error?: string;
+}
+
+function lessonPurgePhaseLabel(phase: string) {
+  const labels: Record<string, string> = {
+    preparation_submissions: 'Kết quả chuẩn bị bài',
+    legacy_prelesson_submissions: 'Kết quả chuẩn bị bài cũ',
+    legacy_prelesson: 'Tiến độ video cũ',
+    learning_actions: 'Lịch sử xử lý kết quả',
+    comments: 'Bình luận/Câu hỏi',
+    colearning_consents: 'Xác nhận học cùng',
+    colearning_sessions: 'Phiên học cùng',
+    teaching_sessions: 'Phiên dạy học',
+    slides_prompts: 'Dữ liệu trình chiếu AI',
+    review_practices: 'Bài luyện tập liên kết',
+    learning_progress: 'Tiến độ và điểm học sinh',
+    activities: 'Hoạt động bài học',
+    content: 'Nội dung bài học',
+    score_tracking: 'Cấu hình mốc điểm',
+    registry_cleanup: 'Danh mục số bài',
+    lesson_finalize: 'Thông tin bài học',
+    completed: 'Hoàn tất',
+  };
+  return labels[phase] || phase || 'Đang xử lý';
+}
+
 
 const PROGRESS_STORAGE_KEY = 'edu_smart_learning_progress_v1';
 const STAGE_WEIGHTS: Record<LessonStageKey, number> = {
@@ -497,7 +553,7 @@ function sanitizeProgressRecord(raw: Partial<LessonProgressRecord> | null | unde
     learning_process_score: raw.learning_process_score === undefined ? undefined : Number(raw.learning_process_score),
     final_quiz_score: raw.final_quiz_score === undefined ? undefined : Number(raw.final_quiz_score),
     current_score: raw.current_score === undefined ? undefined : Number(raw.current_score),
-    score_status: raw.score_status === 'finalized' ? 'finalized' : raw.score_status === 'not_applicable' ? 'not_applicable' : 'in_progress',
+    score_status: raw.score_status === 'finalized' ? 'finalized' : raw.score_status === 'retake_pending' ? 'retake_pending' : raw.score_status === 'not_applicable' ? 'not_applicable' : 'in_progress',
     score_calculated_at: String(raw.score_calculated_at || ''),
     last_closed_at: String(raw.last_closed_at || ''),
     save_state: raw.save_state === 'save_failed' ? 'save_failed' : raw.save_state === 'saving' ? 'saving' : 'saved',
@@ -515,6 +571,7 @@ function sanitizeProgressRecord(raw: Partial<LessonProgressRecord> | null | unde
     official_retake_last_consumed_at: String(raw.official_retake_last_consumed_at || ''),
     official_retake_count: Number(raw.official_retake_count || 0),
     previous_official_score: raw.previous_official_score === undefined ? undefined : Number(raw.previous_official_score),
+    previous_official_completed_at: String(raw.previous_official_completed_at || ''),
     score_reason: String(raw.score_reason || ''),
     deadline_status: String(raw.deadline_status || ''),
     deadline_finalized_at: String(raw.deadline_finalized_at || ''),
@@ -537,6 +594,7 @@ function sanitizeProgressRecord(raw: Partial<LessonProgressRecord> | null | unde
     pre_lesson_watched_seconds: Number(raw.pre_lesson_watched_seconds || 0),
     pre_lesson_completed_at: String(raw.pre_lesson_completed_at || ''),
     pre_lesson_completed_before_deadline: raw.pre_lesson_completed_before_deadline === true,
+    pre_lesson_last_watched_at: String(raw.pre_lesson_last_watched_at || ''),
     pre_lesson_preparation_status: ['in_progress', 'prepared', 'late_completed'].includes(String(raw.pre_lesson_preparation_status || ''))
       ? raw.pre_lesson_preparation_status as any
       : 'not_started',
@@ -608,6 +666,11 @@ function queuePendingLearningProgress(userId: string, record: LessonProgressReco
 function removePendingLearningProgress(userId: string, progressId: string) {
   const next = readPendingLearningProgress(userId).filter((item) => item.progress_id !== progressId);
   writePendingLearningProgress(userId, next);
+}
+
+function lessonAllowsLateSubmission(lesson?: Lesson | null) {
+  const value = lesson?.cho_phep_nop_sau_han;
+  return value === true || String(value ?? '').trim().toLowerCase() === 'true' || String(value ?? '').trim() === '1';
 }
 
 function createEmptyProgressRecord(userId: string, lesson: Lesson): LessonProgressRecord {
@@ -819,6 +882,7 @@ function requiredDataDomains(menu: string, currentUser: User, isAdmin: boolean):
       return canManage ? ['accounts'] : [];
     case 'lessons':
     case 'my_lessons':
+    case 'practice':
       return ['lessons', 'reviews'];
     case 'create_lesson':
       return ['lessons'];
@@ -906,9 +970,18 @@ export default function App() {
   const [lessonAccessFilter, setLessonAccessFilter] = useState('Tất cả');
   const [lessonLockUpdatingId, setLessonLockUpdatingId] = useState('');
   const [lessonDeletingId, setLessonDeletingId] = useState('');
+  const [lessonPurgeProgress, setLessonPurgeProgress] = useState<LessonPurgeProgressState | null>(null);
   const [lessonIntegrityRepairing, setLessonIntegrityRepairing] = useState(false);
   const [lessonLibraryView, setLessonLibraryView] = useState<'grid' | 'list'>('grid');
   const [lessonLibraryPage, setLessonLibraryPage] = useState(1);
+
+  const [practiceSearch, setPracticeSearch] = useState('');
+  const [practiceYearFilter, setPracticeYearFilter] = useState('Tất cả');
+  const [practiceSemesterFilter, setPracticeSemesterFilter] = useState('Tất cả');
+  const [practiceGradeFilter, setPracticeGradeFilter] = useState('Tất cả');
+  const [practiceClassFilter, setPracticeClassFilter] = useState('Tất cả');
+  const [practiceSubjectFilter, setPracticeSubjectFilter] = useState('Tất cả');
+  const [practiceStatusFilter, setPracticeStatusFilter] = useState('Tất cả');
 
   const [accountQuery, setAccountQuery] = useState('');
   const [accountRoleFilter, setAccountRoleFilter] = useState('Tất cả');
@@ -957,6 +1030,16 @@ const accountClassFilterOptions = useMemo(() => {
   return source.map((item) => ({ value: item.lop_id, label: `${item.ten_lop || item.lop_id} • ${item.lop_id}` }));
 }, [classes, accountGradeFilter]);
 
+const practiceClassOptions = useMemo(() => classes
+  .filter((item) => practiceGradeFilter === 'Tất cả' || String(item.khoi || '') === practiceGradeFilter)
+  .sort((a, b) => String(a.ten_lop || a.lop_id).localeCompare(String(b.ten_lop || b.lop_id), 'vi'))
+  .map((item) => ({ value: item.lop_id, label: item.ten_lop || item.lop_id })), [classes, practiceGradeFilter]);
+
+useEffect(() => {
+  if (practiceClassFilter === 'Tất cả') return;
+  if (!practiceClassOptions.some((item) => item.value === practiceClassFilter)) setPracticeClassFilter('Tất cả');
+}, [practiceClassFilter, practiceClassOptions]);
+
 useEffect(() => {
   if (accountClassFilter === 'Tất cả') return;
   if (!accountClassFilterOptions.some((item) => item.value === accountClassFilter)) {
@@ -976,6 +1059,9 @@ useEffect(() => {
   const [retakeChoiceLesson, setRetakeChoiceLesson] = useState<Lesson | null>(null);
   const [retakeHistory, setRetakeHistory] = useState<LessonRetakeAttempt[]>([]);
   const [lessonAccessModeUpdatingId, setLessonAccessModeUpdatingId] = useState('');
+  const [selfStudyAccessLesson, setSelfStudyAccessLesson] = useState<Lesson | null>(null);
+  const [selfStudySelectedClassIds, setSelfStudySelectedClassIds] = useState<string[]>([]);
+  const [selfStudyAccessSaving, setSelfStudyAccessSaving] = useState(false);
   const [isPreLessonVideoOpen, setIsPreLessonVideoOpen] = useState(false);
   const [preLessonVideoLesson, setPreLessonVideoLesson] = useState<Lesson | null>(null);
   const [viewerStage, setViewerStage] = useState<LessonStageKey>('khoi_dong');
@@ -1002,6 +1088,20 @@ useEffect(() => {
   const [reviewResultStudents, setReviewResultStudents] = useState<ReviewPracticeResultStudent[]>([]);
   const [reviewResultSummary, setReviewResultSummary] = useState<ReviewPracticeResultSummary | null>(null);
   const [isReviewResultsLoading, setIsReviewResultsLoading] = useState(false);
+  const [isInteractivePracticeImportOpen, setIsInteractivePracticeImportOpen] = useState(false);
+  const [isInteractivePracticeViewerOpen, setIsInteractivePracticeViewerOpen] = useState(false);
+  const [selectedInteractivePractice, setSelectedInteractivePractice] = useState<ReviewPracticeRow | null>(null);
+  const [selectedInteractiveManifest, setSelectedInteractiveManifest] = useState<InteractivePracticeManifest | null>(null);
+  const [selectedInteractiveAllowRetry, setSelectedInteractiveAllowRetry] = useState(true);
+  const [selectedInteractiveConfig, setSelectedInteractiveConfig] = useState<ReviewPracticeConfig | undefined>(undefined);
+  const [selectedInteractiveAttemptCount, setSelectedInteractiveAttemptCount] = useState(0);
+  const [myReviewAttempts, setMyReviewAttempts] = useState<ReviewPracticeAttempt[]>([]);
+  const [isPracticeSettingsOpen, setIsPracticeSettingsOpen] = useState(false);
+  const [practiceSettingsReview, setPracticeSettingsReview] = useState<ReviewPracticeRow | null>(null);
+  const [practiceSettingsConfig, setPracticeSettingsConfig] = useState<ReviewPracticeConfig | undefined>(undefined);
+  const [pendingInteractivePractice, setPendingInteractivePractice] = useState<ReviewPracticeContentResponse | null>(null);
+  const [activePracticeCoLearningSession, setActivePracticeCoLearningSession] = useState<CoLearningSession | null>(null);
+  const [coLearningPurpose, setCoLearningPurpose] = useState<'lesson' | 'practice'>('lesson');
 
   const [isAccountModalOpen, setIsAccountModalOpen] = useState(false);
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
@@ -1038,6 +1138,7 @@ useEffect(() => {
   const analyticsDefaultSubjectAppliedRef = useRef(false);
   const [analyticsSchoolYearFilter, setAnalyticsSchoolYearFilter] = useState(getComputedSchoolYear());
   const [isAnalyticsProgressLoading, setIsAnalyticsProgressLoading] = useState(false);
+  const [analyticsProgressError, setAnalyticsProgressError] = useState('');
   const deadlineSyncSignatureRef = useRef('');
 
   useEffect(() => {
@@ -1554,10 +1655,12 @@ useEffect(() => {
         .map((item) => sanitizeProgressRecord(item))
         .filter(Boolean) as LessonProgressRecord[];
       setProgressRecordsSync(scoped);
+      setAnalyticsProgressError('');
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Không tải được tiến trình theo phạm vi đã chọn.';
+      setAnalyticsProgressError(message);
       if (!handleSessionError(message)) showToast(message, 'error');
-      setProgressRecordsSync([]);
+      // Giữ dữ liệu gần nhất thay vì biến lỗi Firestore thành 0%.
     } finally {
       setIsAnalyticsProgressLoading(false);
     }
@@ -1568,6 +1671,33 @@ useEffect(() => {
     if (activeMenu !== 'analytics' && activeMenu !== 'learning') return;
     void loadScopedAnalyticsProgress();
   }, [activeMenu, user?.user_id, user?.vai_tro, loadScopedAnalyticsProgress]);
+
+  // preLessonProgress là collection riêng nên listener learningProgress không
+  // nhận thay đổi video. Chỉ refresh phạm vi giáo viên đang xem mỗi 60 giây.
+  useEffect(() => {
+    if (!user || user.vai_tro === 'student' || activeMenu !== 'analytics' || !analyticsHasServerScope) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void loadScopedAnalyticsProgress();
+    }, 60000);
+    return () => window.clearInterval(timer);
+  }, [activeMenu, user?.user_id, user?.vai_tro, analyticsHasServerScope, loadScopedAnalyticsProgress]);
+
+
+  // V6.88.3: preparationSubmissions là nguồn sự thật độc lập với learningProgress.
+  // Khi học sinh bấm Gửi kết quả, listener này reload ngay phạm vi analytics đang mở.
+  useEffect(() => {
+    if (!user || user.vai_tro === 'student' || activeMenu !== 'analytics' || !analyticsHasServerScope) return;
+    const payload: Record<string, unknown> = {};
+    if (analyticsLessonFilter !== 'Tất cả') payload.lesson_id = analyticsLessonFilter;
+    if (analyticsClassFilter !== 'Tất cả') payload.lop_id = analyticsClassFilter;
+    if (analyticsGradeFilter !== 'Tất cả') payload.khoi = analyticsGradeFilter;
+    return subscribeFirebasePreLessonSubmissionChanges(payload, () => {
+      if (document.visibilityState === 'visible') void loadScopedAnalyticsProgress();
+    }, (error) => {
+      console.warn('Realtime preparation submission listener failed:', error);
+      setAnalyticsProgressError('Không thể theo dõi realtime kết quả chuẩn bị bài. Dữ liệu gần nhất vẫn được giữ.');
+    });
+  }, [activeMenu, user?.user_id, user?.vai_tro, analyticsHasServerScope, analyticsLessonFilter, analyticsClassFilter, analyticsGradeFilter, loadScopedAnalyticsProgress]);
 
   useEffect(() => {
     if (!user || user.vai_tro === 'student') return;
@@ -1715,7 +1845,7 @@ useEffect(() => {
       const matchesGrade = lessonGradeFilter === 'Tất cả'
         || lesson.khoi === lessonGradeFilter
         || (user?.vai_tro === 'student' && !lesson.khoi);
-      const matchesStatus = lessonStatusFilter === 'Tất cả' || lesson.trang_thai === lessonStatusFilter;
+      const matchesStatus = lessonStatusFilter === 'Tất cả' ? lesson.trang_thai !== 'archived' : lesson.trang_thai === lessonStatusFilter;
       const matchesScope = lessonScopeFilter === 'Tất cả' || lesson.pham_vi === lessonScopeFilter;
       const matchesAccess = lessonAccessFilter === 'Tất cả'
         || (lessonAccessFilter === 'unlocked' && lesson.is_locked !== true)
@@ -1739,19 +1869,61 @@ useEffect(() => {
       }
       if (user.vai_tro === 'student') {
         const sameGrade = !review.khoi || !user.khoi || String(review.khoi) === String(user.khoi);
-        const sameClass = !review.lop_id || !user.lop_id || review.lop_id === user.lop_id;
+        const targetClasses = Array.isArray(review.target_class_ids) ? review.target_class_ids : [];
+        const sameClass = targetClasses.length
+          ? Boolean(user.lop_id && targetClasses.includes(user.lop_id))
+          : (!review.lop_id || !user.lop_id || review.lop_id === user.lop_id);
         if (!sameGrade || !sameClass || String(review.trang_thai || 'active') !== 'active') return false;
       }
-      const matchesSearch = !lessonSearch || normalizeText(review.tieu_de).includes(normalizeText(lessonSearch)) || normalizeText(review.source_lesson_titles).includes(normalizeText(lessonSearch));
+      const practiceView = activeMenu === 'practice';
+      const matchesSearch = practiceView || !lessonSearch || normalizeText(review.tieu_de).includes(normalizeText(lessonSearch)) || normalizeText(review.source_lesson_titles).includes(normalizeText(lessonSearch));
       const subjectName = subjects.find((item) => item.mon_id === review.mon_id)?.ten_mon || review.mon_hoc || review.mon_id;
-      const matchesSubject = lessonSubjectFilter === 'Tất cả' || subjectName === lessonSubjectFilter;
-      const matchesGrade = lessonGradeFilter === 'Tất cả'
+      const matchesSubject = practiceView || lessonSubjectFilter === 'Tất cả' || subjectName === lessonSubjectFilter;
+      const matchesGrade = practiceView || lessonGradeFilter === 'Tất cả'
         || String(review.khoi) === lessonGradeFilter
         || (user.vai_tro === 'student' && !review.khoi);
-      const matchesScope = lessonScopeFilter === 'Tất cả' || review.pham_vi === lessonScopeFilter;
+      const matchesScope = practiceView || lessonScopeFilter === 'Tất cả' || review.pham_vi === lessonScopeFilter;
       return matchesSearch && matchesSubject && matchesGrade && matchesScope;
     });
-  }, [reviewPractices, user, currentUserIsAdmin, lessonSearch, lessonSubjectFilter, lessonGradeFilter, lessonScopeFilter, subjects]);
+  }, [reviewPractices, user, currentUserIsAdmin, activeMenu, lessonSearch, lessonSubjectFilter, lessonGradeFilter, lessonScopeFilter, subjects]);
+
+  const interactivePractices = useMemo(() => visibleReviewPractices.filter((review) => {
+    if (!(review.source_type === 'interactive_html' || review.loai_on_tap === 'interactive_file')) return false;
+    const subjectName = subjects.find((item) => item.mon_id === review.mon_id)?.ten_mon || review.mon_hoc || review.mon_id || '';
+    const classIds = Array.isArray(review.target_class_ids) ? review.target_class_ids : [];
+    const config = resolvePracticeConfig(review, undefined);
+    const access = practiceClassFilter === 'Tất cả' ? null : getPracticeAccessState(review, config, practiceClassFilter, 0);
+    const now = Date.now();
+    const startMs = config.available_from ? new Date(config.available_from).getTime() : NaN;
+    const endMs = config.available_until ? new Date(config.available_until).getTime() : NaN;
+    const aggregateStatus = String(review.trang_thai || 'active') !== 'active' ? 'draft'
+      : Number.isFinite(startMs) && now < startMs ? 'scheduled'
+      : Number.isFinite(endMs) && now > endMs ? 'closed'
+      : config.locked_class_ids.length && config.target_class_ids.length && config.locked_class_ids.length >= config.target_class_ids.length ? 'locked'
+      : 'open';
+    const matchesSearch = !practiceSearch || normalizeText(review.tieu_de).includes(normalizeText(practiceSearch)) || normalizeText(review.source_lesson_titles).includes(normalizeText(practiceSearch)) || normalizeText(review.source_file_name).includes(normalizeText(practiceSearch));
+    const matchesYear = practiceYearFilter === 'Tất cả' || String(review.nam_hoc || '') === practiceYearFilter;
+    const matchesSemester = practiceSemesterFilter === 'Tất cả' || String(review.hoc_ky || '') === practiceSemesterFilter;
+    const matchesGrade = practiceGradeFilter === 'Tất cả' || String(review.khoi || '') === practiceGradeFilter;
+    const matchesClass = practiceClassFilter === 'Tất cả' || !classIds.length || classIds.includes(practiceClassFilter);
+    const matchesSubject = practiceSubjectFilter === 'Tất cả' || subjectName === practiceSubjectFilter;
+    const statusKey = access?.key || aggregateStatus;
+    const matchesStatus = practiceStatusFilter === 'Tất cả'
+      || practiceStatusFilter === statusKey
+      || (practiceStatusFilter === 'draft' && String(review.trang_thai || '') !== 'active');
+    return matchesSearch && matchesYear && matchesSemester && matchesGrade && matchesClass && matchesSubject && matchesStatus;
+  }), [visibleReviewPractices, subjects, practiceSearch, practiceYearFilter, practiceSemesterFilter, practiceGradeFilter, practiceClassFilter, practiceSubjectFilter, practiceStatusFilter]);
+  const standardReviewPractices = useMemo(() => visibleReviewPractices.filter((review) => review.source_type !== 'interactive_html' && review.loai_on_tap !== 'interactive_file'), [visibleReviewPractices]);
+
+
+  useEffect(() => {
+    if (!user || user.vai_tro !== 'student' || activeMenu !== 'practice') return;
+    let cancelled = false;
+    void listMyReviewAttemptsApi(user.token).then((res) => {
+      if (!cancelled && res.ok) setMyReviewAttempts(res.data?.items || []);
+    });
+    return () => { cancelled = true; };
+  }, [user?.user_id, user?.token, activeMenu]);
 
   const pendingLessonCards = useMemo(() => {
     return pendingShares
@@ -2052,7 +2224,7 @@ useEffect(() => {
     setUser(userData);
     localStorage.setItem('user', JSON.stringify(serializeStoredUser(userData)));
     // Giáo viên vào thẳng màn hình Bài học dùng chung giao diện quản lý với Admin.
-    // Kể cả giáo viên có quyen_admin vẫn giữ workspace 5 chức năng của giáo viên.
+    // Kể cả giáo viên có quyen_admin vẫn giữ workspace nghiệp vụ dành cho giáo viên.
     setActiveMenu(userData.vai_tro === 'admin' ? 'overview' : userData.vai_tro === 'teacher' ? 'lessons' : 'learning');
   };
 
@@ -2340,9 +2512,17 @@ useEffect(() => {
     if (!user || user.vai_tro !== 'student') return false;
     const activeSessionMatches = activeCoLearningSession && activeCoLearningSession.lesson_id === record.lesson_id;
     const queuedCoLearningRecord = record.study_mode === 'co_learning' && Boolean(String(record.co_learning_session_id || '').trim());
+    // V6.84.1: tiến trình của học sinh phải luôn mang lớp/khối của tài khoản hiện tại.
+    // Bài dùng chung theo khối thường có lesson.lop_id trống; nếu giữ giá trị đó thì
+    // bảng Theo dõi lọc theo lớp sẽ không nhận được kết quả vừa nộp.
+    const scopedRecord: LessonProgressRecord = {
+      ...record,
+      khoi: String(user.khoi || record.khoi || selectedLesson?.khoi || '').trim(),
+      lop_id: String(user.lop_id || record.lop_id || '').trim(),
+    };
     const payload: LessonProgressRecord = activeSessionMatches
       ? {
-          ...record,
+          ...scopedRecord,
           study_mode: 'co_learning',
           co_learning_session_id: activeCoLearningSession.co_learning_session_id,
           co_learner_ids: getCoLearningSessionUserIds(activeCoLearningSession).join(','),
@@ -2351,8 +2531,8 @@ useEffect(() => {
           result_group_id: activeCoLearningSession.co_learning_session_id,
         }
       : queuedCoLearningRecord
-        ? { ...record }
-        : { ...record, study_mode: 'single', co_learning_session_id: '', co_learner_ids: '', co_learner_user_ids: [], co_learner_names: [], result_group_id: `${record.user_id}_${record.lesson_id}` };
+        ? { ...scopedRecord }
+        : { ...scopedRecord, study_mode: 'single', co_learning_session_id: '', co_learner_ids: '', co_learner_user_ids: [], co_learner_names: [], result_group_id: `${record.user_id}_${record.lesson_id}` };
     const res = await saveLearningProgressApi(user.token, payload);
     if (!res.ok) {
       queuePendingLearningProgress(user.user_id, payload);
@@ -2369,7 +2549,7 @@ useEffect(() => {
       setProgressRecordsSync((current) => current.map((item) => item.progress_id === record.progress_id ? { ...item, ...payload, save_state: 'saved' } : item));
     }
     return true;
-  }, [user, activeCoLearningSession]);
+  }, [user, selectedLesson, activeCoLearningSession]);
 
   useEffect(() => {
     if (!user || user.vai_tro !== 'student') return;
@@ -2665,9 +2845,21 @@ useEffect(() => {
       delete progressSaveTimersRef.current[progressId];
     }
     const existing = sanitizeProgressRecord(progressRecordsRef.current.find((item) => item.progress_id === progressId)) || createEmptyProgressRecord(user.user_id, selectedLesson);
-    // Không ghi đè một kết quả chính thức đã chốt trước đó. Trường hợp học lại phải đi
-    // qua nhánh retake ở trên.
-    if (existing.score_status === 'finalized' && Number.isFinite(Number(existing.assessment_score))) return true;
+    // V6.84.1: không ghi đè kết quả chính thức đã nộp trước đó. Riêng điểm 0
+    // được hệ thống tự chốt vì quá hạn có thể được thay thế khi bài cho phép nộp
+    // sau hạn; trước đây guard này trả true quá sớm nên học sinh nộp xong nhưng
+    // bảng Theo dõi vẫn giữ 0.
+    const hasFinalizedOfficialScore = existing.score_status === 'finalized'
+      && Number.isFinite(Number(existing.assessment_score));
+    const deadlineMs = Date.parse(String(selectedLesson.thoi_gian_ket_thuc || ''));
+    const finalAttemptStartedMs = Date.parse(String(snapshot.finalExam?.started_at || ''));
+    const attemptStartedBeforeDeadline = Number.isFinite(deadlineMs)
+      && Number.isFinite(finalAttemptStartedMs)
+      && finalAttemptStartedMs <= deadlineMs;
+    const replacingDeadlineZero = hasFinalizedOfficialScore
+      && String(existing.score_reason || '') === 'deadline_missed'
+      && (lessonAllowsLateSubmission(selectedLesson) || attemptStartedBeforeDeadline);
+    if (hasFinalizedOfficialScore && !replacingDeadlineZero) return true;
 
     const record: LessonProgressRecord = { ...existing, step_details: JSON.parse(JSON.stringify(existing.step_details || {})) };
     const detail = record.step_details.luyen_tap || createEmptyStepDetail();
@@ -2692,6 +2884,11 @@ useEffect(() => {
     });
     finalRecord = {
       ...finalRecord,
+      // Một bài nộp thật phải thay dấu vết `deadline_missed` cũ; nếu không
+      // merge Firestore sẽ tiếp tục coi record như điểm 0 do quá hạn.
+      score_reason: finalRecord.score_status === 'finalized' ? 'submitted' : finalRecord.score_reason,
+      deadline_status: replacingDeadlineZero ? 'overridden' : finalRecord.deadline_status,
+      deadline_finalized_at: replacingDeadlineZero ? '' : finalRecord.deadline_finalized_at,
       score_calculated_at: snapshot.finalExam?.submitted_at || new Date().toISOString(),
       save_state: 'saving',
     };
@@ -2906,8 +3103,9 @@ useEffect(() => {
     void loadLessonComments(lesson.lesson_id);
   };
 
-  const openCoLearningChoice = async (lesson: Lesson, preferredSession: CoLearningSession | null = null) => {
+  const openCoLearningChoice = async (lesson: Lesson, preferredSession: CoLearningSession | null = null, purpose: 'lesson' | 'practice' = 'lesson') => {
     if (!user) return;
+    setCoLearningPurpose(purpose);
     setCoLearningLesson(lesson);
     setCoLearningClassmates([]);
     setCoLearningSelectedUserIds([]);
@@ -2943,9 +3141,12 @@ useEffect(() => {
     if (user.vai_tro === 'student') {
       const currentProgress = currentStudentProgressByLesson[lesson.lesson_id];
       const officialFinalized = currentProgress && (currentProgress.score_status === 'finalized' || (currentProgress.status === 'completed' && Number.isFinite(Number(currentProgress.assessment_score))));
-      const officialRetakeGranted = Boolean(officialFinalized && Number(currentProgress?.official_retake_remaining || 0) > 0 && currentProgress?.official_retake_grant_id);
+      const officialRetakeGranted = Boolean(currentProgress
+        && Number(currentProgress.official_retake_remaining || 0) > 0
+        && currentProgress.official_retake_grant_id
+        && (currentProgress.score_status === 'retake_pending' || officialFinalized));
 
-      // V6.84.0: quyền học lại cập nhật điểm do giáo viên cấp là ngoại lệ có kiểm soát.
+      // V6.84.1: quyền học lại cập nhật điểm do giáo viên cấp là ngoại lệ có kiểm soát.
       // Mở lựa chọn trước guard lịch/khóa để học sinh có thể làm bù sau deadline.
       if (officialRetakeGranted) {
         setRetakeChoiceLesson(lesson);
@@ -3018,7 +3219,7 @@ useEffect(() => {
     if (!res.ok || !res.data) { if (!handleSessionError(res.message)) showToast(res.message || 'Không bắt đầu được lượt học lại cập nhật điểm.', 'error'); return; }
     setRetakeChoiceLesson(null);
     await openLessonDirect(lesson, null, 'retake', res.data);
-    showToast(`Lượt học lại chính thức #${res.data.attempt_number}. Điểm của lần nộp mới sẽ thay thế điểm hiện tại.`, 'info');
+    showToast(`Lượt học lại chính thức #${res.data.attempt_number}. Bài đang ở trạng thái chờ học lại; điểm mới sẽ được ghi khi em nộp bài.`, 'info');
   };
 
   const openLessonTeacherMode = async (lesson: Lesson) => {
@@ -3044,6 +3245,10 @@ useEffect(() => {
       return;
     }
     closeCoLearningModal();
+    if (coLearningPurpose === 'practice' && pendingInteractivePractice?.practice_manifest) {
+      launchInteractivePractice(pendingInteractivePractice, null);
+      return;
+    }
     await openLessonDirect(lesson, null);
   };
 
@@ -3119,6 +3324,11 @@ useEffect(() => {
     const lesson = coLearningLesson;
     const session = res.data;
     closeCoLearningModal();
+    if (coLearningPurpose === 'practice' && pendingInteractivePractice?.practice_manifest) {
+      launchInteractivePractice(pendingInteractivePractice, session);
+      showToast(`Đã xác nhận nhóm ${getCoLearningSessionUserIds(session).length} học sinh để luyện tập cùng.`, 'success');
+      return;
+    }
     setActiveCoLearningSession(session);
     showToast(reusableCoLearningSession ? `Đã cập nhật nhóm ${getCoLearningSessionUserIds(session).length} học sinh. Từ lần lưu tiếp theo, tiến độ và điểm dùng nhóm mới.` : `Đã xác nhận nhóm ${getCoLearningSessionUserIds(session).length} học sinh. Tiến độ và điểm sẽ được đồng bộ cho cả nhóm.`, 'success');
     if (!editingActiveSession) await openLessonDirect(lesson, session);
@@ -3130,6 +3340,11 @@ useEffect(() => {
     const session = reusableCoLearningSession;
     const editingActiveSession = Boolean(isLessonViewerOpen && selectedLesson?.lesson_id === lesson.lesson_id);
     closeCoLearningModal();
+    if (coLearningPurpose === 'practice' && pendingInteractivePractice?.practice_manifest) {
+      launchInteractivePractice(pendingInteractivePractice, session);
+      showToast(`Đang luyện tập cùng nhóm ${getCoLearningSessionUserIds(session).length} học sinh đã xác nhận.`, 'success');
+      return;
+    }
     setActiveCoLearningSession(session);
     showToast(`Đang tiếp tục với nhóm ${getCoLearningSessionUserIds(session).length} học sinh đã xác nhận.`, 'success');
     if (!editingActiveSession) await openLessonDirect(lesson, session);
@@ -3295,6 +3510,113 @@ useEffect(() => {
     showToast('Đã lưu kết quả bài ôn tập.', 'success');
   };
 
+  const openInteractivePracticeCreator = () => {
+    if (user?.vai_tro === 'student') {
+      showToast('Học sinh không có quyền tải bài luyện tập lên hệ thống.', 'error');
+      return;
+    }
+    setIsInteractivePracticeImportOpen(true);
+  };
+
+  const handleCreateInteractivePractice = async (payload: Record<string, unknown>) => {
+    if (!user || user.vai_tro === 'student') return;
+    setIsSubmitting(true);
+    const res = await withLoading('Đang lưu bài luyện tập tương tác...', () => createInteractivePracticeApi(user.token, payload));
+    setIsSubmitting(false);
+    if (!res.ok) {
+      if (!handleSessionError(res.message)) showToast(res.message || 'Không tạo được bài luyện tập.', 'error');
+      return;
+    }
+    setIsInteractivePracticeImportOpen(false);
+    await loadDataDomain('reviews', true);
+    showToast('Đã nhập và phát hành bài luyện tập tương tác.', 'success');
+  };
+
+
+  const openPracticeSettings = async (review: ReviewPracticeRow) => {
+    if (!user || user.vai_tro === 'student') return;
+    const res = await withLoading('Đang tải cấu hình luyện tập...', () => getReviewPracticeApi(user.token, review.review_id));
+    if (!res.ok || !res.data) { showToast(res.message || 'Không tải được cấu hình luyện tập.', 'error'); return; }
+    setPracticeSettingsReview(res.data.review || review);
+    setPracticeSettingsConfig(res.data.config);
+    setIsPracticeSettingsOpen(true);
+  };
+
+  const handleSavePracticeSettings = async (payload: Record<string, unknown>) => {
+    if (!user || !practiceSettingsReview) return;
+    setIsSubmitting(true);
+    const res = await updateInteractivePracticeApi(user.token, practiceSettingsReview.review_id, payload);
+    setIsSubmitting(false);
+    if (!res.ok) { if (!handleSessionError(res.message)) showToast(res.message || 'Không lưu được cấu hình luyện tập.', 'error'); return; }
+    setIsPracticeSettingsOpen(false);
+    setPracticeSettingsReview(null);
+    setPracticeSettingsConfig(undefined);
+    await loadDataDomain('reviews', true);
+    showToast('Đã cập nhật cấu hình luyện tập.', 'success');
+  };
+
+  const launchInteractivePractice = (payload: ReviewPracticeContentResponse, session: CoLearningSession | null = null) => {
+    if (!payload.practice_manifest) { showToast('Bài luyện tập chưa có Practice Manifest hợp lệ.', 'error'); return; }
+    const ownAttempts = user?.vai_tro === 'student' ? myReviewAttempts.filter((item) => item.review_id === payload.review.review_id) : [];
+    const resolved = resolvePracticeConfig(payload.review, payload.config);
+    setSelectedInteractivePractice(payload.review);
+    setSelectedInteractiveManifest(payload.practice_manifest);
+    setSelectedInteractiveConfig(resolved);
+    setSelectedInteractiveAttemptCount(ownAttempts.length);
+    setSelectedInteractiveAllowRetry(resolved.max_attempts === 0 || ownAttempts.length < resolved.max_attempts);
+    setActivePracticeCoLearningSession(session);
+    setIsInteractivePracticeViewerOpen(true);
+  };
+
+  const openInteractivePractice = async (review: ReviewPracticeRow) => {
+    if (!user) return;
+    const ownAttempts = user.vai_tro === 'student' ? myReviewAttempts.filter((item) => item.review_id === review.review_id) : [];
+    if (user.vai_tro === 'student') {
+      const access = getPracticeAccessState(review, undefined, user.lop_id || '', ownAttempts.length);
+      if (!access.canStart) { showToast(access.reason || access.label, 'info'); return; }
+    }
+    const res = await withLoading('Đang mở bài luyện tập...', () => getReviewPracticeApi(user.token, review.review_id));
+    if (!res.ok || !res.data) {
+      if (!handleSessionError(res.message)) showToast(res.message || 'Không mở được bài luyện tập.', 'error');
+      return;
+    }
+    const payload = res.data as ReviewPracticeContentResponse;
+    if (!payload.practice_manifest) { showToast('Bài luyện tập chưa có dữ liệu tương tác chuẩn hóa.', 'error'); return; }
+    if (user.vai_tro !== 'student') { launchInteractivePractice(payload, null); return; }
+    const resolved = resolvePracticeConfig(payload.review, payload.config);
+    const access = getPracticeAccessState(payload.review, resolved, user.lop_id || '', ownAttempts.length);
+    if (!access.canStart) { showToast(access.reason || access.label, 'info'); return; }
+    const linkedLessonId = payload.review.lesson_id || payload.practice_manifest.lessonId || String(payload.review.lesson_ids || '').split(',')[0];
+    const linkedLesson = lessonsById.get(linkedLessonId);
+    if (!resolved.allow_co_learning && resolved.allow_solo) { launchInteractivePractice(payload, null); return; }
+    if (!linkedLesson) {
+      if (!resolved.allow_solo) { showToast('Không tìm thấy bài học liên kết để mở chế độ luyện cùng.', 'error'); return; }
+      showToast('Không tìm thấy bài học liên kết. Hệ thống sẽ mở luyện một mình.', 'info');
+      launchInteractivePractice(payload, null);
+      return;
+    }
+    setPendingInteractivePractice(payload);
+    if (!resolved.allow_solo && resolved.allow_co_learning) {
+      await openCoLearningChoice(linkedLesson, null, 'practice');
+      return;
+    }
+    await openCoLearningChoice(linkedLesson, null, 'practice');
+  };
+
+  const handleSubmitInteractivePractice = async (result: Record<string, unknown>) => {
+    if (!user) return;
+    const res = await submitReviewPracticeApi(user.token, result);
+    if (!res.ok) {
+      if (!handleSessionError(res.message)) showToast(res.message || 'Không lưu được kết quả luyện tập.', 'error');
+      throw new Error(res.message || 'Không lưu được kết quả luyện tập.');
+    }
+    if (user.vai_tro === 'student') {
+      const refreshed = await listMyReviewAttemptsApi(user.token);
+      if (refreshed.ok) setMyReviewAttempts(refreshed.data?.items || []);
+    }
+    showToast('Đã lưu kết quả luyện tập.', 'success');
+  };
+
   const loadReviewPracticeResults = async (review: ReviewPracticeRow) => {
     if (!user || user.vai_tro === 'student') return;
     setIsReviewResultsLoading(true);
@@ -3351,9 +3673,9 @@ useEffect(() => {
   const askDeleteLesson = (lesson: Lesson) => {
     setConfirmDialog({
       isOpen: true,
-      title: 'Xóa bài học',
-      description: `Bạn có chắc muốn xóa bài học “${lesson.tieu_de}”? Hệ thống sẽ xóa bài học, nội dung, tiến trình, bình luận, phiên học cùng, nhật ký xử lý kết quả, prompt trình chiếu và các bài ôn tập được tạo từ bài này. Card chỉ biến mất sau khi Firestore xác nhận xóa hoàn toàn.`,
-      confirmLabel: 'Xóa bài học',
+      title: 'Lưu trữ an toàn bài học',
+      description: `Bài “${lesson.tieu_de}” sẽ được khóa và ẩn khỏi thư viện hoạt động. Hệ thống không quét/xóa hàng loạt tiến trình hoặc điểm học sinh, vì vậy không làm mất lịch sử và không gây lỗi quota. Số bài được giải phóng để có thể tạo lại.`,
+      confirmLabel: 'Lưu trữ bài học',
       cancelLabel: 'Hủy',
       variant: 'danger',
       onConfirm: async () => {
@@ -3361,54 +3683,152 @@ useEffect(() => {
         const lessonId = lesson.lesson_id;
         setConfirmDialog(DEFAULT_CONFIRM);
         setLessonDeletingId(lessonId);
-        showToast('Đang xóa bài học và kiểm tra toàn vẹn dữ liệu...', 'info');
-
+        showToast('Đang lưu trữ an toàn bài học...', 'info');
         try {
           const res = await deleteLessonApi(user.token, lessonId);
           if (!res.ok) {
-            if (!handleSessionError(res.message)) showToast(res.message || 'Không xóa được bài học.', 'error');
+            if (!handleSessionError(res.message)) showToast(res.message || 'Không lưu trữ được bài học.', 'error');
             return;
           }
-
-          // Chỉ cập nhật giao diện sau khi backend đã hoàn tất finalization + verify.
-          setLessonRows((current) => current.filter((item) => item.lesson_id !== lessonId));
-          setProgressRecords((current) => current.filter((item) => item.lesson_id !== lessonId));
-          setLessonComments((current) => current.filter((item) => item.lesson_id !== lessonId));
-          setReviewPractices((current) => current.filter((review) => {
-            const raw = review.lesson_ids;
-            const ids = Array.isArray(raw) ? raw : String(raw || '').split(',');
-            return !ids.map((id) => String(id || '').trim()).includes(lessonId);
-          }));
+          setLessonRows((current) => current.map((item) => item.lesson_id === lessonId ? { ...item, trang_thai: 'archived', pham_vi: 'private', is_locked: true } : item));
           setSelectedLesson((current) => current?.lesson_id === lessonId ? null : current);
           setSelectedLessonContent((current) => selectedLesson?.lesson_id === lessonId ? null : current);
           setArenaLesson((current) => current?.lesson_id === lessonId ? null : current);
           setArenaLessonContent((current) => arenaLesson?.lesson_id === lessonId ? null : current);
-
-          const counts = (res.data as any)?.deleted_counts || {};
-          const relatedDeleted = [
-            counts.learningProgress,
-            counts.learningResultActions,
-            counts.lessonComments,
-            counts.coLearningSessions,
-            counts.slidesPrompts,
-            counts.reviewPractices,
-            counts.reviewAttempts,
-          ].reduce((sum: number, value: unknown) => sum + Math.max(0, Number(value || 0)), 0);
-
-          showToast(
-            relatedDeleted > 0
-              ? `Đã xóa hoàn toàn bài học và ${relatedDeleted} bản ghi liên quan.`
-              : 'Đã xóa hoàn toàn bài học và giải phóng số bài để có thể tạo lại.',
-            'success',
-          );
+          showToast('Đã lưu trữ an toàn bài học. Lịch sử điểm/kết quả vẫn được giữ nguyên.', 'success');
           void loadAppData().catch(() => undefined);
         } catch (error) {
-          showToast(error instanceof Error ? error.message : 'Không xóa được bài học.', 'error');
+          showToast(error instanceof Error ? error.message : 'Không lưu trữ được bài học.', 'error');
         } finally {
           setLessonDeletingId('');
         }
       },
     });
+  };
+
+  const runLessonPermanentPurge = async (lesson: Lesson, mode: LessonPurgeMode, totalHint = 0) => {
+    if (!user || !currentUserIsAdmin || lessonDeletingId) return;
+    const lessonId = lesson.lesson_id;
+    setLessonDeletingId(lessonId);
+    setLessonPurgeProgress((current) => current?.lessonId === lessonId
+      ? { ...current, status: 'running', error: undefined }
+      : {
+          lessonId,
+          lessonTitle: lesson.tieu_de,
+          mode,
+          status: 'running',
+          phase: 'preparation_submissions',
+          processed: 0,
+          total: totalHint,
+          archivedGrades: 0,
+        });
+    try {
+      const startRes = await purgeLessonApi(user.token, lessonId, mode);
+      if (!startRes.ok || !startRes.data) {
+        showToast(startRes.message || 'Không thể bắt đầu xóa vĩnh viễn bài học.', 'error');
+        setLessonPurgeProgress((current) => current ? { ...current, status: 'retryable', error: startRes.message } : current);
+        return;
+      }
+      let job: any = startRes.data;
+      const reflect = (value: any) => setLessonPurgeProgress({
+        lessonId,
+        lessonTitle: lesson.tieu_de,
+        mode: value.mode === 'purge_all' ? 'purge_all' : 'preserve_grades',
+        status: value.status === 'completed' ? 'completed' : value.status === 'retryable' ? 'retryable' : 'running',
+        phase: String(value.phase || 'preparation_submissions'),
+        processed: Number(value.processed_records || 0),
+        total: Number(value.total_records || totalHint || 0),
+        archivedGrades: Number(value.archived_grade_records || 0),
+        error: String(value.last_error || ''),
+      });
+      reflect(job);
+
+      // Mỗi vòng xử lý tối đa một batch/phase. Job tự lưu phase nên refresh hoặc
+      // quota/mất mạng không làm mất vị trí. Khoảng nghỉ ngắn tránh dồn request.
+      for (let round = 0; round < 240 && job.status !== 'completed' && job.status !== 'retryable'; round += 1) {
+        const step = await continueLessonPurgeApi(user.token, lessonId);
+        if (!step.ok || !step.data) {
+          const message = step.message || 'Tiến trình xóa bị gián đoạn.';
+          setLessonPurgeProgress((current) => current ? { ...current, status: 'retryable', error: message } : current);
+          showToast(`${message} Dữ liệu đã xử lý được giữ nguyên; có thể bấm Tiếp tục xóa.`, 'error');
+          return;
+        }
+        job = step.data;
+        reflect(job);
+        if (job.status === 'retryable') {
+          showToast('Tiến trình xóa tạm dừng. Hệ thống đã lưu vị trí hiện tại; hãy bấm Tiếp tục xóa khi quota/mạng ổn định.', 'error');
+          return;
+        }
+        if (job.status === 'completed') {
+          setLessonRows((current) => current.filter((item) => item.lesson_id !== lessonId));
+          setSelectedLesson((current) => current?.lesson_id === lessonId ? null : current);
+          setSelectedLessonContent((current) => selectedLesson?.lesson_id === lessonId ? null : current);
+          showToast(mode === 'preserve_grades'
+            ? `Đã xóa vĩnh viễn bài học và lưu ${Number(job.archived_grade_records || 0)} bản ghi điểm lịch sử.`
+            : 'Đã xóa vĩnh viễn bài học và toàn bộ dữ liệu liên quan.', 'success');
+          void loadAppData().catch(() => undefined);
+          return;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 60));
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Không thể tiếp tục xóa vĩnh viễn bài học.';
+      setLessonPurgeProgress((current) => current ? { ...current, status: 'retryable', error: message } : current);
+      showToast(`${message} Tiến trình có thể tiếp tục từ vị trí đã lưu.`, 'error');
+    } finally {
+      setLessonDeletingId('');
+    }
+  };
+
+  const askPurgeLesson = async (lesson: Lesson, mode: LessonPurgeMode = 'preserve_grades') => {
+    if (!currentUserIsAdmin || !user || lessonDeletingId) return;
+    setLessonDeletingId(lesson.lesson_id);
+    showToast('Đang phân tích dữ liệu liên quan trước khi xóa...', 'info');
+    const analysisRes = await analyzeLessonPurgeApi(user.token, lesson.lesson_id);
+    setLessonDeletingId('');
+    if (!analysisRes.ok || !analysisRes.data) {
+      showToast(analysisRes.message || 'Không thể phân tích dữ liệu bài học.', 'error');
+      return;
+    }
+    const analysis: any = analysisRes.data;
+    const counts = analysis.counts || {};
+    const studentRecords = Number(analysis.student_data_records || 0);
+    const total = Number(analysis.total_records || 0);
+    const summary = [
+      `${Number(counts.learningProgress || 0)} tiến độ/điểm`,
+      `${Number(counts.preparationSubmissions || 0) + Number(counts.legacyPreLessonSubmissions || 0) + Number(counts.preLessonProgress || 0)} kết quả chuẩn bị`,
+      `${Number(counts.retakes || 0)} lượt học lại`,
+      `${Number(counts.lessonComments || 0)} bình luận`,
+      `${Number(counts.coLearningSessions || 0)} phiên học cùng`,
+      `${Number(counts.reviewPractices || 0)} bài luyện liên kết`,
+    ].join(' • ');
+    const modeText = mode === 'preserve_grades'
+      ? 'Điểm chính thức sẽ được chụp sang kho lịch sử trước khi xóa tiến độ gốc.'
+      : 'TOÀN BỘ tiến độ, điểm và dữ liệu học sinh liên quan sẽ bị xóa.';
+    setConfirmDialog({
+      isOpen: true,
+      title: mode === 'preserve_grades' ? 'Xóa vĩnh viễn – giữ lịch sử điểm' : 'Xóa vĩnh viễn – xóa toàn bộ dữ liệu',
+      description: `Bài “${lesson.tieu_de}” có khoảng ${total} bản ghi/tham chiếu liên quan (${studentRecords} dữ liệu học sinh). ${summary}. ${modeText} Hệ thống sẽ xóa theo batch nhỏ và có thể tiếp tục nếu quota hoặc mạng gián đoạn.`,
+      confirmLabel: mode === 'preserve_grades' ? 'Xóa và giữ điểm' : 'Xóa toàn bộ vĩnh viễn',
+      cancelLabel: 'Hủy',
+      variant: 'danger',
+      requiredText: 'XOA VINH VIEN',
+      requiredTextLabel: 'Nhập XOA VINH VIEN để xác nhận thao tác không thể hoàn tác',
+      onConfirm: async () => {
+        setConfirmDialog(DEFAULT_CONFIRM);
+        await runLessonPermanentPurge(lesson, mode, total);
+      },
+    });
+  };
+
+  const resumeLessonPermanentPurge = async () => {
+    if (!lessonPurgeProgress) return;
+    const lesson = lessons.find((item) => item.lesson_id === lessonPurgeProgress.lessonId);
+    if (!lesson) {
+      setLessonPurgeProgress(null);
+      return;
+    }
+    await runLessonPermanentPurge(lesson, lessonPurgeProgress.mode, lessonPurgeProgress.total);
   };
 
   const handleRepairLessonIntegrity = async () => {
@@ -3422,10 +3842,12 @@ useEffect(() => {
         return;
       }
       const summary = res.data as any;
+      const orphanFixed = Number(summary.removed_orphan_references || 0);
+      const lessonFixed = Number(summary.normalized_lessons || 0);
       showToast(
-        Number(summary.removed_orphan_references || 0) > 0
-          ? `Đã sửa ${summary.removed_orphan_references} tham chiếu mồ côi trong ${summary.repaired_registries} registry.`
-          : 'Kiểm tra hoàn tất: không còn registry bài học mồ côi.',
+        orphanFixed > 0 || lessonFixed > 0
+          ? `Kiểm tra hoàn tất: sửa ${orphanFixed} tham chiếu mồ côi và chuẩn hóa ${lessonFixed} bài học/video chuẩn bị.`
+          : 'Kiểm tra hoàn tất: registry và metadata video chuẩn bị đều hợp lệ.',
         'success',
       );
       await loadAppData();
@@ -3452,22 +3874,51 @@ useEffect(() => {
     showToast(nextLocked ? `Đã khóa “${lesson.tieu_de}” đối với Học tập và Đấu trường tri thức.` : `Đã mở khóa “${lesson.tieu_de}” cho Học tập và Đấu trường tri thức.`, 'success');
   };
 
-  const handleToggleLessonAccessMode = async (lesson: Lesson) => {
-    if (!user || lessonAccessModeUpdatingId) return;
-    const nextMode = lesson.access_mode === 'self_study' ? 'teacher_controlled' : 'self_study';
-    setLessonAccessModeUpdatingId(lesson.lesson_id);
-    const res = await setLessonAccessModeApi(user.token, lesson.lesson_id, nextMode);
+  const selfStudyClassOptionsForLesson = (lesson: Lesson) => {
+    if (lesson.lop_id) return classes.filter((item) => item.lop_id === lesson.lop_id);
+    return classes
+      .filter((item) => String(item.khoi || '').replace(/\.0+$/, '') === String(lesson.khoi || '').replace(/\.0+$/, ''))
+      .sort((a, b) => String(a.ten_lop || a.lop_id).localeCompare(String(b.ten_lop || b.lop_id), 'vi'));
+  };
+
+  const openSelfStudyAccessModal = (lesson: Lesson) => {
+    const options = selfStudyClassOptionsForLesson(lesson);
+    const scope = lesson.self_study_scope || (lesson.access_mode === 'self_study' ? 'all' : 'none');
+    const selected = scope === 'all'
+      ? options.map((item) => item.lop_id)
+      : scope === 'classes'
+        ? (lesson.self_study_class_ids || []).filter((id) => options.some((item) => item.lop_id === id))
+        : [];
+    setSelfStudyAccessLesson(lesson);
+    setSelfStudySelectedClassIds(selected);
+  };
+
+  const saveSelfStudyAccess = async () => {
+    if (!user || !selfStudyAccessLesson || selfStudyAccessSaving) return;
+    const options = selfStudyClassOptionsForLesson(selfStudyAccessLesson);
+    const allIds = options.map((item) => item.lop_id);
+    const selected: string[] = Array.from(new Set<string>(selfStudySelectedClassIds.filter((id) => allIds.includes(id))));
+    const scope = selected.length === 0 ? 'none' : selected.length === allIds.length ? 'all' : 'classes';
+    setSelfStudyAccessSaving(true);
+    setLessonAccessModeUpdatingId(selfStudyAccessLesson.lesson_id);
+    const res = await setLessonSelfStudyAccessApi(user.token, selfStudyAccessLesson.lesson_id, scope, selected);
+    setSelfStudyAccessSaving(false);
     setLessonAccessModeUpdatingId('');
     if (!res.ok || !res.data) {
-      if (!handleSessionError(res.message)) showToast(res.message || 'Không cập nhật được chế độ truy cập bài học.', 'error');
+      if (!handleSessionError(res.message)) showToast(res.message || 'Không cập nhật được phạm vi tự học theo lớp.', 'error');
       return;
     }
     const saved = mapLessonRow(res.data, subjects, classes, accounts, user);
-    setLessonRows((current) => current.map((item) => item.lesson_id === lesson.lesson_id ? { ...item, ...res.data } : item));
-    setSelectedLesson((current) => current?.lesson_id === lesson.lesson_id ? { ...current, access_mode: saved.access_mode, is_locked: saved.is_locked } : current);
-    showToast(nextMode === 'self_study'
-      ? `Đã mở tự học nhanh cho “${lesson.tieu_de}”. Học sinh có thể mở tất cả mục mà không cần giáo viên mở từng mục.`
-      : `Đã chuyển “${lesson.tieu_de}” về chế độ giáo viên điều khiển từng mục.`, 'success');
+    setLessonRows((current) => current.map((item) => item.lesson_id === saved.lesson_id ? { ...item, ...res.data } : item));
+    setSelectedLesson((current) => current?.lesson_id === saved.lesson_id ? { ...current, ...saved } : current);
+    setSelfStudyAccessLesson(null);
+    setSelfStudySelectedClassIds([]);
+    showToast(res.message || 'Đã cập nhật phạm vi tự học theo lớp.', 'success');
+  };
+
+  // Tương thích hành vi cũ: nút nhanh nay mở trình quản lý phạm vi theo lớp.
+  const handleToggleLessonAccessMode = async (lesson: Lesson) => {
+    openSelfStudyAccessModal(lesson);
   };
 
   const handleSubmitReview = async (lesson: Lesson) => {
@@ -4029,6 +4480,7 @@ useEffect(() => {
               { value: 'ready_private', label: 'Riêng tư' },
               { value: 'draft', label: 'Bản nháp' },
               { value: 'approved_shared', label: 'Dùng chung' },
+              { value: 'archived', label: 'Đã lưu trữ' },
               { value: 'pending_review', label: 'Chờ duyệt' },
               { value: 'rejected', label: 'Bị từ chối' },
             ],
@@ -4164,7 +4616,7 @@ useEffect(() => {
               {canModify ? (
                 <button onClick={(event) => { stopTileAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); void handleToggleLessonAccessMode(lesson); }} disabled={Boolean(lessonAccessModeUpdatingId)} className={`flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold disabled:cursor-wait disabled:opacity-60 ${lesson.access_mode === 'self_study' ? 'text-violet-700 hover:bg-violet-50' : 'text-indigo-700 hover:bg-indigo-50'}`}>
                   {lessonAccessModeUpdatingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <BookOpenCheck className="h-3.5 w-3.5" />}
-                  {lesson.access_mode === 'self_study' ? 'Tắt tự học nhanh' : 'Mở tự học nhanh'}
+                  Quản lý tự học theo lớp
                 </button>
               ) : null}
               {canSubmitReview ? (
@@ -4173,10 +4625,20 @@ useEffect(() => {
                 </button>
               ) : null}
               {canModify ? <div className="my-1 border-t border-slate-100" /> : null}
-              {canModify ? (
+              {canModify && lesson.trang_thai !== 'archived' ? (
                 <button disabled={Boolean(lessonDeletingId)} onClick={(event) => { stopTileAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); askDeleteLesson(lesson); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold text-rose-700 hover:bg-rose-50 disabled:cursor-wait disabled:opacity-60">
-                  {lessonDeletingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />} {lessonDeletingId === lesson.lesson_id ? 'Đang xóa...' : 'Xóa bài học'}
+                  {lessonDeletingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />} {lessonDeletingId === lesson.lesson_id ? 'Đang lưu trữ...' : 'Lưu trữ bài học'}
                 </button>
+              ) : null}
+              {currentUserIsAdmin && lesson.trang_thai === 'archived' ? (
+                <>
+                  <button disabled={Boolean(lessonDeletingId)} onClick={(event) => { stopTileAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); void askPurgeLesson(lesson, 'preserve_grades'); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold text-rose-800 hover:bg-rose-100 disabled:cursor-wait disabled:opacity-60">
+                    <Trash2 className="h-3.5 w-3.5" /> Xóa vĩnh viễn • giữ điểm
+                  </button>
+                  <button disabled={Boolean(lessonDeletingId)} onClick={(event) => { stopTileAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); void askPurgeLesson(lesson, 'purge_all'); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold text-red-700 hover:bg-red-50 disabled:cursor-wait disabled:opacity-60">
+                    <XCircle className="h-3.5 w-3.5" /> Xóa toàn bộ dữ liệu
+                  </button>
+                </>
               ) : null}
             </div>
           </details>
@@ -4251,11 +4713,11 @@ useEffect(() => {
               onClick={(event) => { stopCardAction(event); void handleToggleLessonAccessMode(lesson); }}
               disabled={Boolean(lessonAccessModeUpdatingId)}
               className={`lesson-action-button disabled:cursor-wait disabled:opacity-60 ${lesson.access_mode === 'self_study' ? 'bg-violet-50 text-violet-700 hover:bg-violet-100' : 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100'}`}
-              aria-label={lesson.access_mode === 'self_study' ? 'Tắt tự học nhanh' : 'Mở tự học nhanh'}
-              title={lesson.access_mode === 'self_study' ? 'Tắt tự học nhanh' : 'Mở tự học nhanh'}
+              aria-label="Quản lý tự học theo lớp"
+              title="Quản lý tự học theo lớp"
             >
               {lessonAccessModeUpdatingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 shrink-0 animate-spin" /> : <BookOpenCheck className="h-3.5 w-3.5 shrink-0" />}
-              <span className="lesson-action-label">{lesson.access_mode === 'self_study' ? 'Tắt tự học' : 'Tự học'}</span>
+              <span className="lesson-action-label">Tự học theo lớp</span>
             </button>
           )}
           {(canModify || canSubmitReview) && (
@@ -4276,10 +4738,20 @@ useEffect(() => {
                 {canSubmitReview && (
                   <button onClick={(event) => { stopCardAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); void handleSubmitReview(lesson); }} className="flex w-full items-center rounded-lg px-3 py-2 text-left text-xs font-semibold text-amber-700 transition hover:bg-amber-50">Gửi admin duyệt</button>
                 )}
-                {canModify && (
+                {canModify && lesson.trang_thai !== 'archived' && (
                   <button disabled={Boolean(lessonDeletingId)} onClick={(event) => { stopCardAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); askDeleteLesson(lesson); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-semibold text-rose-700 transition hover:bg-rose-50 disabled:cursor-wait disabled:opacity-60">
-                    {lessonDeletingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />} {lessonDeletingId === lesson.lesson_id ? 'Đang xóa...' : 'Xóa bài học'}
+                    {lessonDeletingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />} {lessonDeletingId === lesson.lesson_id ? 'Đang lưu trữ...' : 'Lưu trữ bài học'}
                   </button>
+                )}
+                {currentUserIsAdmin && lesson.trang_thai === 'archived' && (
+                  <>
+                    <button disabled={Boolean(lessonDeletingId)} onClick={(event) => { stopCardAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); void askPurgeLesson(lesson, 'preserve_grades'); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-semibold text-rose-800 transition hover:bg-rose-100 disabled:cursor-wait disabled:opacity-60">
+                      <Trash2 className="h-3.5 w-3.5" /> Xóa vĩnh viễn • giữ điểm
+                    </button>
+                    <button disabled={Boolean(lessonDeletingId)} onClick={(event) => { stopCardAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); void askPurgeLesson(lesson, 'purge_all'); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-semibold text-red-700 transition hover:bg-red-50 disabled:cursor-wait disabled:opacity-60">
+                      <XCircle className="h-3.5 w-3.5" /> Xóa toàn bộ dữ liệu
+                    </button>
+                  </>
                 )}
               </div>
             </details>
@@ -4330,7 +4802,7 @@ useEffect(() => {
   };
 
   const renderReviewPracticeSection = () => {
-    if (activeMenu === 'approvals' || !visibleReviewPractices.length) return null;
+    if (activeMenu === 'approvals' || !standardReviewPractices.length) return null;
     const reviewTypeLabel: Record<string, string> = {
       chapter: 'Ôn tập chương',
       midterm: 'Ôn tập giữa kỳ',
@@ -4345,10 +4817,10 @@ useEffect(() => {
             <p className="inline-flex items-center gap-2 rounded-full bg-amber-50 px-3 py-1 text-xs font-black uppercase tracking-[0.14em] text-amber-700"><BookOpenCheck className="h-4 w-4" /> Bài ôn tập</p>
             <h3 className="mt-2 text-xl font-black text-slate-900">Ôn tập tổng hợp từ nhiều bài học</h3>
           </div>
-          <span className="rounded-full bg-slate-100 px-3 py-1.5 text-xs font-bold text-slate-600">{visibleReviewPractices.length} bài ôn tập phù hợp</span>
+          <span className="rounded-full bg-slate-100 px-3 py-1.5 text-xs font-bold text-slate-600">{standardReviewPractices.length} bài ôn tập phù hợp</span>
         </div>
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {visibleReviewPractices.map((review) => {
+          {standardReviewPractices.map((review) => {
             const subjectName = subjects.find((item) => item.mon_id === review.mon_id)?.ten_mon || review.mon_hoc || review.mon_id || 'Môn học';
             const canModifyReview = currentUserIsAdmin || (user.vai_tro === 'teacher' && review.nguoi_tao_id === user.user_id);
             return (
@@ -4371,6 +4843,94 @@ useEffect(() => {
           })}
         </div>
       </section>
+    );
+  };
+
+  const renderInteractivePracticeHub = () => {
+    const canCreate = user?.vai_tro !== 'student';
+    const yearOptions = Array.from(new Set(reviewPractices.map((item) => String(item.nam_hoc || '')).filter(Boolean))).sort().reverse();
+    const semesterOptions = Array.from(new Set(reviewPractices.map((item) => String(item.hoc_ky || '')).filter(Boolean))).sort();
+    const subjectOptions = Array.from(new Set(subjects.map((item) => String(item.ten_mon || '')).filter(Boolean))).sort((a,b)=>a.localeCompare(b,'vi'));
+    return (
+      <div className="space-y-5">
+        <section className="rounded-[30px] bg-gradient-to-br from-indigo-600 via-violet-600 to-fuchsia-600 p-6 text-white shadow-xl shadow-indigo-100 sm:p-7">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="max-w-2xl">
+              <p className="inline-flex items-center gap-2 rounded-full bg-white/15 px-3 py-1 text-xs font-black uppercase tracking-[0.14em]"><BookOpenCheck className="h-4 w-4" /> Luyện tập tương tác</p>
+              <h2 className="mt-3 text-2xl font-black sm:text-3xl">Quản lý luyện tập theo từng bài học</h2>
+              <p className="mt-2 text-sm leading-6 text-white/85">Cấu hình thời gian, số lượt, điểm đạt và quyền truy cập theo lớp. Học sinh xem điểm tốt nhất ngay trên thư viện luyện tập.</p>
+            </div>
+            {canCreate ? <button type="button" onClick={openInteractivePracticeCreator} className="inline-flex items-center gap-2 rounded-2xl bg-white px-4 py-3 text-sm font-black text-indigo-700 shadow-lg shadow-indigo-950/10"><UploadCloud className="h-4 w-4" /> Tải file bài tập</button> : null}
+          </div>
+        </section>
+
+        <DataToolbar
+          title="Danh sách bài luyện tập"
+          description="Tìm kiếm và lọc theo năm học, học kỳ, khối, lớp, môn và trạng thái truy cập."
+          searchValue={practiceSearch}
+          onSearchChange={setPracticeSearch}
+          searchPlaceholder="Tìm bài luyện tập, bài học, file nguồn..."
+          compact
+          filters={[
+            { key: 'year', label: 'Năm học', value: practiceYearFilter, onChange: setPracticeYearFilter, options: ['Tất cả', ...yearOptions].map((value)=>({value,label:value==='Tất cả'?'Tất cả năm học':value})) },
+            { key: 'semester', label: 'Học kỳ', value: practiceSemesterFilter, onChange: setPracticeSemesterFilter, options: ['Tất cả', ...semesterOptions].map((value)=>({value,label:value==='Tất cả'?'Tất cả học kỳ':value})) },
+            { key: 'grade', label: 'Khối', value: practiceGradeFilter, onChange: setPracticeGradeFilter, options: ['Tất cả', ...gradeFilterOptions].map((value)=>({value,label:value==='Tất cả'?'Tất cả khối':`Khối ${value}`})) },
+            { key: 'class', label: 'Lớp', value: practiceClassFilter, onChange: setPracticeClassFilter, options: [{value:'Tất cả',label:'Tất cả lớp'}, ...practiceClassOptions] },
+            { key: 'subject', label: 'Môn', value: practiceSubjectFilter, onChange: setPracticeSubjectFilter, options: ['Tất cả', ...subjectOptions].map((value)=>({value,label:value==='Tất cả'?'Tất cả môn học':value})) },
+            { key: 'status', label: 'Trạng thái', value: practiceStatusFilter, onChange: setPracticeStatusFilter, options: [
+              {value:'Tất cả',label:'Tất cả trạng thái'},{value:'open',label:'Đang mở'},{value:'locked',label:'Đang khóa'},{value:'scheduled',label:'Chưa đến giờ'},{value:'closed',label:'Đã kết thúc'},{value:'draft',label:'Bản nháp'},
+            ] },
+          ]}
+        />
+
+        {interactivePractices.length ? (
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            {interactivePractices.map((practice) => {
+              const subjectName = subjects.find((item) => item.mon_id === practice.mon_id)?.ten_mon || practice.mon_hoc || practice.mon_id || 'Môn học';
+              const linkedLesson = lessonsById.get(practice.lesson_id || String(practice.lesson_ids || '').split(',')[0]);
+              const canModify = currentUserIsAdmin || (user?.vai_tro === 'teacher' && practice.nguoi_tao_id === user.user_id);
+              const config = resolvePracticeConfig(practice, undefined);
+              const ownAttempts = user?.vai_tro === 'student' ? myReviewAttempts.filter((item) => item.review_id === practice.review_id) : [];
+              const summary = practiceAttemptSummary(ownAttempts);
+              const studentAccess = user?.vai_tro === 'student' ? getPracticeAccessState(practice, config, user.lop_id || '', summary.count) : null;
+              const selectedClassAccess = user?.vai_tro !== 'student' && practiceClassFilter !== 'Tất cả' ? getPracticeAccessState(practice, config, practiceClassFilter, 0) : null;
+              const lockedCount = config.target_class_ids.filter((id) => config.locked_class_ids.includes(id)).length;
+              const accessLabel = studentAccess?.label || selectedClassAccess?.label || (String(practice.trang_thai || 'active') !== 'active' ? 'Bản nháp' : lockedCount ? `${lockedCount} lớp đang khóa` : 'Đang mở');
+              const accessTone = studentAccess?.key === 'open' || (!studentAccess && !selectedClassAccess && !lockedCount && String(practice.trang_thai || 'active') === 'active') ? 'bg-emerald-50 text-emerald-700' : studentAccess?.key === 'locked' || selectedClassAccess?.key === 'locked' || lockedCount ? 'bg-rose-50 text-rose-700' : 'bg-amber-50 text-amber-700';
+              const passed = summary.best !== null && summary.best >= config.pass_score;
+              return (
+                <article key={practice.review_id} className="rounded-[26px] border border-indigo-100 bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-lg">
+                  <div className="flex items-start justify-between gap-3">
+                    <span className="rounded-full bg-indigo-50 px-3 py-1 text-[11px] font-black uppercase tracking-[0.12em] text-indigo-700">Bài {linkedLesson?.lesson_number || '-'} • Khối {practice.khoi}</span>
+                    <span className={`rounded-full px-2.5 py-1 text-[11px] font-black ${accessTone}`}>{accessLabel}</span>
+                  </div>
+                  <h3 className="mt-3 line-clamp-2 text-lg font-black text-slate-900">{practice.tieu_de}</h3>
+                  <p className="mt-2 text-sm font-semibold text-slate-500">{subjectName} • {practice.hoc_ky || 'HK1'} • {practice.nam_hoc || '-'}</p>
+                  <p className="mt-2 line-clamp-2 text-xs leading-5 text-slate-500">Gắn với: {linkedLesson?.tieu_de || practice.source_lesson_titles || 'Bài học liên kết'}</p>
+                  <div className="mt-4 flex flex-wrap gap-2 text-xs font-bold">
+                    <span className="rounded-full bg-slate-50 px-3 py-1.5 text-slate-600">{Number(practice.so_cau || 0)} mục</span>
+                    <span className="rounded-full bg-slate-50 px-3 py-1.5 text-slate-600">⏱ {config.time_limit_minutes ? `${config.time_limit_minutes} phút` : 'Không giới hạn'}</span>
+                    <span className="rounded-full bg-slate-50 px-3 py-1.5 text-slate-600">🔁 {config.max_attempts || '∞'} lượt</span>
+                    <span className="rounded-full bg-slate-50 px-3 py-1.5 text-slate-600">🎯 Đạt {config.pass_score}/10</span>
+                  </div>
+                  {user?.vai_tro === 'student' ? <div className="mt-4 rounded-2xl bg-slate-50 p-3 text-sm">
+                    {summary.count ? <><div className="flex items-center justify-between"><span className="font-bold text-slate-600">Điểm tốt nhất</span><span className={`text-lg font-black ${passed?'text-emerald-600':'text-amber-600'}`}>{summary.best?.toFixed(summary.best % 1 === 0 ? 0 : 1)}/10</span></div><p className="mt-1 text-xs font-semibold text-slate-500">Gần nhất: {summary.latest ?? '-'} • Đã làm {summary.count}/{config.max_attempts || '∞'} lượt • {passed?'✅ Đạt':'🟠 Chưa đạt'}</p></> : <p className="font-bold text-slate-500">Chưa luyện tập</p>}
+                    {studentAccess && !studentAccess.canStart ? <p className="mt-2 text-xs font-bold text-rose-600">{studentAccess.reason}</p> : null}
+                  </div> : <div className="mt-4 rounded-2xl bg-slate-50 p-3 text-xs font-semibold text-slate-600"><p>{config.target_class_ids.length || classes.filter(c=>String(c.khoi||'')===String(practice.khoi||'')).length} lớp áp dụng • {lockedCount} lớp đang khóa</p>{config.available_from?<p className="mt-1">Mở: {formatPracticeDateTime(config.available_from)}</p>:null}{config.available_until?<p>Đóng: {formatPracticeDateTime(config.available_until)}</p>:null}</div>}
+                  <div className="mt-4 flex flex-wrap gap-2 border-t border-slate-100 pt-4">
+                    <button type="button" disabled={user?.vai_tro === 'student' && studentAccess?.canStart === false} onClick={() => void openInteractivePractice(practice)} className="rounded-full bg-indigo-600 px-4 py-2 text-xs font-black text-white shadow-md shadow-indigo-100 hover:bg-indigo-700 disabled:bg-slate-300 disabled:shadow-none">{user?.vai_tro === 'student' ? 'Luyện tập' : 'Xem thử'}</button>
+                    {user?.vai_tro !== 'student' ? <button type="button" onClick={() => void openReviewPracticeResults(practice)} className="rounded-full bg-emerald-50 px-3 py-2 text-xs font-bold text-emerald-700 hover:bg-emerald-100">Kết quả</button> : null}
+                    {canModify ? <button type="button" onClick={() => void openPracticeSettings(practice)} className="rounded-full bg-indigo-50 px-3 py-2 text-xs font-bold text-indigo-700 hover:bg-indigo-100"><Settings className="mr-1 inline h-3.5 w-3.5" />Cấu hình</button> : null}
+                    {canModify ? <button type="button" onClick={() => askDeleteReviewPractice(practice)} className="rounded-full bg-rose-50 px-3 py-2 text-xs font-bold text-rose-700 hover:bg-rose-100">Xóa</button> : null}
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="rounded-[28px] border border-dashed border-slate-200 bg-white px-6 py-14 text-center shadow-sm"><BookOpenCheck className="mx-auto h-10 w-10 text-slate-300" /><h3 className="mt-3 font-black text-slate-800">Chưa có bài luyện tập phù hợp</h3><p className="mt-2 text-sm text-slate-500">{canCreate ? 'Thay đổi bộ lọc hoặc tải file HTML bài tập tương tác để bắt đầu.' : 'Giáo viên chưa phát hành bài luyện tập phù hợp cho lớp của em.'}</p></div>
+        )}
+      </div>
     );
   };
 
@@ -4464,19 +5024,23 @@ useEffect(() => {
   };
 
   const renderAnalyticsScopeNotice = () => (
-    <div className={`rounded-2xl border px-4 py-3 text-sm ${analyticsHasServerScope ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
+    <div className={`rounded-2xl border px-4 py-3 text-sm ${analyticsProgressError ? 'border-rose-200 bg-rose-50 text-rose-800' : analyticsHasServerScope ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
       <div className="flex flex-wrap items-center gap-2 font-semibold">
         {isAnalyticsProgressLoading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Database className="h-4 w-4" />}
         {isAnalyticsProgressLoading
           ? 'Đang tải tiến trình đúng phạm vi đã chọn...'
-          : analyticsHasServerScope
-            ? 'Đang dùng truy vấn theo phạm vi để tiết kiệm Firestore Spark.'
-            : 'Chưa tải tiến trình toàn trường để bảo vệ hạn mức Firestore Spark.'}
+          : analyticsProgressError
+            ? 'Không tải được dữ liệu tiến độ mới nhất từ Firestore.'
+            : analyticsHasServerScope
+              ? 'Đang dùng truy vấn theo phạm vi để tiết kiệm Firestore Spark.'
+              : 'Chưa tải tiến trình toàn trường để bảo vệ hạn mức Firestore Spark.'}
       </div>
       <p className="mt-1 text-xs leading-5 opacity-85">
-        {analyticsHasServerScope
-          ? 'Thay đổi Khối, Lớp hoặc Bài học sẽ chỉ tải nhóm dữ liệu cần thiết.'
-          : 'Hãy chọn ít nhất Khối, Lớp hoặc Bài học. Hệ thống sẽ không tự quét toàn bộ learningProgress khi chưa có phạm vi.'}
+        {analyticsProgressError
+          ? `${analyticsProgressError} Dữ liệu gần nhất được giữ nguyên; hệ thống không quy lỗi tải thành 0%.`
+          : analyticsHasServerScope
+            ? 'Thay đổi Khối, Lớp hoặc Bài học sẽ chỉ tải nhóm dữ liệu cần thiết. Tiến độ video được làm mới tự động khoảng 60 giây khi màn hình này đang mở.'
+            : 'Hãy chọn ít nhất Khối, Lớp hoặc Bài học. Hệ thống sẽ không tự quét toàn bộ learningProgress khi chưa có phạm vi.'}
       </p>
     </div>
   );
@@ -5396,6 +5960,9 @@ useEffect(() => {
           </div>,
         );
 
+      case 'practice':
+        return renderInteractivePracticeHub();
+
       case 'learning':
         return currentUserIsAdmin ? renderAnalyticsHub() : renderLearningHub();
 
@@ -5605,6 +6172,46 @@ useEffect(() => {
         onClose={closeCoLearningModal}
       />
 
+      {selfStudyAccessLesson ? (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-slate-950/55 p-4" onClick={() => !selfStudyAccessSaving && setSelfStudyAccessLesson(null)}>
+          <div className="w-full max-w-xl overflow-hidden rounded-3xl bg-white shadow-2xl" onClick={(event) => event.stopPropagation()}>
+            <div className="flex items-start justify-between bg-gradient-to-r from-indigo-600 to-violet-600 px-6 py-5 text-white">
+              <div><p className="text-xs font-black uppercase tracking-[0.18em] text-indigo-100">Quản lý tự học theo lớp</p><h3 className="mt-1 text-xl font-black">{selfStudyAccessLesson.tieu_de}</h3><p className="mt-1 text-sm text-indigo-100">Chọn một hoặc nhiều lớp được phép tự mở toàn bộ hoạt động.</p></div>
+              <button type="button" disabled={selfStudyAccessSaving} onClick={() => setSelfStudyAccessLesson(null)} className="rounded-xl bg-white/15 p-2 hover:bg-white/25 disabled:opacity-50"><XCircle className="h-5 w-5" /></button>
+            </div>
+            <div className="p-6">
+              {(() => {
+                const options = selfStudyClassOptionsForLesson(selfStudyAccessLesson);
+                const allSelected = options.length > 0 && options.every((item) => selfStudySelectedClassIds.includes(item.lop_id));
+                return <>
+                  <div className="mb-4 flex flex-wrap gap-2">
+                    <button type="button" onClick={() => setSelfStudySelectedClassIds(options.map((item) => item.lop_id))} className="rounded-xl bg-emerald-50 px-3 py-2 text-xs font-bold text-emerald-700 hover:bg-emerald-100"><Unlock className="mr-1 inline h-3.5 w-3.5" />Mở tất cả lớp</button>
+                    <button type="button" onClick={() => setSelfStudySelectedClassIds([])} className="rounded-xl bg-amber-50 px-3 py-2 text-xs font-bold text-amber-700 hover:bg-amber-100"><Lock className="mr-1 inline h-3.5 w-3.5" />Khóa tất cả lớp</button>
+                    <span className="ml-auto rounded-full bg-slate-100 px-3 py-2 text-xs font-bold text-slate-600">{selfStudySelectedClassIds.length}/{options.length} lớp đang mở</span>
+                  </div>
+                  <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
+                    {options.map((item) => {
+                      const checked = selfStudySelectedClassIds.includes(item.lop_id);
+                      return <label key={item.lop_id} className={`flex cursor-pointer items-center gap-3 rounded-2xl border p-3 ${checked ? 'border-emerald-200 bg-emerald-50' : 'border-slate-200 bg-white'}`}>
+                        <input type="checkbox" checked={checked} onChange={() => setSelfStudySelectedClassIds((current) => checked ? current.filter((id) => id !== item.lop_id) : [...current, item.lop_id])} className="h-4 w-4" />
+                        <div className="min-w-0 flex-1"><p className="font-bold text-slate-800">{item.ten_lop || item.lop_id}</p><p className="text-xs text-slate-500">{item.lop_id} • Khối {item.khoi}</p></div>
+                        <span className={`rounded-full px-2.5 py-1 text-[10px] font-black ${checked ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{checked ? 'TỰ HỌC' : 'GV ĐIỀU KHIỂN'}</span>
+                      </label>;
+                    })}
+                    {!options.length ? <div className="rounded-2xl bg-amber-50 p-4 text-sm text-amber-700">Chưa tìm thấy lớp phù hợp với khối của bài học.</div> : null}
+                  </div>
+                  <div className="mt-5 rounded-2xl bg-slate-50 p-4 text-xs leading-5 text-slate-600">Khóa tự học không phải khóa toàn bài. Lớp chưa được mở tự học vẫn có thể học theo các hoạt động giáo viên mở từng mục. {allSelected ? 'Hiện tất cả lớp đều được tự học.' : ''}</div>
+                </>;
+              })()}
+            </div>
+            <div className="flex justify-end gap-2 border-t border-slate-100 px-6 py-4">
+              <button type="button" disabled={selfStudyAccessSaving} onClick={() => setSelfStudyAccessLesson(null)} className="rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-bold text-slate-600">Hủy</button>
+              <button type="button" disabled={selfStudyAccessSaving} onClick={() => void saveSelfStudyAccess()} className="rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-bold text-white shadow-lg shadow-indigo-200 disabled:opacity-60">{selfStudyAccessSaving ? 'Đang lưu...' : 'Lưu phạm vi tự học'}</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       <PreLessonVideoModal
         isOpen={isPreLessonVideoOpen}
         lesson={preLessonVideoLesson}
@@ -5693,6 +6300,29 @@ useEffect(() => {
         onSubmit={handleSubmitReviewPractice}
       />}
 
+      {isInteractivePracticeViewerOpen && selectedInteractivePractice && selectedInteractiveManifest && user && <InteractivePracticeViewer
+        isOpen={isInteractivePracticeViewerOpen}
+        review={selectedInteractivePractice}
+        manifest={selectedInteractiveManifest}
+        currentUser={user}
+        coLearningSession={activePracticeCoLearningSession}
+        allowRetry={selectedInteractiveAllowRetry}
+        config={selectedInteractiveConfig}
+        initialAttemptCount={selectedInteractiveAttemptCount}
+        previewOnly={user.vai_tro !== 'student'}
+        onClose={() => {
+          setIsInteractivePracticeViewerOpen(false);
+          setSelectedInteractivePractice(null);
+          setSelectedInteractiveManifest(null);
+          setSelectedInteractiveConfig(undefined);
+          setSelectedInteractiveAttemptCount(0);
+          setActivePracticeCoLearningSession(null);
+          setPendingInteractivePractice(null);
+          setCoLearningPurpose('lesson');
+        }}
+        onSubmit={handleSubmitInteractivePractice}
+      />}
+
       {isReviewResultsOpen && <ReviewPracticeResultsModal
         isOpen={isReviewResultsOpen}
         review={reviewResultsPractice}
@@ -5703,6 +6333,30 @@ useEffect(() => {
         onClose={() => setIsReviewResultsOpen(false)}
         onRefresh={() => reviewResultsPractice ? void loadReviewPracticeResults(reviewResultsPractice) : undefined}
       />}
+
+      {user.vai_tro !== 'student' && isInteractivePracticeImportOpen && (
+      <InteractivePracticeImportModal
+        isOpen={isInteractivePracticeImportOpen}
+        lessons={lessonSourcePool}
+        subjects={subjects}
+        classes={classes}
+        isSubmitting={isSubmitting}
+        onClose={() => setIsInteractivePracticeImportOpen(false)}
+        onSubmit={handleCreateInteractivePractice}
+      />
+      )}
+
+      {user.vai_tro !== 'student' && isPracticeSettingsOpen && (
+      <PracticeSettingsModal
+        isOpen={isPracticeSettingsOpen}
+        review={practiceSettingsReview}
+        config={practiceSettingsConfig}
+        classes={classes}
+        isSubmitting={isSubmitting}
+        onClose={() => { setIsPracticeSettingsOpen(false); setPracticeSettingsReview(null); setPracticeSettingsConfig(undefined); }}
+        onSave={handleSavePracticeSettings}
+      />
+      )}
 
       {user.vai_tro !== 'student' && isReviewModalOpen && (
       <ReviewPracticeModal
@@ -5810,6 +6464,61 @@ useEffect(() => {
         onConfirm={handleImportConfirm}
       />}
 
+      <AnimatePresence>
+        {lessonPurgeProgress ? (
+          <div className="fixed inset-0 z-[12600] flex items-center justify-center p-4">
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 bg-slate-950/60 backdrop-blur-sm" />
+            <motion.div initial={{ opacity: 0, scale: 0.96, y: 16 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.96, y: 10 }} className="relative z-10 w-full max-w-xl overflow-hidden rounded-[30px] bg-white shadow-2xl">
+              <div className="bg-gradient-to-r from-rose-600 to-red-500 px-6 py-5 text-white">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-xs font-black uppercase tracking-[0.18em] text-white/80">Xóa vĩnh viễn bài học</p>
+                    <h3 className="mt-2 text-xl font-black">{lessonPurgeProgress.lessonTitle}</h3>
+                    <p className="mt-1 text-sm text-white/85">{lessonPurgeProgress.mode === 'preserve_grades' ? 'Giữ snapshot điểm chính thức' : 'Xóa toàn bộ dữ liệu học sinh'}</p>
+                  </div>
+                  {lessonPurgeProgress.status !== 'running' ? (
+                    <button type="button" onClick={() => setLessonPurgeProgress(null)} className="rounded-full bg-white/15 p-2 hover:bg-white/25" aria-label="Đóng"><XCircle className="h-5 w-5" /></button>
+                  ) : null}
+                </div>
+              </div>
+              <div className="space-y-5 p-6">
+                <div className="grid gap-3 sm:grid-cols-3">
+                  <div className="rounded-2xl bg-slate-50 p-4"><p className="text-xs font-bold uppercase tracking-wide text-slate-400">Tiến độ</p><p className="mt-1 text-2xl font-black text-slate-900">{lessonPurgeProgress.status === 'completed' ? 100 : Math.min(99, Math.round((lessonPurgeProgress.processed / Math.max(1, lessonPurgeProgress.total)) * 100))}%</p></div>
+                  <div className="rounded-2xl bg-slate-50 p-4"><p className="text-xs font-bold uppercase tracking-wide text-slate-400">Đã xử lý</p><p className="mt-1 text-2xl font-black text-slate-900">{lessonPurgeProgress.processed}<span className="text-sm text-slate-400">/{lessonPurgeProgress.total || '?'}</span></p></div>
+                  <div className="rounded-2xl bg-slate-50 p-4"><p className="text-xs font-bold uppercase tracking-wide text-slate-400">Điểm lưu</p><p className="mt-1 text-2xl font-black text-slate-900">{lessonPurgeProgress.archivedGrades}</p></div>
+                </div>
+                <div>
+                  <div className="h-3 overflow-hidden rounded-full bg-slate-100">
+                    <div className="h-full rounded-full bg-gradient-to-r from-rose-500 to-orange-500 transition-all duration-300" style={{ width: `${lessonPurgeProgress.status === 'completed' ? 100 : Math.min(99, Math.max(3, Math.round((lessonPurgeProgress.processed / Math.max(1, lessonPurgeProgress.total)) * 100)))}%` }} />
+                  </div>
+                  <p className="mt-3 text-sm font-bold text-slate-700">{lessonPurgeProgress.status === 'completed' ? 'Đã hoàn tất xóa vĩnh viễn.' : `Đang xử lý: ${lessonPurgePhaseLabel(lessonPurgeProgress.phase)}`}</p>
+                  <p className="mt-1 text-xs leading-5 text-slate-500">Tiến trình được lưu sau từng batch. Có thể tiếp tục nếu mạng hoặc quota Firestore gián đoạn.</p>
+                </div>
+                {lessonPurgeProgress.status === 'retryable' ? (
+                  <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+                    <b>Tiến trình đang tạm dừng.</b> {lessonPurgeProgress.error || 'Hãy thử lại khi kết nối/quota ổn định.'}
+                  </div>
+                ) : null}
+              </div>
+              <div className="flex justify-end gap-3 border-t border-slate-100 px-6 py-4">
+                {lessonPurgeProgress.status === 'retryable' ? (
+                  <>
+                    <button type="button" onClick={() => setLessonPurgeProgress(null)} className="rounded-2xl border border-slate-200 px-4 py-2.5 text-sm font-bold text-slate-600 hover:bg-slate-50">Đóng</button>
+                    <button type="button" disabled={Boolean(lessonDeletingId)} onClick={() => void resumeLessonPermanentPurge()} className="inline-flex items-center gap-2 rounded-2xl bg-rose-600 px-4 py-2.5 text-sm font-black text-white hover:bg-rose-700 disabled:opacity-60">
+                      {lessonDeletingId ? <RefreshCw className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Tiếp tục xóa
+                    </button>
+                  </>
+                ) : lessonPurgeProgress.status === 'completed' ? (
+                  <button type="button" onClick={() => setLessonPurgeProgress(null)} className="rounded-2xl bg-emerald-600 px-4 py-2.5 text-sm font-black text-white hover:bg-emerald-700">Hoàn tất</button>
+                ) : (
+                  <span className="inline-flex items-center gap-2 text-sm font-bold text-slate-500"><RefreshCw className="h-4 w-4 animate-spin" /> Đang xóa an toàn theo từng batch…</span>
+                )}
+              </div>
+            </motion.div>
+          </div>
+        ) : null}
+      </AnimatePresence>
+
       <ConfirmDialog
         isOpen={confirmDialog.isOpen}
         title={confirmDialog.title}
@@ -5832,7 +6541,7 @@ useEffect(() => {
             <motion.div initial={{ opacity: 0, scale: 0.96, y: 12 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.96, y: 8 }} className="relative z-10 w-full max-w-xl rounded-[28px] bg-white p-6 shadow-2xl">
               <div className="flex items-start justify-between gap-4"><div><p className="text-xs font-black uppercase tracking-[0.16em] text-violet-600">Bài đã hoàn thành</p><h3 className="mt-2 text-xl font-black text-slate-900">{retakeChoiceLesson.tieu_de}</h3></div><button type="button" onClick={() => setRetakeChoiceLesson(null)} className="rounded-xl bg-slate-100 p-2 text-slate-500 hover:bg-slate-200"><XCircle className="h-5 w-5" /></button></div>
               {Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.official_retake_remaining || 0) > 0 ? (
-                <div className="mt-5 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm leading-6 text-emerald-900"><b>Giáo viên đã cấp 1 lượt học lại cập nhật điểm.</b> Điểm của lần nộp mới sẽ thay thế điểm chính thức hiện tại{Number.isFinite(Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.assessment_score)) ? ` ${Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.assessment_score).toFixed(1)}/10` : ''}. Điểm cũ vẫn được lưu trong lịch sử.</div>
+                <div className="mt-5 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm leading-6 text-emerald-900"><b>Giáo viên đã cấp 1 lượt học lại cập nhật điểm.</b> Điểm cũ đã được chuyển vào lịch sử và tạm ẩn khỏi bảng điểm. Khi em nộp lượt mới, điểm mới sẽ trở thành điểm chính thức.</div>
               ) : (
                 <div className="mt-5 rounded-2xl border border-violet-100 bg-violet-50 p-4 text-sm leading-6 text-violet-900"><b>Học lại để luyện tập.</b> Điểm học lại được lưu riêng và không thay thế điểm chính thức{Number.isFinite(Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.assessment_score)) ? ` ${Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.assessment_score).toFixed(1)}/10` : ''}.</div>
               )}
@@ -5854,7 +6563,6 @@ useEffect(() => {
         user={user}
         onSave={handleSaveAIConfig}
         onDelete={handleDeleteAIConfig}
-        setLoading={setIsLoading}
         showToast={showToast}
         openReason={aiConfigOpenReason}
       />}

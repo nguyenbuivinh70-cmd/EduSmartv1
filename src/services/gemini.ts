@@ -12,7 +12,7 @@ import {
   QuizQuestionType,
   UploadedSourceFile,
 } from '../types';
-import { sanitizeSingleChoiceQuestion } from '../utils/quizSanitizer';
+import { isQuizQuestionQualityAcceptable, sanitizeQuizQuestion } from '../utils/quizSanitizer';
 
 function cleanTextValue(value: unknown): string {
   return String(value ?? '')
@@ -42,7 +42,6 @@ function normalizeQuestionType(value: unknown): QuizQuestionType {
   return 'single_choice';
 }
 
-const DEFAULT_FILL_DISTRACTORS = ['dữ liệu', 'thông tin', 'vật mang tin', 'xử lí thông tin', 'máy tính', 'bộ xử lí', 'Internet', 'phần mềm'];
 
 function uniqueByText(items: string[]) {
   const seen = new Set<string>();
@@ -83,10 +82,10 @@ function ensureFillSentence(question: string, answer: string) {
 
 function ensureFourFillChoices(correctAnswers: string[], rawChoices: string[]) {
   const correct = uniqueByText(correctAnswers).slice(0, 1);
-  const base = uniqueByText([...correct, ...rawChoices, ...DEFAULT_FILL_DISTRACTORS]);
-  const result = base.slice(0, 4);
-  while (result.length < 4) result.push(`Lựa chọn ${result.length + 1}`);
-  return result;
+  // V6.84.5: không tự bịa phương án nhiễu chung chung. Nếu AI không tạo đủ
+  // 4 lựa chọn chất lượng, Question Quality Gate sẽ loại câu và yêu cầu lần tạo
+  // sau tuân thủ prompt thay vì đưa câu hỏi kém chất lượng cho học sinh.
+  return uniqueByText([...correct, ...rawChoices]).slice(0, 4);
 }
 
 function normalizeLevel(value: unknown) {
@@ -169,7 +168,7 @@ function safeQuizArray(value: unknown) {
       const correctAnswer = cleanTextValue(raw?.correctAnswer ?? raw?.dap_an ?? '');
       const question = cleanTextValue(raw?.question ?? raw?.cau_hoi ?? '');
       if (!question || options.length < 2 || !correctAnswer) return null;
-      const result = sanitizeSingleChoiceQuestion({
+      const result = sanitizeQuizQuestion({
         id: String(raw?.id || `SC${index + 1}`),
         type: 'single_choice',
         question,
@@ -188,7 +187,9 @@ function safeQuizArray(value: unknown) {
       // không đủ chất lượng để đưa vào bài kiểm tra.
       return (result.options?.length || 0) >= 2 && result.correctAnswer ? result : null;
     })
-    .filter(Boolean) as LessonContent['luyen_tap']['trac_nghiem'];
+    .filter(Boolean)
+    .map((question) => sanitizeQuizQuestion(question as QuizQuestion))
+    .filter((question) => isQuizQuestionQualityAcceptable(question)) as LessonContent['luyen_tap']['trac_nghiem'];
 }
 
 export function getVietnameseLevelLabel(level?: string) {
@@ -932,6 +933,12 @@ Cấu hình bài học:
 - Đảo câu hỏi kiểm tra cuối bài: ${config.shuffle_final_questions !== false ? 'có' : 'không'}
 - Đảo đáp án kiểm tra cuối bài: ${config.shuffle_final_options !== false ? 'có' : 'không'}
 - Với câu trắc nghiệm: options chỉ chứa NỘI DUNG đáp án, tuyệt đối không thêm tiền tố A./B./C./D.; các options không được trùng nhau; correctAnswer phải là nguyên văn nội dung đáp án đúng, không chỉ là chữ cái.
+- CHUẨN CHẤT LƯỢNG CÂU HỎI: câu hỏi phải đủ chủ ngữ/ngữ cảnh, không cụt ý, không mơ hồ, không có lỗi chính tả; chỉ có đúng 1 đáp án đúng rõ ràng.
+- Phương án nhiễu phải cùng kiểu nội dung với đáp án đúng, hợp lý nhưng sai về kiến thức; không dùng phương án vô nghĩa, quá dễ loại hoặc chỉ khác đáp án đúng bởi một từ phủ định gây mơ hồ.
+- correctAnswer BẮT BUỘC trùng chính xác từng ký tự với đúng một phần tử trong options sau khi tạo JSON. Trước khi trả JSON phải tự đối chiếu lại question → options → correctAnswer → explanation.
+- Với fill_in_blank: câu phải có đúng 1 _____; choices có đúng 4 từ/cụm từ khác nhau, cùng loại ngữ nghĩa; correctAnswers có đúng 1 phần tử và phần tử đó BẮT BUỘC trùng chính xác với đúng một choice. Không dùng cụm từ bị cắt, sai chính tả hoặc không hoàn chỉnh.
+- explanation phải giải thích trực tiếp vì sao đáp án đúng phù hợp với kiến thức nguồn; không được giải thích mâu thuẫn với correctAnswer/correctAnswers.
+- Phân bố mức độ hợp lý: khoảng 30% nhận biết, 40% thông hiểu, 30% vận dụng nếu học liệu cho phép; câu vận dụng phải có tình huống cụ thể, không chỉ đổi nhãn level.
 - Cho xem đáp án sau khi nộp: ${config.show_final_answers_after_submit !== false ? 'có' : 'không'}
 - Cho phép làm lại kiểm tra: ${config.allow_exam_retry !== false ? 'có' : 'không'}
 - Số lần làm lại tối đa: ${config.max_exam_attempts || 2}
@@ -944,10 +951,10 @@ Yêu cầu nội dung:
 3. Mỗi page có page_id, title, subtitle, layout, blocks, teacher_notes, student_prompt và visual. visual gồm type, title, items, center_label, relationship. visual_hint/illustration_keywords chỉ dùng làm tương thích, không dùng để lặp lại tiêu đề hoặc hiển thị như chip cho học sinh.
 4. page.blocks chia nội dung thành các khối ngắn. Mỗi khối có type, title, category, theme, text; title phải bám sát nội dung.
 5. activity.interactions gồm câu hỏi/nhiệm vụ tương tác sau phần trình bày và chỉ có 3 dạng: single_choice, true_false, fill_in_blank. Với fill_in_blank phải có sentence chứa đúng một _____, choices đúng 4 từ/cụm từ, correctAnswers đúng 1 từ/cụm từ đúng và explanation.
-5. final_quiz gồm câu hỏi cuối bài khách quan dạng single_choice và true_false, có explanation; không dùng short_answer. Các đáp án phải có option rõ, đáp án đúng phải không phụ thuộc thứ tự hiển thị để hệ thống có thể đảo đáp án.
-6. settings phải lưu đầy đủ cấu hình thời gian học, thời gian kiểm tra, đảo câu hỏi, đảo đáp án, xem đáp án sau khi nộp, làm lại kiểm tra.
-7. assessment quy định thang điểm 10.
-7. Nếu học liệu có nội dung vận dụng, đưa vào phần section hoặc final_quiz theo hướng đánh giá năng lực.
+6. final_quiz gồm câu hỏi cuối bài khách quan thuộc 3 dạng single_choice, true_false, fill_in_blank; không dùng short_answer/tự luận. Với single_choice phải có đúng 4 options và correctAnswer trùng nguyên văn đúng một option. Với fill_in_blank phải có đúng một _____, đúng 4 choices và correctAnswers gồm đúng một choice. Mọi câu đều có explanation ngắn, chính xác và đáp án đúng không phụ thuộc thứ tự hiển thị để hệ thống có thể đảo đáp án.
+7. settings phải lưu đầy đủ cấu hình thời gian học, thời gian kiểm tra, đảo câu hỏi, đảo đáp án, xem đáp án sau khi nộp, làm lại kiểm tra.
+8. assessment quy định thang điểm 10.
+9. Nếu học liệu có nội dung vận dụng, đưa vào phần section hoặc final_quiz theo hướng đánh giá năng lực.
 
 JSON bắt buộc:
 {
@@ -1042,7 +1049,7 @@ export async function reviseLessonWithAI(
     model,
     contents: [{
       role: 'user',
-      parts: [{ text: `Bạn là chuyên gia thiết kế bài học trực tuyến. Hãy chỉnh sửa JSON bài học theo yêu cầu của giáo viên, giữ nguyên schema_version lesson_v3, bảo toàn cấu trúc activities, pages, interactions, final_quiz, assessment. Không tạo tiêu đề dạng "Nội dung 1" dư thừa, không trả HTML thô như <br>, ưu tiên giữ ghi nhớ và câu hỏi lấy từ học liệu gốc; không ép câu hỏi mở thành đúng/sai; nếu cần câu hỏi mở, hãy chuyển thành fill_in_blank với 1 chỗ trống và 4 từ/cụm từ lựa chọn. Với content_blocks, đặt title ngắn gọn theo đúng ý chính, gán category/theme để giao diện hiển thị màu nền nhẹ phù hợp.\n\nYêu cầu chỉnh sửa: ${request}\n\nCấu hình hiện tại: ${JSON.stringify(settings || lesson.settings || {})}\n\nJSON bài học hiện tại:\n${JSON.stringify(lesson).slice(0, 60000)}\n\nChỉ trả về JSON bài học đã chỉnh sửa, không giải thích thêm.` }],
+      parts: [{ text: `Bạn là chuyên gia thiết kế bài học trực tuyến. Hãy chỉnh sửa JSON bài học theo yêu cầu của giáo viên, giữ nguyên schema_version lesson_v3, bảo toàn cấu trúc activities, pages, interactions, final_quiz, assessment. Không tạo tiêu đề dạng "Nội dung 1" dư thừa, không trả HTML thô như <br>, ưu tiên giữ ghi nhớ và câu hỏi lấy từ học liệu gốc; không ép câu hỏi mở thành đúng/sai; nếu cần câu hỏi mở, hãy chuyển thành fill_in_blank với 1 chỗ trống và 4 từ/cụm từ lựa chọn. Với content_blocks, đặt title ngắn gọn theo đúng ý chính, gán category/theme để giao diện hiển thị màu nền nhẹ phù hợp. Mọi single_choice phải có correctAnswer trùng nguyên văn đúng một option; mọi fill_in_blank phải có đúng 4 choices và correctAnswers trùng nguyên văn đúng một choice. Loại bỏ câu hỏi mơ hồ, cụt ý, sai chính tả hoặc có hơn một đáp án hợp lý; explanation phải thống nhất với đáp án đúng.\n\nYêu cầu chỉnh sửa: ${request}\n\nCấu hình hiện tại: ${JSON.stringify(settings || lesson.settings || {})}\n\nJSON bài học hiện tại:\n${JSON.stringify(lesson).slice(0, 60000)}\n\nChỉ trả về JSON bài học đã chỉnh sửa, không giải thích thêm.` }],
     }],
     config: {
       systemInstruction: 'Luôn trả về JSON hợp lệ theo schema lesson_v3. Không trả về markdown.',
