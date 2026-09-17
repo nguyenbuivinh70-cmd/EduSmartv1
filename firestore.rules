@@ -456,14 +456,24 @@ service cloud.firestore {
         && preLessonEnabledForMember(schoolId, lesson);
     }
 
+    // V6.88.5: đối chiếu cả classId canonical và lop_id legacy. Một số hồ sơ
+    // học sinh đã migrate có đủ hai field nhưng dữ liệu cũ/hiện tại không hoàn toàn
+    // đồng nhất; chỉ dùng một field có thể làm client xác định đúng lớp nhưng Rules
+    // lại từ chối toàn bộ /activities/{id}.
+    function memberMatchesAnyClass(schoolId, classIds) {
+      let profile = memberData(schoolId);
+      let canonical = profile.get('classId', '');
+      let legacy = profile.get('lop_id', '');
+      return classIds is list
+        && ((canonical is string && canonical != '' && classIds.hasAny([canonical]))
+          || (legacy is string && legacy != '' && classIds.hasAny([legacy])));
+    }
+
     function lessonSelfStudyEnabled(schoolId, lessonData) {
       let scope = lessonData.get('self_study_scope', lessonData.get('access_mode', 'teacher_controlled') == 'self_study' ? 'all' : 'none');
-      let classId = memberClassValue(schoolId);
+      let classIds = lessonData.get('self_study_class_ids', []);
       return scope == 'all'
-        || (scope == 'classes'
-          && classId is string && classId != ''
-          && lessonData.get('self_study_class_ids', []) is list
-          && lessonData.get('self_study_class_ids', []).hasAny([classId]));
+        || (scope == 'classes' && memberMatchesAnyClass(schoolId, classIds));
     }
 
     function completedOfficialAccess(schoolId, lessonId) {
@@ -482,7 +492,8 @@ service cloud.firestore {
       return isActiveMember(schoolId)
         && role == 'student'
         && canReadLessonContent(schoolId, lessonData)
-        && (completedOfficialAccess(schoolId, lessonId)
+        && (lessonSelfStudyEnabled(schoolId, lessonData)
+          || completedOfficialAccess(schoolId, lessonId)
           || (classId is string && classId != ''
             && exists(teachingSessionPath(schoolId, lessonId, classId))
             && get(teachingSessionPath(schoolId, lessonId, classId)).data.schoolId == schoolId
@@ -1401,7 +1412,7 @@ service cloud.firestore {
         allow delete: if isAdmin(schoolId);
       }
 
-      // V6.88.4: capability probe ổn định theo nghiệp vụ, không khóa frontend
+      // V6.88.5: capability probe ổn định theo nghiệp vụ; bổ sung xác minh tự học theo lớp
       // vào một chuỗi số phiên bản Rules. Payload mới còn kiểm tra đúng khối mà
       // giáo viên đang quản lý. Nhánh legacy 6.88.3 được giữ để rollout an toàn.
       match /rulesProbes/{probeId} {
@@ -1413,10 +1424,12 @@ service cloud.firestore {
           && request.resource.data.keys().hasAll(['schoolId', 'ownerUid', 'purpose'])
           && request.resource.data.schoolId == schoolId
           && request.resource.data.ownerUid == request.auth.uid
-          && ((request.resource.data.get('capability', '') == 'lesson_publish_v2'
-                && request.resource.data.get('purpose', '') == 'lesson-publish-capability'
+          && (((request.resource.data.get('capability', '') == 'lesson_publish_v2'
+                  && request.resource.data.get('purpose', '') == 'lesson-publish-capability')
+                || (request.resource.data.get('capability', '') == 'class_scoped_self_study_v1'
+                  && request.resource.data.get('purpose', '') == 'class-scoped-self-study-capability'))
                 && request.resource.data.get('schemaVersion', 0) == 1
-                && canManageGradeData(schoolId, request.resource.data))
+                && canManageGradeData(schoolId, request.resource.data)
               || (request.resource.data.get('rulesVersion', '') == '6.88.3'
                 && request.resource.data.get('purpose', '') == 'lesson-publish-probe'));
         allow delete: if isAdmin(schoolId) || (canManageLearningContent(schoolId)
@@ -1424,6 +1437,8 @@ service cloud.firestore {
           && resource.data.ownerUid == request.auth.uid
           && ((resource.data.get('capability', '') == 'lesson_publish_v2'
                 && resource.data.get('purpose', '') == 'lesson-publish-capability')
+              || (resource.data.get('capability', '') == 'class_scoped_self_study_v1'
+                && resource.data.get('purpose', '') == 'class-scoped-self-study-capability')
               || resource.data.get('rulesVersion', '') == '6.88.3'));
       }
 
@@ -1522,6 +1537,9 @@ service cloud.firestore {
 
         match /activities/{activityId} {
 
+          // V6.88.5: học sinh đọc từng activity bằng get (không list).
+          // Nhánh tự học được đặt riêng trước nhánh teachingSession để quyền theo lớp
+          // được chứng minh trực tiếp, không phụ thuộc dữ liệu phiên dạy học cũ.
           allow get: if isAdmin(schoolId)
             || (canManageLearningContent(schoolId)
               && canReadLessonData(schoolId, get(/databases/$(database)/documents/schools/$(schoolId)/lessons/$(lessonId)).data)

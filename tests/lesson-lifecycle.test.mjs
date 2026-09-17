@@ -58,7 +58,7 @@ before(async () => {
   service = await import('../src/services/firebaseOperational.ts');
   await login('teacher');
   // Fault injection at the application's SDK transport boundary. Successful
-  // requests use the real local emulator and the exact V6.88.4 Rules bundled with this source.
+  // requests use the real local emulator and the exact V6.88.5 Rules bundled with this source.
   // Internal transport access is confined to this test; no production hooks.
   await getDocFromServer(doc(db, base, 'members', accounts.teacher.uid));
   const connection = db._firestoreClient._onlineComponents.datastore.connection;
@@ -72,7 +72,7 @@ before(async () => {
       const isContent = writes.some((write) => write.update?.name?.endsWith('/content/main'));
       const isReserve = !isContent && writes.some((write) => write.update?.name?.includes('/lessonNumberRegistry/'));
       if (probeDelete) {
-        // V6.88.4: deliberately fail probe cleanup. A successful probe write is
+        // V6.88.5: deliberately fail probe cleanup. A successful probe write is
         // sufficient and cleanup must never block publishing.
         state.probeDeleteAttempts++;
         throw new FirestoreError('resource-exhausted', 'Local test: probe cleanup blocked');
@@ -171,6 +171,57 @@ test('student, wrong-grade teacher and another teacher cannot perform unauthoriz
   await login('otherTeacher');
   await assert.rejects(service.deleteFirebaseLesson(created.lesson_id));
   await assert.rejects(service.saveFirebaseLesson(payload(108, { khoi: '9' })));
+  await login('teacher');
+});
+
+
+test('class-scoped self-study lets the selected student GET activities and blocks an unselected class', async () => {
+  const lessonId = 'self-study-class-scope';
+  await seed(`${base}/lessons/${lessonId}`, {
+    lesson_id: lessonId,
+    schoolId: 'hthtv1',
+    schemaVersion: 2,
+    createdByUid: accounts.teacher.uid,
+    nguoi_tao_id: 'TEST_teacher',
+    tieu_de: 'Bài tự học theo lớp',
+    mon_id: 'TIN',
+    khoi: '6',
+    lop_id: '',
+    pham_vi: 'shared',
+    trang_thai: 'approved_shared',
+    content_status: 'ready',
+    is_locked: false,
+    access_mode: 'teacher_controlled',
+    self_study_scope: 'classes',
+    self_study_class_ids: ['6A'],
+    updated_at: new Date().toISOString(),
+  });
+  await seed(`${base}/lessons/${lessonId}/content/main`, {
+    schoolId: 'hthtv1', lessonId, schemaVersion: 2, ownerUid: accounts.teacher.uid, createdByUid: accounts.teacher.uid, khoi: '6',
+    lesson_json: { schema_version: 'lesson_v3', title: 'Tự học', activities: [{ activity_id: 'A1', title: 'Hoạt động 1' }] },
+  });
+  await seed(`${base}/lessons/${lessonId}/activities/A1`, {
+    schoolId: 'hthtv1', lessonId, schemaVersion: 3, ownerUid: accounts.teacher.uid, createdByUid: accounts.teacher.uid,
+    khoi: '6', activity_id: 'A1', title: 'Hoạt động 1', pages: [{ page_id: 'P1', title: 'Trang 1', content: 'Nội dung tự học' }], interactions: [],
+  });
+
+  await login('student');
+  const opened = await service.getFirebaseLesson(lessonId);
+  assert.equal(opened.content.activities[0].locked, false);
+  assert.equal(opened.content.activities[0].pages[0].content, 'Nội dung tự học');
+
+  await seed(`${base}/members/${accounts.student.uid}`, {
+    authUid: accounts.student.uid, userId: 'TEST_student', username: 'student', displayName: 'student', email: accounts.student.email,
+    role: 'student', status: 'active', schoolId: 'hthtv1', adminPermission: false, grade: '6', gradeScopes: ['6'], allGrades: false, classId: '6B',
+  });
+  service.clearFirebaseIdentityCache();
+  await assert.rejects(getDocFromServer(doc(db, base, 'lessons', lessonId, 'activities', 'A1')), (error) => firebaseErrorCode(error) === 'permission-denied');
+
+  await seed(`${base}/members/${accounts.student.uid}`, {
+    authUid: accounts.student.uid, userId: 'TEST_student', username: 'student', displayName: 'student', email: accounts.student.email,
+    role: 'student', status: 'active', schoolId: 'hthtv1', adminPermission: false, grade: '6', gradeScopes: ['6'], allGrades: false, classId: '6A',
+  });
+  service.clearFirebaseIdentityCache();
   await login('teacher');
 });
 

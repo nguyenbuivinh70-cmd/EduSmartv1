@@ -58,8 +58,10 @@ let identityPromise: { uid: string; value: Promise<any> } | null = null;
 let bootstrapCache: { uid: string; expiresAt: number; value: Record<string, any[]> } | null = null;
 let bootstrapPromise: { uid: string; value: Promise<Record<string, any[]>> } | null = null;
 let lessonPublishRulesVerifiedKey = '';
+let selfStudyRulesVerifiedKey = '';
 const LESSON_PUBLISH_CAPABILITY = 'lesson_publish_v2';
-const LESSON_PUBLISH_RULES_LABEL = 'V6.88.4';
+const LESSON_PUBLISH_RULES_LABEL = 'V6.88.5';
+const CLASS_SCOPED_SELF_STUDY_CAPABILITY = 'class_scoped_self_study_v1';
 
 function clean(value: unknown) { return value == null ? '' : String(value).trim(); }
 function sameGrade(left: unknown, right: unknown) { return clean(left).replace(/\.0+$/, '') === clean(right).replace(/\.0+$/, ''); }
@@ -349,6 +351,7 @@ export function clearFirebaseIdentityCache() {
   bootstrapCache = null;
   bootstrapPromise = null;
   lessonPublishRulesVerifiedKey = '';
+  selfStudyRulesVerifiedKey = '';
 }
 
 async function migrateLegacyLessonDocuments(items: Array<{ id: string; data: () => DocumentData }>) {
@@ -448,7 +451,7 @@ function selfStudyEnabledForClass(data: any, classId: unknown) {
   if (scope === 'all') return true;
   if (scope !== 'classes') return false;
   const normalizedClass = clean(classId);
-  return Boolean(normalizedClass && cleanStringList(data?.self_study_class_ids).includes(normalizedClass));
+  return Boolean(normalizedClass && cleanStringList(data?.self_study_class_ids).some((item) => sameClassId(item, normalizedClass)));
 }
 
 function rowForViewer(data: any, id: string, me: any): LessonRow {
@@ -589,7 +592,12 @@ export async function getFirebaseLesson(lessonId: string): Promise<LessonContent
           }
         }));
         if (selfStudy && selfStudyLoadErrors.length) {
-          throw new Error(`Không tải được đầy đủ nội dung tự học (${selfStudyLoadErrors.join(', ')}). Hãy xác minh Firestore Rules hiện hành rồi đăng xuất/đăng nhập lại và mở bài học.`);
+          const denied = selfStudyLoadErrors.filter((item) => item.includes('permission-denied'));
+          if (denied.length === selfStudyLoadErrors.length) {
+            const scope = resolveSelfStudyScope(data);
+            throw new Error(`Firestore đã cho phép học sinh thấy bài nhưng đang từ chối đọc các hoạt động tự học (${selfStudyLoadErrors.join(', ')}). Phạm vi tự học: ${scope}${scope === 'classes' ? `; lớp hiện tại: ${clean(me.classId) || '-'}` : ''}. Hãy deploy Firestore Rules ${LESSON_PUBLISH_RULES_LABEL}, chờ Rules cập nhật rồi đăng xuất/đăng nhập lại. [SELF_STUDY_ACTIVITY_READ_DENIED]`);
+          }
+          throw new Error(`Không tải được đầy đủ nội dung tự học (${selfStudyLoadErrors.join(', ')}). Hãy xác minh Firestore Rules hiện hành rồi mở lại bài học. [SELF_STUDY_ACTIVITY_LOAD_INCOMPLETE]`);
         }
         lessonJson = { ...lessonJson, activities: activityDocs, teaching_session: session };
       } else {
@@ -636,6 +644,45 @@ export async function setFirebaseLessonLock(lessonId: string, locked: boolean) {
   return row({ ...current, ...patch }, snap.id);
 }
 
+async function verifyClassScopedSelfStudyRulesCapability(uid: string, grade: unknown) {
+  const normalizedUid = clean(uid);
+  const normalizedGrade = clean(grade).replace(/\.0+$/, '');
+  if (!normalizedUid || !normalizedGrade) {
+    throw new Error('Không xác định được tài khoản/khối để kiểm tra quyền mở tự học theo lớp.');
+  }
+  const capabilityKey = `${normalizedUid}|${normalizedGrade}|${CLASS_SCOPED_SELF_STUDY_CAPABILITY}`;
+  if (selfStudyRulesVerifiedKey === capabilityKey) return;
+
+  const probeRef = doc(school(), 'rulesProbes', normalizedUid);
+  try {
+    await setDoc(probeRef, {
+      schoolId: FIREBASE_SCHOOL_ID,
+      ownerUid: normalizedUid,
+      capability: CLASS_SCOPED_SELF_STUDY_CAPABILITY,
+      purpose: 'class-scoped-self-study-capability',
+      schemaVersion: 1,
+      khoi: normalizedGrade,
+      updatedAt: serverTimestamp(),
+    }, { merge: false });
+    selfStudyRulesVerifiedKey = capabilityKey;
+  } catch (error) {
+    if (firebaseErrorCode(error).includes('permission-denied')) {
+      throw new Error(`Firestore Rules hiện hành chưa hỗ trợ tự học theo lớp an toàn. Hãy deploy Rules ${LESSON_PUBLISH_RULES_LABEL} rồi đăng xuất/đăng nhập lại. [SELF_STUDY_RULES_CAPABILITY_DENIED]`);
+    }
+    throw error;
+  }
+
+  try {
+    await deleteDoc(probeRef);
+  } catch (cleanupError) {
+    console.warn('[EduSmart][SelfStudy] Capability probe cleanup skipped', {
+      capability: CLASS_SCOPED_SELF_STUDY_CAPABILITY,
+      grade: normalizedGrade,
+      error: firebaseErrorMessage(cleanupError),
+    });
+  }
+}
+
 export async function setFirebaseLessonSelfStudyAccess(lessonId: string, scope: SelfStudyScope, classIds: string[] = []) {
   const me = await identity();
   const target = doc(lessons(), clean(lessonId));
@@ -650,6 +697,9 @@ export async function setFirebaseLessonSelfStudyAccess(lessonId: string, scope: 
   const normalizedScope: SelfStudyScope = scope === 'all' ? 'all' : scope === 'classes' ? 'classes' : 'none';
   const normalizedClassIds = Array.from(new Set((classIds || []).map(clean).filter(Boolean)));
   if (normalizedScope === 'classes' && !normalizedClassIds.length) throw new Error('Hãy chọn ít nhất một lớp để mở tự học.');
+  if (normalizedScope === 'classes') {
+    await verifyClassScopedSelfStudyRulesCapability(me.uid, current.khoi);
+  }
   const now = new Date().toISOString();
   const patch = withoutUndefined({
     self_study_scope: normalizedScope,
