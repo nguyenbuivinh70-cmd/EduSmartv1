@@ -1,4 +1,4 @@
-import { AI_MODELS, BACKEND_URL, DEFAULT_VIDEO_POPUP_CONFIG, VIDEO_CONFIG_STORAGE_KEY } from '../constants';
+import { AI_MODELS, BACKEND_URL, DEFAULT_VIDEO_POPUP_CONFIG, VIDEO_CONFIG_STORAGE_KEY, normalizeGeminiModelName } from '../constants';
 import { normalizeGradeScope } from '../utils/gradeScope';
 import { AIConfig, Account, ApiResponse, CatalogClass, CatalogResponse, CoLearningPartnerCredential, CoLearningSession, GoogleSlidesPromptDetailResponse, GoogleSlidesPromptRecord, GoogleSlidesPromptSaveResponse, LearningResultModerationPayload, LearningResultModerationSummary, LessonBuilderDefaultsResponse, LessonBuilderSettings, LessonComment, LessonComposerValues, LessonContentResponse, LessonProgressRecord, LessonRow, PendingShareItem, ReviewPracticeAttempt, ReviewPracticeContentResponse, ReviewPracticeResultStudent, ReviewPracticeResultsResponse, ReviewPracticeRow, SchoolYear, SchoolYearTransferPayload, SchoolYearTransferSummary, MoveStudentsPayload, MoveStudentsSummary, StudentLearningAnalyticsRow, Subject, SystemDiagnostics, SystemDiagnosticIssue, SystemDiagnosticSection, User, VideoPopupConfig, PreLessonProgress, PreLessonSubmission, TeachingSession, LessonRetakeAttempt, LessonAccessMode, SelfStudyScope } from '../types';
 import {
@@ -461,6 +461,8 @@ function normalizeLessonRow(raw: any): LessonRow {
       ? raw.self_study_scope
       : (raw?.access_mode === 'self_study' ? 'all' : 'none'),
     self_study_class_ids: Array.isArray(raw?.self_study_class_ids) ? raw.self_study_class_ids.map(toCleanString).filter(Boolean) : [],
+    self_study_class_access_keys: Array.isArray(raw?.self_study_class_access_keys) ? raw.self_study_class_access_keys.map(toCleanString).filter(Boolean) : [],
+    self_study_access_version: Number.isFinite(Number(raw?.self_study_access_version)) ? Number(raw.self_study_access_version) : undefined,
     allow_retake_after_completion: raw?.allow_retake_after_completion === true,
     locked_at: toCleanString(raw?.locked_at),
     locked_by_uid: toCleanString(raw?.locked_by_uid),
@@ -606,8 +608,12 @@ function normalizeLessonComment(raw: any): LessonComment {
     comment_id: toCleanString(raw?.comment_id),
     lesson_id: toCleanString(raw?.lesson_id),
     user_id: toCleanString(raw?.user_id),
-    ho_ten: toCleanString(raw?.ho_ten),
-    lop_id: normalizeClassId(raw?.lop_id),
+    ho_ten: toCleanString(raw?.ho_ten || raw?.student_name),
+    student_name: toCleanString(raw?.student_name || raw?.ho_ten),
+    student_code: toCleanString(raw?.student_code),
+    lop_id: normalizeClassId(raw?.lop_id || raw?.class_id),
+    class_id: normalizeClassId(raw?.class_id || raw?.lop_id),
+    lesson_title: toCleanString(raw?.lesson_title),
     parent_id: toCleanString(raw?.parent_id),
     noi_dung: toCleanString(raw?.noi_dung),
     loai: toCleanString(raw?.loai) || 'binh_luan',
@@ -726,6 +732,7 @@ function normalizeLessonProgressRecord(raw: any): LessonProgressRecord {
   const updatedAtIso = toIsoDateTime(raw?.updated_at);
   return {
     progress_id: toCleanString(raw?.progress_id),
+    ownerUid: toCleanString(raw?.ownerUid || raw?.firebase_uid || raw?.uid),
     user_id: toCleanString(raw?.user_id),
     lesson_id: toCleanString(raw?.lesson_id),
     lesson_title: toCleanString(raw?.lesson_title),
@@ -792,6 +799,20 @@ function normalizeLessonProgressRecord(raw: any): LessonProgressRecord {
       ? raw.co_learner_names.map(toCleanString).filter(Boolean)
       : [],
     nam_hoc: toCleanString(raw?.nam_hoc),
+    // V6.88.16: giữ nguyên snapshot chuẩn bị bài do listFirebaseProgress ghép từ
+    // preparationSubmissions. V6.88.15 đã vô tình bỏ các field này tại normalizer,
+    // khiến giáo viên luôn thấy 0% / Chưa gửi dù submission đã tồn tại.
+    pre_lesson_status: ['in_progress', 'completed'].includes(toCleanString(raw?.pre_lesson_status))
+      ? toCleanString(raw.pre_lesson_status) as any
+      : (raw?.pre_lesson_status ? 'not_started' : undefined),
+    pre_lesson_watch_percent: raw?.pre_lesson_watch_percent === undefined || raw?.pre_lesson_watch_percent === null ? undefined : Number(raw.pre_lesson_watch_percent),
+    pre_lesson_watched_seconds: raw?.pre_lesson_watched_seconds === undefined || raw?.pre_lesson_watched_seconds === null ? undefined : Number(raw.pre_lesson_watched_seconds),
+    pre_lesson_completed_at: toCleanString(raw?.pre_lesson_completed_at),
+    pre_lesson_completed_before_deadline: raw?.pre_lesson_completed_before_deadline === undefined ? undefined : raw.pre_lesson_completed_before_deadline === true,
+    pre_lesson_preparation_status: ['not_started', 'in_progress', 'prepared', 'late_completed'].includes(toCleanString(raw?.pre_lesson_preparation_status))
+      ? toCleanString(raw.pre_lesson_preparation_status) as any
+      : undefined,
+    pre_lesson_last_watched_at: toCleanString(raw?.pre_lesson_last_watched_at),
   };
 }
 
@@ -951,7 +972,7 @@ function jsonpRequest<T>(payload: Record<string, unknown>): Promise<ApiResponse<
       resolve({
         ok: false,
         message:
-          'Không thể tải Web App Apps Script. Hãy kiểm tra link /exec, quyền truy cập Web App và trạng thái deploy.',
+          'Dịch vụ xử lý tài khoản đang tạm thời chưa sẵn sàng. Vui lòng thử lại sau ít phút.',
       });
     };
 
@@ -962,8 +983,8 @@ function jsonpRequest<T>(payload: Record<string, unknown>): Promise<ApiResponse<
 }
 
 async function requestViaJsonpFallback<T>(payload: Record<string, unknown>): Promise<ApiResponse<T>> {
-  if (['createAccount', 'updateAccount', 'deleteAccount', 'batchDeleteAccounts', 'batchResetPasswords'].includes(String(payload.action))) {
-    return { ok: false, message: 'Chưa xác nhận được kết quả từ Apps Script. Hãy tải lại danh sách để kiểm tra, rồi thử lại nếu cần. Kiểm tra URL /exec và quyền triển khai Apps Script trong hướng dẫn V6.77.0.' };
+  if (['createAccount', 'updateAccount', 'deleteAccount', 'batchDeleteAccounts', 'batchResetPasswords', 'getAdminPasswordCapability'].includes(String(payload.action))) {
+    return { ok: false, message: 'Chưa xác nhận được kết quả thao tác. Vui lòng tải lại danh sách để kiểm tra trước khi thực hiện lại.' };
   }
 
   try {
@@ -974,7 +995,7 @@ async function requestViaJsonpFallback<T>(payload: Record<string, unknown>): Pro
   }
   return {
     ok: false,
-    message: 'Không thể kết nối Web App Apps Script. Hãy kiểm tra lại deploy, quyền truy cập và URL backend.',
+    message: 'Dịch vụ xử lý dữ liệu đang tạm thời gián đoạn. Vui lòng kiểm tra kết nối và thử lại.',
   };
 }
 
@@ -1032,7 +1053,7 @@ async function rawRequest<T>(payload: Record<string, unknown>): Promise<ApiRespo
     }
     return {
       ok: false,
-      message: 'Không thể kết nối Web App Apps Script. Hãy kiểm tra lại deploy, quyền truy cập và URL backend.',
+      message: 'Dịch vụ xử lý dữ liệu đang tạm thời gián đoạn. Vui lòng kiểm tra kết nối và thử lại.',
       error,
     };
   }
@@ -1111,9 +1132,10 @@ function normalizeUser(raw: any, token: string): User {
 function normalizeAIConfig(raw: any): AIConfig {
   const apiKey = toCleanString(raw?.api_key);
   const apiKeyMasked = toCleanString(raw?.api_key_masked);
+  const requestedModel = toCleanString(raw?.model_ai) || AI_MODELS[0];
   return {
     apiKey,
-    model: toCleanString(raw?.model_ai),
+    model: normalizeGeminiModelName(requestedModel),
     apiKeyMasked: apiKey ? `${apiKey.slice(0, 4)}...${apiKey.slice(-4)}` : apiKeyMasked,
     hasServerKey: normalizeBoolean(raw?.has_api_key, Boolean(apiKey)),
     updatedAt: toCleanString(raw?.updated_at),
@@ -1230,7 +1252,7 @@ export async function getUserConfigApi(token: string): Promise<ApiResponse<AICon
   } catch (error) {
     return {
       ok: false,
-      message: `${firebaseErrorMessage(error)} Hãy xác minh Firestore Rules hiện hành đã được deploy.`,
+      message: 'Chưa tải được cấu hình AI của tài khoản. Hãy tải lại ứng dụng và thử lại.',
       error,
     };
   }
@@ -1243,7 +1265,7 @@ export async function getUserConfigApi(token: string): Promise<ApiResponse<AICon
     if (legacyFirestoreKey) {
       const migrated = await saveFirebaseUserAISecret(
         legacyFirestoreKey,
-        AI_MODELS.includes(legacyFirestoreModel) ? legacyFirestoreModel : AI_MODELS[0],
+        normalizeGeminiModelName(legacyFirestoreModel),
       );
       await deleteFirebaseUserAIConfig().catch(() => undefined);
       return { ok: true, message: 'Đã chuyển cấu hình AI Firestore cũ sang kho theo tài khoản.', data: normalizeAIConfig(migrated) };
@@ -1263,7 +1285,7 @@ export async function getUserConfigApi(token: string): Promise<ApiResponse<AICon
     const legacyKey = legacyRes.ok && legacyRes.data ? toCleanString((legacyRes.data as any).api_key) : '';
     const legacyModel = legacyRes.ok && legacyRes.data ? toCleanString((legacyRes.data as any).model_ai) || AI_MODELS[0] : AI_MODELS[0];
     if (legacyKey) {
-      const migrated = await saveFirebaseUserAISecret(legacyKey, AI_MODELS.includes(legacyModel) ? legacyModel : AI_MODELS[0]);
+      const migrated = await saveFirebaseUserAISecret(legacyKey, normalizeGeminiModelName(legacyModel));
       void apiRequest<Record<string, unknown>>('deleteMyAIConfig', { model_ai: legacyModel }, token).catch(() => undefined);
       try { await deleteFirebaseUserAIConfig(); } catch { /* cleanup legacy Firestore is best-effort */ }
       return { ok: true, message: 'Đã chuyển cấu hình AI cũ sang tài khoản Firebase.', data: normalizeAIConfig(migrated) };
@@ -1585,6 +1607,28 @@ export async function updateAccountApi(token: string, payload: Record<string, un
   return { ...res, data: normalizeAccount(res.data) };
 }
 
+export interface AdminPasswordCapability {
+  ready: boolean;
+  version: string;
+  projectId: string;
+  effectiveEmail?: string;
+  status?: string;
+}
+
+export async function getAdminPasswordCapabilityApi(token: string, firebaseIdToken = ''): Promise<ApiResponse<AdminPasswordCapability>> {
+  const res = await apiRequest<AdminPasswordCapability>('getAdminPasswordCapability', {
+    ...(firebaseIdToken ? { firebase_id_token: firebaseIdToken } : {}),
+  }, token);
+  const message = typeof res.message === 'string' ? res.message.trim() : '';
+  if (!res.ok) {
+    return { ...res, message: message || 'Chức năng quản lý mật khẩu chưa sẵn sàng. Vui lòng tải lại trang và thử lại.' };
+  }
+  if (!res.data?.ready) {
+    return { ...res, ok: false, message: message || 'Chức năng quản lý mật khẩu chưa sẵn sàng. Vui lòng thử lại sau ít phút.' };
+  }
+  return { ...res, message: message || 'Chức năng quản lý mật khẩu đã sẵn sàng.' };
+}
+
 export interface StudentAccountImportBatchResult {
   requested_count: number;
   created_count: number;
@@ -1645,20 +1689,26 @@ export async function batchDeleteAccountsApi(token: string, user_ids: string[], 
       deleted, failed, firebaseCleanupPending: failed.length > 0 } };
 }
 
-export async function batchResetPasswordsApi(token: string, user_ids: string[], new_password = '123456', firebaseIdToken = '', options: AccountOperationOptions = {}) {
+export async function batchResetPasswordsApi(token: string, user_ids: string[], new_password = '123456', firebaseIdToken = '') {
   const ids = Array.from(new Set(user_ids.map(toCleanString).filter(Boolean)));
   const reset: Array<{ user_id: string; ho_ten?: string; ten_dang_nhap?: string; password_policy?: string }> = [];
   const failed: Array<{ user_id: string; ho_ten?: string; reason: string }> = [];
   for (let offset = 0; offset < ids.length; offset += 20) {
     const chunk = ids.slice(offset, offset + 20);
     const response = await apiRequest<{ reset: typeof reset; failed: typeof failed }>('batchResetPasswords',
-      { user_ids: chunk, new_password, ...options, ...(firebaseIdToken ? { firebase_id_token: firebaseIdToken } : {}) }, token);
+      { user_ids: chunk, new_password, ...(firebaseIdToken ? { firebase_id_token: firebaseIdToken } : {}) }, token);
     if (response.ok && response.data) { reset.push(...response.data.reset); failed.push(...response.data.failed); }
     else failed.push(...chunk.map(user_id => ({ user_id, reason: response.message || 'Chưa đặt lại được mật khẩu.' })));
   }
-  return { ok: reset.length > 0, message: `Đã đặt lại mật khẩu ${reset.length}/${ids.length} tài khoản.${failed.length ? ` ${failed[0].reason}` : ''}`,
+  const firstFailure = failed.find((item) => typeof item.reason === 'string' && item.reason.trim())?.reason?.trim() || '';
+  return {
+    ok: reset.length > 0,
+    message: reset.length > 0
+      ? `Đã đặt lại mật khẩu ${reset.length}/${ids.length} tài khoản.${failed.length ? ` ${firstFailure || `${failed.length} tài khoản chưa hoàn tất.`}` : ''}`
+      : firstFailure || '[PASSWORD_RESET_FAILED] Không tài khoản nào được đặt lại mật khẩu. Hãy kiểm tra quyền quản trị Firebase Authentication của Apps Script.',
     data: { requested_count: ids.length, reset_count: reset.length, failed_count: failed.length,
-      default_password: new_password, student_password_policy: 'student_code' as const, reset, failed } };
+      default_password: new_password, student_password_policy: 'student_code' as const, reset, failed }
+  };
 }
 
 export async function listClassesApi(_token: string, payload: Record<string, unknown> = {}) {
@@ -1788,16 +1838,16 @@ export async function saveUserConfigApi(_token: string, config: AIConfig): Promi
       return {
         ok: true,
         message: 'Đã xóa API key của tài khoản hiện tại.',
-        data: { apiKey: '', model: AI_MODELS.includes(config.model) ? config.model : AI_MODELS[0], apiKeyMasked: '', hasServerKey: false, updatedAt: new Date().toISOString() },
+        data: { apiKey: '', model: normalizeGeminiModelName(config.model), apiKeyMasked: '', hasServerKey: false, updatedAt: new Date().toISOString() },
       };
     }
     const apiKey = toCleanString(config.apiKey);
     if (!apiKey) return { ok: false, message: 'Vui lòng nhập Gemini API Key.' };
-    const model = AI_MODELS.includes(config.model) ? config.model : AI_MODELS[0];
+    const model = normalizeGeminiModelName(config.model);
     const saved = await saveFirebaseUserAISecret(apiKey, model);
     return { ok: true, message: 'Đã lưu cấu hình AI theo tài khoản trên Firestore.', data: normalizeAIConfig(saved) };
   } catch (error) {
-    return { ok: false, message: `${firebaseErrorMessage(error)} Hãy xác minh Firestore Rules hiện hành đã được deploy.`, error };
+    return { ok: false, message: 'Chưa lưu được cấu hình AI của tài khoản. Hãy tải lại ứng dụng và thử lại.', error };
   }
 }
 
@@ -1825,10 +1875,10 @@ export async function deleteUserConfigApi(_token: string, model = AI_MODELS[0]):
     return {
       ok: true,
       message: 'Đã xóa API key của tài khoản hiện tại trên Firestore.',
-      data: { apiKey: '', model: AI_MODELS.includes(model) ? model : AI_MODELS[0], apiKeyMasked: '', hasServerKey: false, updatedAt: new Date().toISOString() },
+      data: { apiKey: '', model: normalizeGeminiModelName(model), apiKeyMasked: '', hasServerKey: false, updatedAt: new Date().toISOString() },
     };
   } catch (error) {
-    return { ok: false, message: `${firebaseErrorMessage(error)} Hãy xác minh Firestore Rules hiện hành đã được deploy.`, error };
+    return { ok: false, message: 'Chưa xóa được API key của tài khoản. Hãy tải lại ứng dụng và thử lại.', error };
   }
 }
 

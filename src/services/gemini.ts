@@ -13,6 +13,7 @@ import {
   UploadedSourceFile,
 } from '../types';
 import { isQuizQuestionQualityAcceptable, sanitizeQuizQuestion } from '../utils/quizSanitizer';
+import { AI_MODELS, normalizeGeminiModelName } from '../constants';
 
 function cleanTextValue(value: unknown): string {
   return String(value ?? '')
@@ -1729,16 +1730,147 @@ export async function synthesizeTeacherSpeech(apiKey: string, text: string): Pro
   return pcmToWavBlob(base64ToUint8Array(base64Audio));
 }
 
-export async function testGeminiKey(apiKey: string, model: string) {
+export interface GeminiKeyTestResult {
+  ok: boolean;
+  keyValid: boolean;
+  model: string;
+  message: string;
+  code: 'OK' | 'INVALID_KEY' | 'API_RESTRICTED' | 'MODEL_UNAVAILABLE' | 'QUOTA' | 'NETWORK' | 'UNKNOWN';
+  availableModels?: string[];
+  generationVerified?: boolean;
+}
+
+function parseGeminiApiError(payload: any, status: number) {
+  const rawMessage = String(payload?.error?.message || payload?.message || '').trim();
+  const normalized = rawMessage.toLowerCase();
+
+  if (status === 429 || normalized.includes('quota') || normalized.includes('rate limit')) {
+    return { code: 'QUOTA' as const, keyValid: true, message: 'API key hợp lệ nhưng hạn mức Gemini hiện tại đã hết hoặc đang bị giới hạn.' };
+  }
+  if (status === 404 || normalized.includes('not found') || normalized.includes('not supported')) {
+    return { code: 'MODEL_UNAVAILABLE' as const, keyValid: true, message: 'Mô hình đã chọn không khả dụng cho API key này.' };
+  }
+  if (status === 400 && (normalized.includes('api key') || normalized.includes('key not valid'))) {
+    return { code: 'INVALID_KEY' as const, keyValid: false, message: 'API key không hợp lệ. Hãy sao chép lại khóa từ Google AI Studio.' };
+  }
+  if (status === 401) {
+    return { code: 'INVALID_KEY' as const, keyValid: false, message: 'API key không được chấp nhận. Hãy tạo hoặc sao chép lại API key từ Google AI Studio.' };
+  }
+  if (status === 403) {
+    return { code: 'API_RESTRICTED' as const, keyValid: false, message: 'API key chưa được phép sử dụng Gemini API hoặc đang bị giới hạn.' };
+  }
+  return {
+    code: 'UNKNOWN' as const,
+    keyValid: false,
+    message: rawMessage ? `Chưa xác minh được API key: ${rawMessage}` : 'Chưa thể kết nối Gemini API lúc này. Vui lòng thử lại.',
+  };
+}
+
+async function fetchGeminiJson(url: string, apiKey: string, init?: RequestInit) {
+  const controller = new AbortController();
+  const timeoutId = globalThis.setTimeout(() => controller.abort(), 15000);
   try {
-    const ai = new GoogleGenAI({ apiKey });
-    const response = await ai.models.generateContent({
-      model,
-      contents: 'Hello',
+    const response = await fetch(url, {
+      ...init,
+      headers: {
+        'x-goog-api-key': apiKey,
+        ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(init?.headers || {}),
+      },
+      signal: controller.signal,
     });
-    return !!response.text;
-  } catch {
-    return false;
+    let payload: any = null;
+    try { payload = await response.json(); } catch { payload = null; }
+    return { response, payload };
+  } finally {
+    globalThis.clearTimeout(timeoutId);
+  }
+}
+
+function chooseGeminiModel(requestedModel: string, availableModels: string[]) {
+  const available = new Set(availableModels.map((name) => normalizeGeminiModelName(name)));
+  const requested = normalizeGeminiModelName(requestedModel);
+  if (available.has(requested)) return requested;
+  const preferred = AI_MODELS.find((name) => available.has(name));
+  if (preferred) return preferred;
+  return availableModels.map((name) => normalizeGeminiModelName(name)).find((name) => available.has(name)) || requested;
+}
+
+export async function testGeminiKey(apiKey: string, model: string): Promise<GeminiKeyTestResult> {
+  const normalizedKey = String(apiKey || '').trim();
+  const requestedModel = normalizeGeminiModelName(model || AI_MODELS[0]);
+
+  if (!normalizedKey || normalizedKey.length < 20) {
+    return {
+      ok: false,
+      keyValid: false,
+      model: requestedModel,
+      code: 'INVALID_KEY',
+      message: 'API key chưa đầy đủ. Hãy dán lại khóa Gemini API.',
+    };
+  }
+
+  try {
+    // V6.88.14: xác minh API key bằng Models API. Không dùng generateContent làm
+    // cổng chặn cấu hình vì một số model/backend có thể trả INVALID_ARGUMENT
+    // cho request kiểm tra cực ngắn dù key và quyền truy cập model là hợp lệ.
+    const listUrl = 'https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000';
+    const { response: listResponse, payload: listPayload } = await fetchGeminiJson(listUrl, normalizedKey);
+
+    if (!listResponse.ok) {
+      const detail = parseGeminiApiError(listPayload, listResponse.status);
+      return {
+        ok: false,
+        keyValid: detail.keyValid,
+        model: requestedModel,
+        code: detail.code,
+        message: detail.message,
+      };
+    }
+
+    const availableModels = (Array.isArray(listPayload?.models) ? listPayload.models : [])
+      .filter((item: any) => {
+        const methods = Array.isArray(item?.supportedGenerationMethods) ? item.supportedGenerationMethods : [];
+        return methods.includes('generateContent');
+      })
+      .map((item: any) => String(item?.baseModelId || item?.name || '').replace(/^models\//, '').trim())
+      .filter((name: string) => /^gemini-/i.test(name));
+
+    const uniqueAvailable = Array.from(new Set(availableModels));
+    if (!uniqueAvailable.length) {
+      return {
+        ok: false,
+        keyValid: true,
+        model: requestedModel,
+        code: 'MODEL_UNAVAILABLE',
+        message: 'API key hợp lệ nhưng tài khoản hiện chưa được cấp mô hình Gemini có thể tạo nội dung.',
+        availableModels: [],
+      };
+    }
+
+    const resolvedModel = chooseGeminiModel(requestedModel, uniqueAvailable);
+    return {
+      ok: true,
+      keyValid: true,
+      model: resolvedModel,
+      code: 'OK',
+      generationVerified: false,
+      availableModels: uniqueAvailable,
+      message: resolvedModel === requestedModel
+        ? `API key hợp lệ. Mô hình ${resolvedModel} đã được Gemini API xác nhận khả dụng.`
+        : `API key hợp lệ. Hệ thống đã tự chọn mô hình khả dụng ${resolvedModel}.`,
+    };
+  } catch (error) {
+    const isAbort = error instanceof DOMException && error.name === 'AbortError';
+    return {
+      ok: false,
+      keyValid: false,
+      model: requestedModel,
+      code: 'NETWORK',
+      message: isAbort
+        ? 'Kiểm tra API key quá thời gian. Hãy kiểm tra mạng và thử lại.'
+        : 'Không thể kiểm tra Gemini API từ trình duyệt lúc này. Hãy kiểm tra mạng hoặc giới hạn API key.',
+    };
   }
 }
 

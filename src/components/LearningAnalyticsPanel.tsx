@@ -384,6 +384,25 @@ export default function LearningAnalyticsPanel({
   }, [classes]);
   const progressRowsForYear = useMemo(() => rows.filter((row) => !row.nam_hoc || String(row.nam_hoc) === selectedSchoolYear), [rows, selectedSchoolYear]);
   const progressMap = useMemo(() => new Map(progressRowsForYear.map((row) => [`${row.user_id}__${row.lesson_id}`, row])), [progressRowsForYear]);
+  // V6.88.16: preparationSubmissions dùng Firebase Auth UID làm danh tính canonical.
+  // Ghép theo UID trước, user_id legacy chỉ là fallback. Điều này tránh trạng thái
+  // "Đã gửi" ở học sinh nhưng giáo viên lại thấy 0%/Chưa gửi do userId migrate lệch.
+  const preparationProgressByUid = useMemo(() => {
+    const map = new Map<string, StudentLearningAnalyticsRow>();
+    progressRowsForYear.forEach((row) => {
+      if (!row.ownerUid || row.pre_lesson_status !== 'completed') return;
+      map.set(`${row.ownerUid}__${row.lesson_id}`, row);
+    });
+    return map;
+  }, [progressRowsForYear]);
+  const getPreparationProgress = (student: Account, lessonId: string) => {
+    const firebaseUid = String(student.firebase_uid || '').trim();
+    if (firebaseUid) {
+      const byUid = preparationProgressByUid.get(`${firebaseUid}__${lessonId}`);
+      if (byUid) return byUid;
+    }
+    return progressMap.get(`${student.user_id}__${lessonId}`);
+  };
   const historicalScopeMap = useMemo(() => {
     const map = new Map<string, { khoi?: string; lop_id?: string }>();
     progressRowsForYear.forEach((row) => {
@@ -567,12 +586,12 @@ export default function LearningAnalyticsPanel({
     return visibleStudents
       .filter((student) => lessonAppliesToStudent(selectedPreparationLesson, student))
       .map((student) => {
-        const progress = progressMap.get(`${student.user_id}__${selectedPreparationLesson.lesson_id}`);
+        const progress = getPreparationProgress(student, selectedPreparationLesson.lesson_id);
         const evaluation = getPreparationEvaluation(selectedPreparationLesson, progress);
         return { student, progress, evaluation };
       })
       .sort((a, b) => compareStudentsByGivenName(a.student, b.student));
-  }, [selectedPreparationLesson, visibleStudents, progressMap]);
+  }, [selectedPreparationLesson, visibleStudents, progressMap, preparationProgressByUid]);
 
   const preparationDetailRows = useMemo(() => preparationDetailRowsAll
     .filter((item) => preparationStatusFilter === 'all'
@@ -581,12 +600,12 @@ export default function LearningAnalyticsPanel({
 
   const preparationSummaryRows = useMemo(() => preparationLessons.map((lesson) => {
     const lessonStudents = visibleStudents.filter((student) => lessonAppliesToStudent(lesson, student));
-    const evaluations = lessonStudents.map((student) => getPreparationEvaluation(lesson, progressMap.get(`${student.user_id}__${lesson.lesson_id}`)));
+    const evaluations = lessonStudents.map((student) => getPreparationEvaluation(lesson, getPreparationProgress(student, lesson.lesson_id)));
     const prepared = evaluations.filter((item) => item.state === 'prepared').length;
     const lateCompleted = evaluations.filter((item) => item.state === 'late_completed').length;
     const notStarted = evaluations.filter((item) => item.state === 'not_started').length;
     return { lesson, total: lessonStudents.length, prepared, lateCompleted, notStarted, notPrepared: Math.max(0, lessonStudents.length - prepared), rate: lessonStudents.length ? Math.round((prepared / lessonStudents.length) * 100) : 0 };
-  }), [preparationLessons, visibleStudents, progressMap]);
+  }), [preparationLessons, visibleStudents, progressMap, preparationProgressByUid]);
 
   const preparationStats = useMemo(() => {
     if (!selectedPreparationLesson) {
@@ -1266,7 +1285,7 @@ export default function LearningAnalyticsPanel({
 
       {analyticsModule === 'preparation' ? (
         effectiveGrade === 'Tất cả' || filters.classId === 'Tất cả' ? (
-          <EmptyState title="Chọn khối và lớp để theo dõi chuẩn bị bài" description="Hệ thống chỉ tải dữ liệu video chuẩn bị trong một phạm vi lớp cụ thể để tiết kiệm Firestore Spark và đánh giá đúng toàn bộ học sinh của lớp." />
+          <EmptyState title="Chọn khối và lớp để theo dõi chuẩn bị bài" description="Hệ thống chỉ tải dữ liệu chuẩn bị bài trong lớp đã chọn để hiển thị nhanh và đánh giá đúng toàn bộ học sinh." />
         ) : preparationLessons.length === 0 ? (
           <EmptyState title="Chưa có bài học dùng video chuẩn bị" description="Các bài có bật Nhiệm vụ chuẩn bị bài bằng video sẽ xuất hiện tại đây." />
         ) : selectedPreparationLesson ? (
@@ -1492,7 +1511,7 @@ function PreparationSummaryTable({ rows, onSelectLesson }: { rows: Array<{ lesso
     <div className="overflow-hidden rounded-[30px] bg-white shadow-sm ring-1 ring-slate-100">
       <div className="border-b border-fuchsia-100 bg-fuchsia-50 px-5 py-4">
         <h3 className="font-bold text-slate-900">Tổng hợp chuẩn bị bài theo bài học</h3>
-        <p className="mt-1 text-xs font-semibold text-slate-500">Đã chuẩn bị chỉ khi học sinh xem đủ ngưỡng và bấm gửi kết quả. Học sinh chưa gửi sẽ không có dữ liệu tiến độ trên Firestore.</p>
+        <p className="mt-1 text-xs font-semibold text-slate-500">Đã chuẩn bị chỉ khi học sinh xem đủ ngưỡng và bấm gửi kết quả. Học sinh chưa gửi sẽ được hiển thị là chưa hoàn tất chuẩn bị bài.</p>
       </div>
       <div className="overflow-x-auto">
         <table className="min-w-full text-sm">

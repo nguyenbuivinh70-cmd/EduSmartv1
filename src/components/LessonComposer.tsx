@@ -197,6 +197,66 @@ function buildInitialValues(user: User, lesson?: Lesson | null, content?: Lesson
   };
 }
 
+
+type SavedAssignmentConfiguration = {
+  version: 1;
+  savedAt: string;
+  values: Pick<
+    LessonComposerValues,
+    | 'lop_id'
+    | 'pham_vi'
+    | 'nam_hoc'
+    | 'hoc_ky'
+    | 'thoi_gian_bat_dau'
+    | 'thoi_gian_ket_thuc'
+    | 'cho_phep_hoc_sau_han'
+    | 'cho_phep_nop_sau_han'
+    | 'access_mode'
+    | 'allow_retake_after_completion'
+  >;
+};
+
+const ASSIGNMENT_CONFIG_STORAGE_PREFIX = 'edusmart:lesson-assignment-config:v1:';
+
+function assignmentConfigStorageKey(user: User) {
+  const accountKey = String(user.user_id || user.ten_dang_nhap || 'current').trim() || 'current';
+  return `${ASSIGNMENT_CONFIG_STORAGE_PREFIX}${accountKey}`;
+}
+
+function readSavedAssignmentConfiguration(user: User): SavedAssignmentConfiguration | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(assignmentConfigStorageKey(user));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<SavedAssignmentConfiguration>;
+    if (parsed.version !== 1 || !parsed.values || typeof parsed.values !== 'object') return null;
+    return {
+      version: 1,
+      savedAt: String(parsed.savedAt || ''),
+      values: {
+        lop_id: String(parsed.values.lop_id || ''),
+        pham_vi: parsed.values.pham_vi === 'shared' ? 'shared' : 'private',
+        nam_hoc: String(parsed.values.nam_hoc || ''),
+        hoc_ky: String(parsed.values.hoc_ky || 'HK1'),
+        thoi_gian_bat_dau: String(parsed.values.thoi_gian_bat_dau || ''),
+        thoi_gian_ket_thuc: String(parsed.values.thoi_gian_ket_thuc || ''),
+        cho_phep_hoc_sau_han: Boolean(parsed.values.cho_phep_hoc_sau_han),
+        cho_phep_nop_sau_han: Boolean(parsed.values.cho_phep_nop_sau_han),
+        access_mode: parsed.values.access_mode === 'self_study' ? 'self_study' : 'teacher_controlled',
+        allow_retake_after_completion: Boolean(parsed.values.allow_retake_after_completion),
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+function formatSavedAssignmentTime(value?: string) {
+  if (!value) return '';
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? '' : parsed.toLocaleString('vi-VN');
+}
+
 const fieldClass = 'w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100';
 
 function lessonSaveDisplayError(error: unknown) {
@@ -204,7 +264,7 @@ function lessonSaveDisplayError(error: unknown) {
   if (!raw) return 'Không thể lưu bài học.';
   if (/ReferenceError|is not defined|Cannot access .* before initialization/i.test(raw)) {
     console.error('[EduSmart][LessonComposer][PUBLISH_RUNTIME]', error);
-    return 'Không thể xuất bản bài học do lỗi xử lý nội bộ. Hệ thống đã ghi nhận để chẩn đoán. [PUBLISH_RUNTIME]';
+    return 'Chưa thể xuất bản bài học lúc này. Nội dung đang soạn vẫn được giữ; vui lòng thử lại.';
   }
   return raw;
 }
@@ -221,6 +281,8 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
   const [isSavingLessonDefaults, setIsSavingLessonDefaults] = useState(false);
   const [isResettingLessonDefaults, setIsResettingLessonDefaults] = useState(false);
   const [defaultStatusMessage, setDefaultStatusMessage] = useState('');
+  const [savedAssignmentConfig, setSavedAssignmentConfig] = useState<SavedAssignmentConfiguration | null>(null);
+  const [assignmentConfigStatus, setAssignmentConfigStatus] = useState('');
   const [values, setValues] = useState<LessonComposerValues>(buildInitialValues(user, initialLesson, initialContent, systemSchoolYear, lessonBuilderDefaults));
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isRevising, setIsRevising] = useState(false);
@@ -251,6 +313,8 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
       setConfigurationConfirmed(Boolean(initialContent));
       setContentNeedsRegeneration(false);
       setDefaultStatusMessage('');
+      setSavedAssignmentConfig(readSavedAssignmentConfiguration(user));
+      setAssignmentConfigStatus('');
     }
   }, [isOpen, user, initialLesson, initialContent, systemSchoolYear]);
 
@@ -425,6 +489,65 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
     } finally {
       setIsResettingLessonDefaults(false);
     }
+  };
+
+  const handleSaveAssignmentConfiguration = () => {
+    if (typeof window === 'undefined') return;
+    const saved: SavedAssignmentConfiguration = {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      values: {
+        lop_id: String(values.lop_id || ''),
+        pham_vi: values.pham_vi === 'shared' ? 'shared' : 'private',
+        nam_hoc: String(values.nam_hoc || ''),
+        hoc_ky: String(values.hoc_ky || 'HK1'),
+        thoi_gian_bat_dau: String(values.thoi_gian_bat_dau || ''),
+        thoi_gian_ket_thuc: String(values.thoi_gian_ket_thuc || ''),
+        cho_phep_hoc_sau_han: Boolean(values.cho_phep_hoc_sau_han),
+        cho_phep_nop_sau_han: Boolean(values.cho_phep_nop_sau_han),
+        access_mode: values.access_mode === 'self_study' ? 'self_study' : 'teacher_controlled',
+        allow_retake_after_completion: Boolean(values.allow_retake_after_completion),
+      },
+    };
+    try {
+      window.localStorage.setItem(assignmentConfigStorageKey(user), JSON.stringify(saved));
+      setSavedAssignmentConfig(saved);
+      setAssignmentConfigStatus('Đã lưu cấu hình giao bài. Bạn có thể áp dụng lại cho bài học khác trên thiết bị này.');
+    } catch {
+      setAssignmentConfigStatus('Chưa lưu được cấu hình giao bài trên trình duyệt. Hãy kiểm tra quyền lưu dữ liệu của trình duyệt và thử lại.');
+    }
+  };
+
+  const handleApplyAssignmentConfiguration = () => {
+    const saved = savedAssignmentConfig || readSavedAssignmentConfiguration(user);
+    if (!saved) {
+      setAssignmentConfigStatus('Chưa có cấu hình giao bài đã lưu.');
+      return;
+    }
+    const savedClassId = String(saved.values.lop_id || '');
+    const classStillValid = !savedClassId || classes.some((item) => item.lop_id === savedClassId && (!values.khoi || String(item.khoi) === String(values.khoi)));
+    setValues((prev) => ({
+      ...prev,
+      ...saved.values,
+      lop_id: classStillValid ? savedClassId : '',
+      nam_hoc: saved.values.nam_hoc || prev.nam_hoc || systemSchoolYear || currentSchoolYear(),
+      hoc_ky: saved.values.hoc_ky || prev.hoc_ky || 'HK1',
+    }));
+    setSavedAssignmentConfig(saved);
+    setAssignmentConfigStatus(classStillValid
+      ? 'Đã áp dụng cấu hình giao bài đã lưu.'
+      : 'Đã áp dụng cấu hình đã lưu; lớp cũ không thuộc khối hiện tại nên hệ thống chuyển về “Tất cả / không cố định”.');
+  };
+
+  const handleClearAssignmentConfiguration = () => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.removeItem(assignmentConfigStorageKey(user));
+    } catch {
+      // LocalStorage cleanup is best-effort.
+    }
+    setSavedAssignmentConfig(null);
+    setAssignmentConfigStatus('Đã xóa cấu hình giao bài đã lưu.');
   };
 
   useEffect(() => {
@@ -869,6 +992,26 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
                   {activeStep === 'publish' ? (
                     <div className="space-y-6">
                       <div><p className="text-xs font-bold uppercase tracking-[0.18em] text-indigo-600">Bước 5</p><h3 className="mt-1 text-xl font-black text-slate-900">Giao bài và xuất bản</h3><p className="mt-1 text-sm text-slate-500">Nội dung đã hoàn thiện. Bây giờ mới chọn lớp, phạm vi và thời gian học để tránh phải cấu hình vận hành quá sớm.</p></div>
+
+                      <div className="rounded-3xl border border-sky-100 bg-sky-50/70 p-4">
+                        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <Save className="h-4 w-4 text-sky-700" />
+                              <h4 className="font-black text-slate-900">Cấu hình giao bài dùng lại</h4>
+                            </div>
+                            <p className="mt-1 text-xs font-medium leading-5 text-slate-600">Lưu lớp, phạm vi, năm học, học kỳ, lịch mở/đóng bài, chế độ tự học và học lại để áp dụng nhanh cho bài học khác.</p>
+                            {savedAssignmentConfig?.savedAt ? <p className="mt-1 text-[11px] font-bold text-sky-700">Đã lưu: {formatSavedAssignmentTime(savedAssignmentConfig.savedAt)}</p> : <p className="mt-1 text-[11px] font-semibold text-slate-500">Chưa có cấu hình giao bài đã lưu.</p>}
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            <button type="button" onClick={handleSaveAssignmentConfiguration} className="inline-flex items-center gap-2 rounded-xl bg-sky-600 px-3.5 py-2 text-xs font-black text-white shadow-sm hover:bg-sky-700"><Save className="h-3.5 w-3.5" /> Lưu cấu hình</button>
+                            <button type="button" onClick={handleApplyAssignmentConfiguration} disabled={!savedAssignmentConfig} className="inline-flex items-center gap-2 rounded-xl bg-white px-3.5 py-2 text-xs font-black text-sky-700 ring-1 ring-sky-200 hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-40"><CheckCircle2 className="h-3.5 w-3.5" /> Áp dụng đã lưu</button>
+                            <button type="button" onClick={handleClearAssignmentConfiguration} disabled={!savedAssignmentConfig} className="inline-flex items-center gap-2 rounded-xl bg-white px-3.5 py-2 text-xs font-black text-slate-600 ring-1 ring-slate-200 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"><X className="h-3.5 w-3.5" /> Xóa</button>
+                          </div>
+                        </div>
+                        {assignmentConfigStatus ? <div className="mt-3 rounded-2xl bg-white px-3.5 py-2.5 text-xs font-semibold text-sky-800 ring-1 ring-sky-100">{assignmentConfigStatus}</div> : null}
+                      </div>
+
                       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
                         <div><label className="mb-2 block text-sm font-semibold text-slate-700">Lớp áp dụng</label><select value={values.lop_id} onChange={(e) => setValues((prev) => ({ ...prev, lop_id: e.target.value }))} className={fieldClass} disabled={user.vai_tro === 'student'}><option value="">Tất cả / không cố định</option>{classes.filter((item) => !values.khoi || item.khoi === values.khoi).map((item) => <option key={item.lop_id} value={item.lop_id}>{item.ten_lop}</option>)}</select></div>
                         <div><label className="mb-2 block text-sm font-semibold text-slate-700">Phạm vi sử dụng</label><select value={values.pham_vi} onChange={(e) => setValues((prev) => ({ ...prev, pham_vi: e.target.value as 'private' | 'shared' }))} className={fieldClass} disabled={user.vai_tro === 'student'}><option value="private">Dùng riêng</option><option value="shared">Dùng chung</option></select></div>

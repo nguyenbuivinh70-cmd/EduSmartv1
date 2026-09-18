@@ -1,4 +1,5 @@
 import { FirebaseError } from 'firebase/app';
+import { professionalUserMessage } from '../utils/userMessages';
 import { deleteApp, getApp, getApps, initializeApp } from 'firebase/app';
 import {
   browserLocalPersistence,
@@ -240,6 +241,72 @@ function normalizeMember(raw: Record<string, unknown>, uid: string, email: strin
   };
 }
 
+
+function internalStudentCode(email: string, raw: Record<string, unknown>) {
+  const explicit = cleanText(raw.studentCode || raw.username);
+  if (/^\d{6,}$/.test(explicit)) return explicit;
+  const normalizedEmail = cleanText(email).toLowerCase();
+  const suffix = '@hthtv1.firebaseapp.com';
+  if (normalizedEmail.endsWith(suffix)) {
+    const fromEmail = normalizedEmail.slice(0, -suffix.length);
+    if (/^\d{6,}$/.test(fromEmail)) return fromEmail;
+  }
+  return '';
+}
+
+async function synchronizeStudentMemberFromRoster(
+  memberRef: ReturnType<typeof doc>,
+  memberSnapshot: Awaited<ReturnType<typeof getDocFromServer>>,
+  uid: string,
+  signedInEmail: string,
+) {
+  if (!memberSnapshot.exists()) return memberSnapshot;
+  const raw = memberSnapshot.data() as Record<string, unknown>;
+  if (normalizeRole(raw.role ?? raw.vai_tro) !== 'student') return memberSnapshot;
+  const studentCode = internalStudentCode(signedInEmail, raw);
+  if (!studentCode) return memberSnapshot;
+
+  const rosterRef = doc(firestoreDb, 'schools', FIREBASE_SCHOOL_ID, 'studentRoster', studentCode);
+  let rosterSnapshot;
+  try {
+    rosterSnapshot = await getDocFromServer(rosterRef);
+  } catch {
+    return memberSnapshot;
+  }
+  if (!rosterSnapshot.exists()) return memberSnapshot;
+  const roster = rosterSnapshot.data() as Record<string, unknown>;
+  if (cleanText(roster.status).toLowerCase() !== 'active') return memberSnapshot;
+
+  const patch: Record<string, unknown> = {};
+  const setIfDifferent = (key: string, next: unknown, normalize: (value: unknown) => string = cleanText) => {
+    const normalizedNext = normalize(next);
+    if (normalizedNext && normalize(raw[key]) !== normalizedNext) patch[key] = normalizedNext;
+  };
+  setIfDifferent('userId', roster.userId);
+  setIfDifferent('username', roster.username || studentCode);
+  setIfDifferent('displayName', roster.displayName);
+  setIfDifferent('email', roster.email || signedInEmail, (value) => cleanText(value).toLowerCase());
+  setIfDifferent('classId', roster.classId);
+  setIfDifferent('grade', roster.grade, normalizeStudentGrade);
+  setIfDifferent('studentCode', roster.studentCode || studentCode);
+  if (cleanText(raw.schoolId) !== FIREBASE_SCHOOL_ID) patch.schoolId = FIREBASE_SCHOOL_ID;
+  if (cleanText(raw.authUid) !== uid) patch.authUid = uid;
+
+  if (!Object.keys(patch).length) return memberSnapshot;
+  try {
+    await updateDoc(memberRef, { ...patch, updatedAt: serverTimestamp() });
+    const repaired = await getDocFromServer(memberRef);
+    return repaired.exists() ? repaired : memberSnapshot;
+  } catch (error) {
+    console.warn('[EduSmart][IdentitySync] Student profile sync deferred', {
+      uid,
+      studentCode,
+      code: error instanceof FirebaseError ? error.code : '',
+    });
+    return memberSnapshot;
+  }
+}
+
 export function firebaseInternalEmailForUsername(username: string) {
   let localPart = cleanText(username)
     .toLowerCase()
@@ -258,22 +325,23 @@ export function firebaseErrorMessage(error: unknown) {
   const code = error instanceof FirebaseError ? error.code : '';
   const messages: Record<string, string> = {
     'auth/invalid-email': 'Email không đúng định dạng.',
-    'auth/invalid-credential': 'Email hoặc mật khẩu Firebase không đúng.',
-    'auth/user-disabled': 'Tài khoản Firebase đã bị vô hiệu hóa.',
+    'auth/invalid-credential': 'Tên đăng nhập hoặc mật khẩu không đúng.',
+    'auth/user-disabled': 'Tài khoản này đang tạm ngừng hoạt động. Vui lòng liên hệ quản trị viên.',
     'auth/too-many-requests': 'Đăng nhập sai quá nhiều lần. Vui lòng thử lại sau.',
-    'auth/network-request-failed': 'Không kết nối được Firebase. Vui lòng kiểm tra Internet.',
-    'permission-denied': 'Firestore từ chối thao tác theo điều kiện bảo mật hiện tại. Hãy tải lại dữ liệu, kiểm tra tài khoản đang active và phạm vi lớp/khối; nếu chức năng vừa được nâng cấp, hãy xác minh đúng phiên bản Firestore Rules đã được triển khai.',
-    'firestore/permission-denied': 'Firestore từ chối thao tác theo điều kiện bảo mật hiện tại. Hãy tải lại dữ liệu, kiểm tra tài khoản đang active và phạm vi lớp/khối; nếu chức năng vừa được nâng cấp, hãy xác minh đúng phiên bản Firestore Rules đã được triển khai.',
-    'resource-exhausted': 'Firestore đã chạm giới hạn quota/tài nguyên hiện tại. Dữ liệu chưa bị xóa. Với bài học, tiến trình xóa theo batch đã được lưu; hãy thử Tiếp tục xóa sau khi quota khôi phục.',
-    'firestore/resource-exhausted': 'Firestore đã chạm giới hạn quota/tài nguyên hiện tại. Dữ liệu chưa bị xóa. Với bài học, tiến trình xóa theo batch đã được lưu; hãy thử Tiếp tục xóa sau khi quota khôi phục.',
+    'auth/network-request-failed': 'Kết nối đang gián đoạn. Vui lòng kiểm tra Internet và thử lại.',
+    'permission-denied': 'Tài khoản hiện tại chưa thể thực hiện thao tác này. Vui lòng tải lại dữ liệu và thử lại.',
+    'firestore/permission-denied': 'Tài khoản hiện tại chưa thể thực hiện thao tác này. Vui lòng tải lại dữ liệu và thử lại.',
+    'resource-exhausted': 'Hệ thống đang bận. Dữ liệu đã xử lý được giữ nguyên; vui lòng thử lại sau ít phút.',
+    'firestore/resource-exhausted': 'Hệ thống đang bận. Dữ liệu đã xử lý được giữ nguyên; vui lòng thử lại sau ít phút.',
   };
   if (messages[code]) return messages[code];
   if (code.includes('api-key-not-valid') || (error instanceof Error && error.message.includes('api-key-not-valid'))) {
-    return 'Khóa cấu hình Firebase không hợp lệ. Vui lòng dùng bản EduSmart V6.54.1 trở lên.';
+    return 'Cấu hình đăng nhập của ứng dụng chưa sẵn sàng. Vui lòng liên hệ quản trị viên.';
   }
-  return error instanceof Error && error.message
-    ? error.message
-    : 'Không thể xác thực với Firebase.';
+  return professionalUserMessage(
+    error instanceof Error && error.message ? error.message : '',
+    'Chưa thể hoàn tất thao tác với dữ liệu. Vui lòng thử lại.',
+  );
 }
 
 export function shouldFallbackToLegacyLogin(error: unknown) {
@@ -283,13 +351,14 @@ export function shouldFallbackToLegacyLogin(error: unknown) {
 
 export async function loadValidatedCurrentFirebaseMember() {
   const current = firebaseAuth.currentUser;
-  if (!current) throw new Error('Bạn cần đăng nhập Firebase để sử dụng kho dữ liệu mới.');
+  if (!current) throw new Error('Bạn cần đăng nhập lại để tiếp tục sử dụng chức năng này.');
   const uid = current.uid;
   const signedInEmail = cleanText(current.email || '').toLowerCase();
   const memberRef = doc(firestoreDb, 'schools', FIREBASE_SCHOOL_ID, 'members', uid);
   await current.getIdToken(true);
   let memberSnapshot = await getDocFromServer(memberRef);
-  if (!memberSnapshot.exists()) throw new Error('Không tìm thấy hồ sơ thành viên Firebase.');
+  if (!memberSnapshot.exists()) throw new Error('Không tìm thấy hồ sơ thành viên.');
+  memberSnapshot = await synchronizeStudentMemberFromRoster(memberRef, memberSnapshot, uid, signedInEmail);
 
   const rawMember = memberSnapshot.data();
   const identityRepair: Record<string, unknown> = {};
@@ -310,10 +379,10 @@ export async function loadValidatedCurrentFirebaseMember() {
   }
 
   const member = normalizeMember(memberSnapshot.data(), uid, signedInEmail);
-  if (member.authUid !== uid) throw new Error('Hồ sơ thành viên thiếu/sai authUid. Hãy xác minh Firestore Rules hiện hành rồi đăng nhập lại.');
-  if (member.schoolId !== FIREBASE_SCHOOL_ID) throw new Error(`Hồ sơ thành viên thiếu/sai schoolId (cần ${FIREBASE_SCHOOL_ID}). Hãy xác minh Firestore Rules hiện hành rồi đăng nhập lại.`);
+  if (member.authUid !== uid) throw new Error('Thông tin tài khoản chưa đồng bộ đầy đủ. Vui lòng đăng xuất và đăng nhập lại.');
+  if (member.schoolId !== FIREBASE_SCHOOL_ID) throw new Error(`Thông tin tài khoản chưa đồng bộ đầy đủ. Vui lòng đăng xuất và đăng nhập lại.`);
   if (member.status !== 'active') throw new Error('Tài khoản thành viên đang bị khóa hoặc chưa kích hoạt.');
-  if (!member.userId) throw new Error('Hồ sơ thành viên chưa có trường userId.');
+  if (!member.userId) throw new Error('Thông tin tài khoản chưa đầy đủ. Vui lòng liên hệ quản trị viên.');
   return { uid, ...member };
 }
 
@@ -331,7 +400,7 @@ export async function signInAndLoadMember(email: string, password: string): Prom
         ? signedInEmail.slice(0, -'@hthtv1.firebaseapp.com'.length)
         : '';
       if (!/^\d{6,}$/.test(studentCode)) {
-        throw new Error(`Chưa có hồ sơ thành viên tại schools/${FIREBASE_SCHOOL_ID}/members/${uid}.`);
+        throw new Error('Tài khoản chưa có hồ sơ sử dụng ứng dụng. Vui lòng liên hệ quản trị viên.');
       }
       const rosterRef = doc(firestoreDb, 'schools', FIREBASE_SCHOOL_ID, 'studentRoster', studentCode);
       const rosterSnapshot = await getDoc(rosterRef);
@@ -367,11 +436,13 @@ export async function signInAndLoadMember(email: string, password: string): Prom
         updatedAt: serverTimestamp(),
       }));
       memberSnapshot = await getDoc(memberRef);
-      if (!memberSnapshot.exists()) throw new Error('Không thể kích hoạt hồ sơ học sinh sau khi xác thực.');
+      if (!memberSnapshot.exists()) throw new Error('Chưa thể hoàn tất kích hoạt hồ sơ học sinh. Vui lòng thử lại.');
     }
 
+    memberSnapshot = await synchronizeStudentMemberFromRoster(memberRef, memberSnapshot, uid, signedInEmail);
+
     // Một số hồ sơ được tạo ở các bản cũ có thể thiếu schoolId/authUid.
-    // Rules V6.74.2 cho phép chính chủ bổ sung đúng hai trường nhận dạng này,
+    // Hệ thống tự chuẩn hóa các trường nhận dạng an toàn,
     // giúp tránh tình trạng đăng nhập được nhưng mọi collection phía sau đều bị
     // permission-denied. Việc sửa là best-effort để không phá phiên đăng nhập.
     const rawMember = memberSnapshot.data();
@@ -392,10 +463,10 @@ export async function signInAndLoadMember(email: string, password: string): Prom
     }
 
     const member = normalizeMember(memberSnapshot.data(), uid, signedInEmail);
-    if (member.authUid !== uid) throw new Error('Hồ sơ thành viên thiếu/sai authUid. Hãy xác minh Firestore Rules hiện hành rồi đăng nhập lại.');
-    if (member.schoolId !== FIREBASE_SCHOOL_ID) throw new Error(`Hồ sơ thành viên thiếu/sai schoolId (cần ${FIREBASE_SCHOOL_ID}). Hãy xác minh Firestore Rules hiện hành rồi đăng nhập lại.`);
+    if (member.authUid !== uid) throw new Error('Thông tin tài khoản chưa đồng bộ đầy đủ. Vui lòng đăng xuất và đăng nhập lại.');
+    if (member.schoolId !== FIREBASE_SCHOOL_ID) throw new Error(`Thông tin tài khoản chưa đồng bộ đầy đủ. Vui lòng đăng xuất và đăng nhập lại.`);
     if (member.status !== 'active') throw new Error('Tài khoản thành viên đang bị khóa hoặc chưa kích hoạt.');
-    if (!member.userId) throw new Error('Hồ sơ thành viên chưa có trường userId.');
+    if (!member.userId) throw new Error('Thông tin tài khoản chưa đầy đủ. Vui lòng liên hệ quản trị viên.');
 
     return {
       idToken: await credential.user.getIdToken(true),
@@ -475,7 +546,7 @@ export async function verifyOrActivateFirebaseClassmateInIsolation(
       } catch (rosterError) {
         const rosterCode = rosterError instanceof FirebaseError ? rosterError.code : '';
         if (rosterCode === 'permission-denied' || rosterCode === 'firestore/permission-denied') {
-          throw new Error('Chưa thể kiểm tra bạn cùng lớp. Hãy xác minh Firestore Rules hiện hành rồi thử lại.');
+          throw new Error('Chưa thể tải danh sách bạn cùng lớp lúc này. Vui lòng tải lại và thử lại.');
         }
         throw rosterError;
       }
@@ -558,7 +629,7 @@ export async function verifyOrActivateFirebaseClassmateInIsolation(
 
     const member = normalizeMember(memberSnapshot.data(), uid, signedInEmail);
     if (member.authUid !== uid || member.schoolId !== FIREBASE_SCHOOL_ID) {
-      throw new Error('Hồ sơ Firebase của bạn học cùng thiếu/sai authUid hoặc schoolId. Hãy xác minh Firestore Rules hiện hành.');
+      throw new Error('Thông tin bạn học cùng chưa được đồng bộ đầy đủ. Vui lòng tải lại danh sách và thử lại.');
     }
     if (member.role !== 'student') throw new Error('Tài khoản được nhập không phải tài khoản học sinh.');
     if (member.status !== 'active') throw new Error('Tài khoản bạn học cùng đang bị khóa hoặc chưa kích hoạt.');

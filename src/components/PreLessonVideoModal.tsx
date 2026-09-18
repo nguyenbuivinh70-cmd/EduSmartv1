@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { Lesson, PreLessonProgress, PreLessonSubmission, User } from '../types';
 import { getPreLessonSubmissionApi, submitPreLessonPreparationApi } from '../services/api';
+import { professionalUserMessage } from '../utils/userMessages';
 
 type SecondSet = Set<number>;
 type SubmissionState = 'idle' | 'loading' | 'ready' | 'submitting' | 'submitted' | 'failed';
@@ -355,7 +356,7 @@ export default function PreLessonVideoModal({ isOpen, lesson, user, onClose, onP
         }
       } else {
         const diag = diagnosticCode(res.error, 'PRELESSON_SUBMISSION_LOAD_DENIED');
-        setError(`Không tải được trạng thái đã gửi (${diag}). Tiến độ xem vẫn được giữ trên thiết bị; em có thể tiếp tục xem và thử gửi khi đủ điều kiện.`);
+        setError(professionalUserMessage((res as any).message || diag, 'Chưa tải được trạng thái kết quả chuẩn bị bài. Tiến độ xem của em vẫn được giữ; em có thể tiếp tục xem.'));
         setSubmissionState('failed');
       }
     });
@@ -529,10 +530,12 @@ export default function PreLessonVideoModal({ isOpen, lesson, user, onClose, onP
       onProgressChangeRef.current?.(official);
       return;
     }
-    const diag = diagnosticCode(res.error, 'PRELESSON_SUBMIT_DENIED');
-    setError(diag === 'PRELESSON_SUBMIT_DENIED'
-      ? 'Firestore từ chối ghi kết quả chuẩn bị bài. Hãy xác minh Firestore Rules hiện hành đã được deploy. Hệ thống dùng submission tối giản theo từng bài; tiến độ xem vẫn được giữ an toàn trên thiết bị rồi bấm Thử gửi lại.'
-      : `Chưa gửi được kết quả chuẩn bị bài (${diag}). Tiến độ vẫn được lưu an toàn trên thiết bị. Hãy kiểm tra mạng rồi bấm gửi lại.`);
+    const diag = diagnosticCode(res.error, 'PRELESSON_SUBMIT_RULES_DENIED');
+    setError(diag === 'PRELESSON_SUBMIT_VERIFY_DENIED' || diag === 'PRELESSON_SUBMIT_VERIFY_FAILED'
+      ? 'Kết quả chuẩn bị bài đang được đồng bộ. Tiến độ xem của em vẫn được giữ an toàn; hãy tải lại và kiểm tra sau ít phút.'
+      : diag === 'PRELESSON_NETWORK'
+        ? 'Kết nối đang gián đoạn. Tiến độ xem của em vẫn được giữ; hãy thử gửi lại khi kết nối ổn định.'
+        : 'Chưa gửi được kết quả chuẩn bị bài. Tiến độ xem của em vẫn được giữ an toàn; hãy thử gửi lại.');
     setSubmissionState('failed');
   }, [lesson, user, trackingEnabled, threshold, videoRevision, samplePlayerCoverage, snapshotLocalBuffer, currentCoverageSnapshot]);
 
@@ -644,7 +647,7 @@ export default function PreLessonVideoModal({ isOpen, lesson, user, onClose, onP
                   {submission ? 'Đã gửi kết quả chuẩn bị bài' : submissionState === 'submitting' ? 'Đang gửi và xác minh...' : 'Gửi kết quả chuẩn bị bài'}
                 </button> : null}
 
-                {trackingEnabled && !submission ? <section className="rounded-2xl bg-slate-50 p-3 text-xs leading-5 text-slate-600 ring-1 ring-slate-100"><p className="font-black text-slate-800">Cách ghi nhận</p><p className="mt-1">Trong khi xem, tiến độ chỉ lưu trên thiết bị. Khi đạt đủ {threshold}%, nút gửi mới được mở. Chỉ sau khi Firestore xác nhận lần gửi thành công, giáo viên mới thấy em là “Đã chuẩn bị”.</p></section> : null}
+                {trackingEnabled && !submission ? <section className="rounded-2xl bg-slate-50 p-3 text-xs leading-5 text-slate-600 ring-1 ring-slate-100"><p className="font-black text-slate-800">Cách ghi nhận</p><p className="mt-1">Trong khi xem, tiến độ chỉ lưu trên thiết bị. Khi đạt đủ {threshold}%, nút gửi mới được mở. Sau khi hệ thống ghi nhận lần gửi thành công, giáo viên sẽ thấy trạng thái “Đã chuẩn bị”.</p></section> : null}
 
                 {submission ? <section className={`rounded-2xl p-3 text-xs leading-5 ring-1 ${submittedOnTime ? 'bg-emerald-50 text-emerald-800 ring-emerald-100' : 'bg-amber-50 text-amber-800 ring-amber-100'}`}><p className="font-black">{submittedOnTime ? '✓ Kết quả đã được ghi nhận' : '✓ Kết quả đã được ghi nhận muộn'}</p><p className="mt-1">Thời gian gửi: {formatDateTime(submission.submitted_at)} • Độ phủ khi gửi: {Math.round(submission.watch_percent)}%.</p></section> : null}
 

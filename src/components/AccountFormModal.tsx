@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from 'motion/react';
-import { Check, GraduationCap, Layers3, LoaderCircle, ShieldCheck, UserRound, X } from 'lucide-react';
+import { Check, Eye, EyeOff, GraduationCap, KeyRound, Layers3, LoaderCircle, ShieldCheck, UserRound, X } from 'lucide-react';
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { Account, CatalogClass, Role } from '../types';
 import { DEFAULT_ACTIVE_GRADES, sortGrades } from '../constants';
@@ -9,7 +9,6 @@ interface AccountFormValues {
   ho_ten: string;
   ten_dang_nhap: string;
   mat_khau: string;
-  current_password?: string;
   vai_tro: Role;
   lop_id: string;
   khoi: string;
@@ -70,9 +69,11 @@ export default function AccountFormModal({ isOpen, classes, availableGrades = DE
   const gradeOptions = useMemo(() => sortGrades(availableGrades.length ? availableGrades : DEFAULT_ACTIVE_GRADES), [availableGrades]);
   const [values, setValues] = useState<AccountFormValues>(INITIAL_VALUES);
   const [assignmentError, setAssignmentError] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
 
   useEffect(() => {
     if (!isOpen) return;
+    setShowPassword(false);
     if (initialData) {
       setValues({
         user_id: initialData.user_id,
@@ -224,19 +225,49 @@ export default function AccountFormModal({ isOpen, classes, availableGrades = DE
                       {isStudent && <span className="block text-xs text-indigo-600">Tên đăng nhập được đồng bộ với mã học sinh và giữ cố định sau khi tạo.</span>}
                     </label>
 
-                    <label className="space-y-2">
+                    <div className="space-y-2">
                       <span className="text-sm font-semibold text-slate-700">{isEdit ? 'Mật khẩu mới (để trống nếu giữ nguyên)' : 'Mật khẩu'}</span>
-                      <input type="password" minLength={6} value={values.mat_khau} onChange={(e) => setValues((c) => ({ ...c, mat_khau: e.target.value }))} required={!isEdit} disabled={isStudent && !isEdit} className={fieldClassName} placeholder={isEdit ? 'Nhập khi cần đổi mật khẩu' : isStudent ? 'Tự động lấy theo mã học sinh' : 'Tối thiểu 6 ký tự'} />
+                      <div className="flex flex-col gap-2 sm:flex-row">
+                        <div className="relative min-w-0 flex-1">
+                          <input
+                            type={showPassword ? 'text' : 'password'}
+                            minLength={6}
+                            value={values.mat_khau}
+                            onChange={(e) => setValues((c) => ({ ...c, mat_khau: e.target.value }))}
+                            required={!isEdit}
+                            disabled={isStudent && !isEdit}
+                            autoComplete="new-password"
+                            className={`${fieldClassName} pr-12`}
+                            placeholder={isEdit ? 'Nhập mật khẩu mới' : isStudent ? 'Tự động lấy theo mã học sinh' : 'Tối thiểu 6 ký tự'}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setShowPassword((current) => !current)}
+                            disabled={!values.mat_khau}
+                            className="absolute right-2 top-1/2 inline-flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-xl text-slate-500 transition hover:bg-slate-100 hover:text-indigo-700 disabled:cursor-not-allowed disabled:opacity-35"
+                            aria-label={showPassword ? 'Ẩn mật khẩu' : 'Hiện mật khẩu'}
+                            title={showPassword ? 'Ẩn mật khẩu' : 'Hiện mật khẩu'}
+                          >
+                            {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                          </button>
+                        </div>
+                        {isEdit && (isStudent ? values.ma_hoc_sinh.trim() : true) ? (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setValues((current) => ({ ...current, mat_khau: isStudent ? current.ma_hoc_sinh.trim() : '123456' }));
+                              setShowPassword(false);
+                            }}
+                            className="inline-flex shrink-0 items-center justify-center gap-2 rounded-2xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm font-bold text-indigo-700 transition hover:border-indigo-300 hover:bg-indigo-100"
+                          >
+                            <KeyRound className="h-4 w-4" />
+                            {isStudent ? 'Đặt về mã học sinh' : 'Đặt mật khẩu mặc định'}
+                          </button>
+                        ) : null}
+                      </div>
                       {isStudent && <span className="block text-xs text-indigo-600">Mật khẩu ban đầu/reset mặc định là mã học sinh.</span>}
-                    </label>
-
-                    {isEdit && values.mat_khau && <label className="space-y-2 md:col-span-2">
-                      <span className="text-sm font-semibold text-slate-700">Mật khẩu hiện tại của tài khoản đang sửa</span>
-                      <input type="password" autoComplete="off" value={values.current_password || ''}
-                        onChange={event => setValues(current => ({ ...current, current_password: event.target.value }))}
-                        className={fieldClassName} placeholder="Dùng để xác thực lần đổi mật khẩu này" />
-                      <span className="block text-xs text-slate-600">Không biết mật khẩu hiện tại thì không thể ép đổi mật khẩu Firebase trong mô hình này.</span>
-                    </label>}
+                      {isEdit && <span className="block text-xs font-medium text-emerald-700">Quản trị viên có thể đặt mật khẩu mới trực tiếp, không cần biết mật khẩu hiện tại của tài khoản. Để trống nếu không thay đổi.</span>}
+                    </div>
 
                     <label className="space-y-2">
                       <span className="text-sm font-semibold text-slate-700">Vai trò</span>

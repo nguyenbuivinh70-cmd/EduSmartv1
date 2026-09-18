@@ -79,7 +79,7 @@ export default function Login({ onLoginSuccess, setLoading, showToast }: LoginPr
                       value={email}
                       onChange={(e) => setEmail(e.target.value)}
                       className="w-full rounded-2xl border border-slate-200 bg-slate-50 py-3.5 pl-12 pr-4 text-[15px] text-slate-900 outline-none transition-all placeholder:text-slate-400 focus:border-indigo-500 focus:bg-white focus:ring-4 focus:ring-indigo-500/10"
-                      placeholder="Email Firebase hoặc tên đăng nhập"
+                      placeholder="Tên đăng nhập hoặc email"
                     />
                   </div>
                 </div>

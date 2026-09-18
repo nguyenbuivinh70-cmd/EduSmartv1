@@ -96,11 +96,18 @@ export function getPreLessonVideoAccess(
   const trackingEnabled = lesson?.pre_lesson_enabled !== false && hasVideo;
   const allowWhenLocked = lesson?.pre_lesson_allow_when_locked !== false;
   const reason = lesson?.is_locked === true ? 'locked' : scheduleAccess.reason === 'before_start' ? 'before_start' : null;
+  const lessonMainWindowOpen = lesson?.is_locked !== true && !scheduleAccess.blocked;
+  const preparationWindowAllowed = reason !== null && allowWhenLocked;
   return {
     hasVideo,
     trackingEnabled,
     allowWhenLocked,
-    canWatchNow: hasVideo && allowWhenLocked && reason !== null,
+    // V6.88.10: video chuẩn bị luôn có thể xem trong thời gian bài học đang mở.
+    // pre_lesson_allow_when_locked chỉ quyết định việc xem sớm khi bài đang khóa/
+    // chưa đến giờ. Trước V6.88.10, điều kiện `reason !== null` khiến video biến
+    // mất đúng lúc bài học đã mở, nên học sinh không thể quay lại xem/hoàn thành
+    // nhiệm vụ chuẩn bị.
+    canWatchNow: hasVideo && (lessonMainWindowOpen || preparationWindowAllowed),
     reason,
   };
 }

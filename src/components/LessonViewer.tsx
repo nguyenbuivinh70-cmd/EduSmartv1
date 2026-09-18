@@ -10,6 +10,7 @@ import { getLessonContentApi, getTeachingSessionApi, saveTeachingSessionApi, set
 import { calculateFairAssessmentScore, calculateSectionProgress } from '../utils/learningScoreEngine';
 import { getFirebaseCurrentMemberClassId, subscribeFirebaseTeachingSession } from '../services/firebaseOperational';
 import { isQuizQuestionQualityAcceptable, resolveCorrectOption, sanitizeQuizQuestion } from '../utils/quizSanitizer';
+import { professionalErrorMessage } from '../utils/userMessages';
 
 interface LessonViewerProps {
   isOpen: boolean;
@@ -1200,10 +1201,10 @@ export default function LessonViewer({
     try {
       const ok = onFinalExamSubmit ? await onFinalExamSubmit(snapshot) : true;
       if (ok) finalSubmitPersistedRef.current = submitKey;
-      else setFinalExamSaveError('Bài đã được chấm trên màn hình nhưng chưa đồng bộ được điểm lên hệ thống. Hãy giữ màn hình và thử lại.');
+      else setFinalExamSaveError('Điểm đã được tính nhưng chưa được ghi nhận chính thức. Bài làm của em vẫn được giữ an toàn; hãy thử nộp lại.');
       return Boolean(ok);
     } catch (error) {
-      setFinalExamSaveError(error instanceof Error ? error.message : 'Không đồng bộ được điểm bài kiểm tra.');
+      setFinalExamSaveError(professionalErrorMessage(error, 'Kết quả học tập chưa được đồng bộ. Bài làm của em vẫn được giữ an toàn; hãy thử lại.'));
       return false;
     } finally {
       setFinalExamSaving(false);
@@ -1222,10 +1223,11 @@ export default function LessonViewer({
     }
     if (finalExamSaving) return;
     setSubmitConfirmState(null);
-    // Chốt trạng thái hiển thị trước, sau đó ghi điểm chính thức ngay lên Firestore.
-    setExamSubmitted(true);
+    // V6.88.12: chỉ chuyển giao diện sang trạng thái Đã nộp sau khi
+    // Firestore đã ghi và read-after-write xác minh kết quả chính thức.
     setExamAutoSubmitted(false);
-    await persistSubmittedExam(false);
+    const persisted = await persistSubmittedExam(false);
+    if (persisted) setExamSubmitted(true);
   };
 
   const retryFinalExam = () => {
@@ -1876,7 +1878,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
 
       <section className="rounded-[32px] bg-white p-5 shadow-sm ring-1 ring-slate-100 lg:p-6">
         <div className="mb-4 flex items-center justify-between gap-3">
-          <h3 className="text-lg font-black text-slate-900">Danh sách bình luận/câu hỏi</h3>
+          <div><h3 className="text-lg font-black text-slate-900">Bình luận/Câu hỏi theo bài học</h3><p className="mt-1 text-xs font-semibold text-slate-500">{lesson?.tieu_de || lessonTitle}</p></div>
           {isCommentsLoading ? <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-bold text-slate-500">Đang tải...</span> : null}
         </div>
         {!topLevelComments.length && !isCommentsLoading ? (
@@ -1897,8 +1899,9 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                       {comment.loai === 'cau_hoi' ? <HelpCircle className="h-5 w-5" /> : <MessageCircleMore className="h-5 w-5" />}
                     </div>
                     <div>
-                      <p className="font-black text-slate-900">{comment.ho_ten || comment.user_id || 'Người học'}</p>
-                      <p className="text-xs font-semibold text-slate-400">{commentTypeLabel(comment.loai)} • {formatDateTime(comment.created_at)}{comment.trang_thai === 'resolved' ? ' • Đã xử lý' : ''}</p>
+                      <p className="font-black text-slate-900">{comment.ho_ten || comment.student_name || comment.user_id || 'Người học'}</p>
+                      <p className="text-xs font-semibold text-slate-400">{comment.lop_id ? `${comment.lop_id} • ` : ''}{commentTypeLabel(comment.loai)} • {formatDateTime(comment.created_at)}{comment.trang_thai === 'resolved' ? ' • Đã xử lý' : ''}</p>
+                      <p className="mt-1 text-[11px] font-bold text-indigo-600">{comment.lesson_title || lesson?.tieu_de || lessonTitle}</p>
                     </div>
                   </div>
                   {canModerateComments ? (
@@ -1919,7 +1922,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                     {replies.map((reply) => (
                       <div key={reply.comment_id} className="rounded-2xl bg-indigo-50/70 px-4 py-3">
                         <div className="flex items-center gap-2 text-xs font-semibold text-indigo-700">
-                          <Reply className="h-3.5 w-3.5" /> {reply.ho_ten || reply.user_id || 'Giáo viên'} • {formatDateTime(reply.created_at)}
+                          <Reply className="h-3.5 w-3.5" /> {reply.ho_ten || reply.student_name || reply.user_id || 'Giáo viên'} • {formatDateTime(reply.created_at)}
                         </div>
                         <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-700">{reply.noi_dung}</p>
                       </div>

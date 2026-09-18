@@ -69,7 +69,7 @@ import {
   User,
   VideoPopupConfig,
 } from './types';
-import { AI_MODELS, DEFAULT_ACTIVE_GRADES, DEFAULT_VIDEO_POPUP_CONFIG, VIDEO_POPUP_VIEW_STORAGE_KEY, sortGrades } from './constants';
+import { AI_MODELS, DEFAULT_ACTIVE_GRADES, DEFAULT_VIDEO_POPUP_CONFIG, VIDEO_POPUP_VIEW_STORAGE_KEY, normalizeGeminiModelName, sortGrades } from './constants';
 import { compareStructuredLessons, resolveLessonIdentity } from './utils/lessonCatalog';
 import { getLessonScheduleAccess, getPreLessonVideoAccess } from './utils/lessonAccess';
 import { applyProgressScoreModelV3, finalizeProgressScore } from './utils/learningScoreEngine';
@@ -87,6 +87,7 @@ import {
   deleteAccountApi,
   batchDeleteAccountsApi,
   batchResetPasswordsApi,
+  getAdminPasswordCapabilityApi,
   batchDeleteClassesApi,
   deleteLessonApi,
   analyzeLessonPurgeApi,
@@ -162,6 +163,7 @@ import Layout from './components/Layout';
 import LessonCard from './components/LessonCard';
 import LoadingOverlay from './components/LoadingOverlay';
 import Toast from './components/Toast';
+import { professionalUserMessage } from './utils/userMessages';
 import DataToolbar from './components/DataToolbar';
 import AccountFormModal from './components/AccountFormModal';
 import ClassFormModal from './components/ClassFormModal';
@@ -236,6 +238,8 @@ function mapLessonRow(
       ? row.self_study_scope
       : (row.access_mode === 'self_study' ? 'all' : 'none'),
     self_study_class_ids: Array.isArray(row.self_study_class_ids) ? row.self_study_class_ids.filter(Boolean) : [],
+    self_study_class_access_keys: Array.isArray(row.self_study_class_access_keys) ? row.self_study_class_access_keys.filter(Boolean) : [],
+    self_study_access_version: Number.isFinite(Number(row.self_study_access_version)) ? Number(row.self_study_access_version) : undefined,
     allow_retake_after_completion: row.allow_retake_after_completion === true,
     locked_at: row.locked_at || '',
     locked_by_uid: row.locked_by_uid || '',
@@ -310,6 +314,17 @@ function normalizeClassIdValue(value?: string | null) {
   return String(value ?? '').trim().toUpperCase();
 }
 
+function classIdComparable(value?: string | null) {
+  return normalizeClassIdValue(value).toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function sameClassIdentity(left?: string | null, right?: string | null) {
+  const a = classIdComparable(left);
+  const b = classIdComparable(right);
+  if (!a || !b) return a === b;
+  return a === b || a.endsWith(b) || b.endsWith(a);
+}
+
 function getComputedSchoolYear() {
   const now = new Date();
   const start = now.getMonth() + 1 >= 8 ? now.getFullYear() : now.getFullYear() - 1;
@@ -349,9 +364,10 @@ function sanitizeStoredAIConfig(raw: unknown): AIConfig {
   const config = raw as Partial<AIConfig>;
   const apiKey = String(config.apiKey || '').trim();
   const apiKeyMasked = String(config.apiKeyMasked || '').trim();
+  const requestedModel = String(config.model || AI_MODELS[0]).trim() || AI_MODELS[0];
   return {
     apiKey,
-    model: String(config.model || AI_MODELS[0]).trim() || AI_MODELS[0],
+    model: normalizeGeminiModelName(requestedModel),
     apiKeyMasked: apiKey ? `${apiKey.slice(0, 4)}...${apiKey.slice(-4)}` : apiKeyMasked,
     hasServerKey: Boolean(config.hasServerKey || apiKey),
     updatedAt: String(config.updatedAt || '').trim(),
@@ -528,6 +544,7 @@ function sanitizeProgressRecord(raw: Partial<LessonProgressRecord> | null | unde
 
   return {
     progress_id: String(raw.progress_id),
+    ownerUid: String(raw.ownerUid || ''),
     user_id: String(raw.user_id),
     lesson_id: String(raw.lesson_id),
     lesson_title: String(raw.lesson_title || ''),
@@ -1022,6 +1039,12 @@ const gradeFilterOptions = useMemo(() => {
 }, [classes, user, currentUserIsAdmin]);
 
 const classLabelById = useMemo(() => new Map(classes.map((item) => [item.lop_id, item.ten_lop || item.lop_id])), [classes]);
+  const currentUserClassLabel = useMemo(() => {
+    if (!user?.lop_id) return '';
+    return classes.find((item) => sameClassIdentity(item.lop_id, user.lop_id) || sameClassIdentity(item.ten_lop, user.lop_id))?.ten_lop
+      || classLabelById.get(user.lop_id)
+      || user.lop_id;
+  }, [classes, classLabelById, user?.lop_id]);
 
 const accountClassFilterOptions = useMemo(() => {
   const source = classes
@@ -1062,6 +1085,8 @@ useEffect(() => {
   const [selfStudyAccessLesson, setSelfStudyAccessLesson] = useState<Lesson | null>(null);
   const [selfStudySelectedClassIds, setSelfStudySelectedClassIds] = useState<string[]>([]);
   const [selfStudyAccessSaving, setSelfStudyAccessSaving] = useState(false);
+  const [selfStudyAccessRepairing, setSelfStudyAccessRepairing] = useState(false);
+  const selfStudyIntegrityRepairRef = useRef<Set<string>>(new Set());
   const [isPreLessonVideoOpen, setIsPreLessonVideoOpen] = useState(false);
   const [preLessonVideoLesson, setPreLessonVideoLesson] = useState<Lesson | null>(null);
   const [viewerStage, setViewerStage] = useState<LessonStageKey>('khoi_dong');
@@ -1357,7 +1382,7 @@ useEffect(() => {
     }
   }, [user?.user_id]);
 
-  const showToast = (message: string, type: ToastType) => setToast({ message, type });
+  const showToast = (message: string, type: ToastType) => setToast({ message: professionalUserMessage(message), type });
 
   // Khi học sinh đang ở trong bài, theo dõi metadata bài học theo thời gian thực.
   // Nếu giáo viên khóa bài, viewer đóng ngay và Rules hiện hành đồng thời chặn đọc content.
@@ -1787,7 +1812,7 @@ useEffect(() => {
         return inManagedGrade && (isOwner || lesson.trang_thai === 'approved_shared');
       }
       const sameGrade = !lesson.khoi || !user.khoi || String(lesson.khoi) === String(user.khoi);
-      const classMatches = !lesson.lop_id || !user.lop_id || lesson.lop_id === user.lop_id;
+      const classMatches = !lesson.lop_id || !user.lop_id || sameClassIdentity(lesson.lop_id, user.lop_id);
       const isSharedForStudent = lesson.trang_thai === 'approved_shared' && sameGrade && classMatches;
       return isSharedForStudent;
     });
@@ -1966,10 +1991,13 @@ useEffect(() => {
     const visibleUsers = accounts.filter((item) => item.vai_tro === 'student');
     return progressRecords
       .map((record): StudentLearningAnalyticsRow => {
-        const account = visibleUsers.find((item) => item.user_id === record.user_id);
+        const account = (record.ownerUid
+          ? visibleUsers.find((item) => item.firebase_uid && item.firebase_uid === record.ownerUid)
+          : undefined) || visibleUsers.find((item) => item.user_id === record.user_id);
         const lessonMeta = lessonsById.get(record.lesson_id);
         return {
-          user_id: record.user_id,
+          user_id: account?.user_id || record.user_id,
+          ownerUid: record.ownerUid || account?.firebase_uid,
           ho_ten: account?.ho_ten || record.user_id,
           vai_tro: account?.vai_tro || 'student',
           // Ưu tiên snapshot tại thời điểm học để kết chuyển năm học không làm sai lịch sử.
@@ -2544,7 +2572,10 @@ useEffect(() => {
     delete progressPendingRecordsRef.current[record.progress_id];
     if (res.data) {
       const saved = sanitizeProgressRecord({ ...res.data, save_state: 'saved' })!;
-      setProgressRecordsSync((current) => mergeProgressCollections(current.filter((item) => item.progress_id !== saved.progress_id), [saved]));
+      setProgressRecordsSync((current) => mergeProgressCollections(
+        current.filter((item) => item.progress_id !== record.progress_id && item.progress_id !== saved.progress_id),
+        [saved],
+      ));
     } else {
       setProgressRecordsSync((current) => current.map((item) => item.progress_id === record.progress_id ? { ...item, ...payload, save_state: 'saved' } : item));
     }
@@ -3136,6 +3167,27 @@ useEffect(() => {
     void openCoLearningChoice(selectedLesson, activeCoLearningSession);
   }, [selectedLesson, activeCoLearningSession, user?.vai_tro]);
 
+  const openPreLessonVideo = (lesson: Lesson) => {
+    const scheduleAccess = getLessonScheduleAccess(lesson);
+    const preLessonAccess = getPreLessonVideoAccess(lesson, scheduleAccess);
+    if (!preLessonAccess.hasVideo) {
+      showToast('Bài học này chưa có video chuẩn bị.', 'error');
+      return false;
+    }
+    if (!preLessonAccess.canWatchNow) {
+      showToast(
+        scheduleAccess.reason === 'after_end'
+          ? 'Thời gian học của bài này đã kết thúc nên video chuẩn bị hiện không còn mở.'
+          : 'Video chuẩn bị hiện chưa được mở cho thời điểm này.',
+        'error',
+      );
+      return false;
+    }
+    setPreLessonVideoLesson(lesson);
+    setIsPreLessonVideoOpen(true);
+    return true;
+  };
+
   const openLesson = async (lesson: Lesson) => {
     if (!user) return;
     if (user.vai_tro === 'student') {
@@ -3156,9 +3208,11 @@ useEffect(() => {
 
       const scheduleAccess = getLessonScheduleAccess(lesson);
       const preLessonAccess = getPreLessonVideoAccess(lesson, scheduleAccess);
-      if (preLessonAccess.canWatchNow) {
-        setPreLessonVideoLesson(lesson);
-        setIsPreLessonVideoOpen(true);
+      // V6.88.10: video chuẩn bị chỉ thay thế nút vào bài khi bài chính đang
+      // khóa/chưa đến giờ. Khi bài đã mở, học sinh vào bài bình thường và dùng
+      // nút Video chuẩn bị riêng trên thẻ để xem/xem lại.
+      if (preLessonAccess.canWatchNow && (lesson.is_locked === true || scheduleAccess.reason === 'before_start')) {
+        openPreLessonVideo(lesson);
         return;
       }
       if (lesson.is_locked === true) {
@@ -3875,26 +3929,98 @@ useEffect(() => {
   };
 
   const selfStudyClassOptionsForLesson = (lesson: Lesson) => {
-    if (lesson.lop_id) return classes.filter((item) => item.lop_id === lesson.lop_id);
+    if (lesson.lop_id) return classes.filter((item) => sameClassIdentity(item.lop_id, lesson.lop_id) || sameClassIdentity(item.ten_lop, lesson.lop_id));
     return classes
       .filter((item) => String(item.khoi || '').replace(/\.0+$/, '') === String(lesson.khoi || '').replace(/\.0+$/, ''))
       .sort((a, b) => String(a.ten_lop || a.lop_id).localeCompare(String(b.ten_lop || b.lop_id), 'vi'));
   };
 
-  const openSelfStudyAccessModal = (lesson: Lesson) => {
+  // V6.88.17: tự sửa envelope quyền của các bài tự học lớp cũ ngay khi
+  // quản trị/giáo viên tải danh sách bài. Việc này giúp bài đã cấu hình từ các
+  // phiên bản trước có đủ ID kỹ thuật + tên lớp mà không cần bỏ chọn/chọn lại.
+  useEffect(() => {
+    if (!user || user.vai_tro === 'student' || !lessonRows.length || !classes.length) return;
+    let cancelled = false;
+    void (async () => {
+      for (const lesson of lessonRows) {
+        if (cancelled) return;
+        const scope = lesson.self_study_scope || (lesson.access_mode === 'self_study' ? 'all' : 'none');
+        if (scope !== 'classes' || !(lesson.self_study_class_ids || []).length) continue;
+        const repairKey = `${user.user_id}|${lesson.lesson_id}`;
+        if (selfStudyIntegrityRepairRef.current.has(repairKey)) continue;
+
+        const options = selfStudyClassOptionsForLesson(lesson);
+        const selected = options
+          .filter((item) => (lesson.self_study_class_ids || []).some((id) => sameClassIdentity(id, item.lop_id) || sameClassIdentity(id, item.ten_lop)))
+          .map((item) => item.lop_id);
+        if (!selected.length) continue;
+
+        const exact = (value: unknown) => String(value ?? '').trim().toLocaleLowerCase('vi');
+        const expected = new Set<string>();
+        options.filter((item) => selected.includes(item.lop_id)).forEach((item) => {
+          [item.lop_id, item.ten_lop].forEach((value) => { const key = exact(value); if (key) expected.add(key); });
+        });
+        const current = new Set((lesson.self_study_class_access_keys || []).map(exact).filter(Boolean));
+        const needsRepair = Number(lesson.self_study_access_version || 0) < 5
+          || Array.from(expected).some((key) => !current.has(key));
+        if (!needsRepair) {
+          selfStudyIntegrityRepairRef.current.add(repairKey);
+          continue;
+        }
+
+        selfStudyIntegrityRepairRef.current.add(repairKey);
+        const repaired = await setLessonSelfStudyAccessApi(user.token, lesson.lesson_id, 'classes', selected);
+        if (!repaired.ok || !repaired.data || cancelled) continue;
+        setLessonRows((items) => items.map((item) => item.lesson_id === lesson.lesson_id ? { ...item, ...repaired.data } : item));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [user, lessonRows, classes]);
+
+  const openSelfStudyAccessModal = async (lesson: Lesson) => {
     const options = selfStudyClassOptionsForLesson(lesson);
     const scope = lesson.self_study_scope || (lesson.access_mode === 'self_study' ? 'all' : 'none');
     const selected = scope === 'all'
       ? options.map((item) => item.lop_id)
       : scope === 'classes'
-        ? (lesson.self_study_class_ids || []).filter((id) => options.some((item) => item.lop_id === id))
+        ? options.filter((item) => (lesson.self_study_class_ids || []).some((id) => sameClassIdentity(id, item.lop_id) || sameClassIdentity(id, item.ten_lop))).map((item) => item.lop_id)
         : [];
     setSelfStudyAccessLesson(lesson);
     setSelfStudySelectedClassIds(selected);
+
+    // V6.88.17: các bài cũ có thể chỉ lưu class ID mà chưa có alias tên lớp.
+    // Khi người quản lý mở hộp phạm vi tự học, tự sửa envelope quyền một lần để
+    // Firestore Rules và frontend dùng đúng cùng bộ class access keys.
+    if (user && scope === 'classes' && selected.length) {
+      const exactKey = (value: unknown) => String(value ?? '').trim().toLocaleLowerCase('vi');
+      const expectedKeys = new Set<string>();
+      options.filter((item) => selected.includes(item.lop_id)).forEach((item) => {
+        [item.lop_id, item.ten_lop].forEach((value) => {
+          const key = exactKey(value);
+          if (key) expectedKeys.add(key);
+        });
+      });
+      const currentKeys = new Set((lesson.self_study_class_access_keys || []).map(exactKey).filter(Boolean));
+      const needsRepair = Number(lesson.self_study_access_version || 0) < 5
+        || Array.from(expectedKeys).some((key) => !currentKeys.has(key));
+      if (needsRepair) {
+        setSelfStudyAccessRepairing(true);
+        const repair = await setLessonSelfStudyAccessApi(user.token, lesson.lesson_id, 'classes', selected);
+        setSelfStudyAccessRepairing(false);
+        if (repair.ok && repair.data) {
+          const repaired = mapLessonRow(repair.data, subjects, classes, accounts, user);
+          setLessonRows((current) => current.map((item) => item.lesson_id === repaired.lesson_id ? { ...item, ...repair.data } : item));
+          setSelectedLesson((current) => current?.lesson_id === repaired.lesson_id ? { ...current, ...repaired } : current);
+          setSelfStudyAccessLesson(repaired);
+        } else if (!handleSessionError(repair.message)) {
+          showToast('Phạm vi tự học cũ chưa đồng bộ hoàn toàn. Hãy bấm “Lưu phạm vi tự học” để hoàn tất cập nhật.', 'info');
+        }
+      }
+    }
   };
 
   const saveSelfStudyAccess = async () => {
-    if (!user || !selfStudyAccessLesson || selfStudyAccessSaving) return;
+    if (!user || !selfStudyAccessLesson || selfStudyAccessSaving || selfStudyAccessRepairing) return;
     const options = selfStudyClassOptionsForLesson(selfStudyAccessLesson);
     const allIds = options.map((item) => item.lop_id);
     const selected: string[] = Array.from(new Set<string>(selfStudySelectedClassIds.filter((id) => allIds.includes(id))));
@@ -3918,7 +4044,7 @@ useEffect(() => {
 
   // Tương thích hành vi cũ: nút nhanh nay mở trình quản lý phạm vi theo lớp.
   const handleToggleLessonAccessMode = async (lesson: Lesson) => {
-    openSelfStudyAccessModal(lesson);
+    await openSelfStudyAccessModal(lesson);
   };
 
   const handleSubmitReview = async (lesson: Lesson) => {
@@ -4104,19 +4230,32 @@ useEffect(() => {
     const sanitizedPayload = { ...payload };
     if (!sanitizedPayload.mat_khau) delete sanitizedPayload.mat_khau;
     const action = payload.user_id ? updateAccountApi : createAccountApi;
+    const changingExistingPassword = Boolean(payload.user_id && sanitizedPayload.mat_khau);
     const res = await withLoading(payload.user_id ? 'Đang cập nhật tài khoản...' : 'Đang tạo tài khoản...', async () => {
       const firebaseIdToken = user.auth_provider === 'firebase' ? await getFirebaseIdToken(true) : '';
+      if (changingExistingPassword) {
+        const capability = await getAdminPasswordCapabilityApi(user.token, firebaseIdToken);
+        if (!capability.ok) {
+          return {
+            ok: false as const,
+            message: capability.message?.trim() || 'Chức năng đặt lại mật khẩu chưa sẵn sàng. Vui lòng tải lại trang và thử lại.',
+          };
+        }
+      }
       return action(user.token, sanitizedPayload, firebaseIdToken);
     });
     setIsSubmitting(false);
     if (!res.ok) {
-      if (!handleSessionError(res.message)) showToast(res.message, 'error');
+      const errorMessage = res.message?.trim() || (changingExistingPassword
+        ? 'Chưa đặt được mật khẩu mới. Vui lòng tải lại tài khoản và thử lại.'
+        : 'Không cập nhật được tài khoản. Hãy tải lại dữ liệu và thử lại.');
+      if (!handleSessionError(errorMessage)) showToast(errorMessage, 'error');
       return;
     }
     setIsAccountModalOpen(false);
     setEditingAccount(null);
     await loadAppData();
-    showToast(payload.user_id ? 'Đã cập nhật tài khoản' : 'Đã tạo tài khoản mới', 'success');
+    showToast(payload.user_id ? (changingExistingPassword ? 'Đã cập nhật tài khoản và đặt mật khẩu mới' : 'Đã cập nhật tài khoản') : 'Đã tạo tài khoản mới', 'success');
   };
 
   const refreshAfterAccountDeletion = async () => {
@@ -4209,22 +4348,30 @@ useEffect(() => {
     setConfirmDialog({
       isOpen: true,
       title: `Reset mật khẩu ${selectedAccounts.length} tài khoản`,
-      description: `Bạn sắp reset mật khẩu các tài khoản đã chọn: ${previewNames}${moreText}. ${passwordPolicyText}. Chỉ tài khoản xác thực được bằng mật khẩu hiện tại mới được đổi mật khẩu. Các tài khoản còn lại sẽ báo lỗi riêng.`,
+      description: `Bạn sắp reset mật khẩu các tài khoản đã chọn: ${previewNames}${moreText}. ${passwordPolicyText}. Không cần mật khẩu hiện tại; hệ thống sẽ đặt lại trực tiếp và đăng xuất các phiên cũ của tài khoản sau khi hoàn tất.`,
       confirmLabel: 'Reset mật khẩu mặc định',
       cancelLabel: 'Hủy',
       variant: 'primary',
       accountOperation: 'reset',
-      onConfirm: async (credentials) => {
+      onConfirm: async () => {
         if (!user) return;
         const ids = selectedAccounts.map((item) => item.user_id);
         setIsSubmitting(true);
         const res = await withLoading('Đang reset mật khẩu các tài khoản đã chọn...', async () => {
           const firebaseIdToken = user.auth_provider === 'firebase' ? await getFirebaseIdToken(true) : '';
-          return batchResetPasswordsApi(user.token, ids, '123456', firebaseIdToken, credentials);
+          const capability = await getAdminPasswordCapabilityApi(user.token, firebaseIdToken);
+          if (!capability.ok) {
+            return {
+              ok: false as const,
+              message: capability.message?.trim() || 'Chức năng đặt lại mật khẩu chưa sẵn sàng. Vui lòng tải lại trang và thử lại.',
+            };
+          }
+          return batchResetPasswordsApi(user.token, ids, '123456', firebaseIdToken);
         });
         setIsSubmitting(false);
         if (!res.ok) {
-          if (!handleSessionError(res.message)) showToast(res.message || 'Không reset được mật khẩu.', 'error');
+          const errorMessage = res.message?.trim() || 'Chưa đặt lại được mật khẩu cho các tài khoản đã chọn. Vui lòng tải lại và thử lại.';
+          if (!handleSessionError(errorMessage)) showToast(errorMessage, 'error');
           return;
         }
         setConfirmDialog(DEFAULT_CONFIRM);
@@ -5085,7 +5232,7 @@ useEffect(() => {
                     <Sparkles className="h-3.5 w-3.5" /> Học theo 4 chặng • AI đồng hành
                   </span>
                   <span className="rounded-full bg-white/10 px-3 py-1 text-[11px] font-semibold text-white/85">Khối {user.khoi || '-'}</span>
-                  {user.lop_id ? <span className="rounded-full bg-white/10 px-3 py-1 text-[11px] font-semibold text-white/85">{user.lop_id}</span> : null}
+                  {user.lop_id ? <span className="rounded-full bg-white/10 px-3 py-1 text-[11px] font-semibold text-white/85">{currentUserClassLabel}</span> : null}
                 </div>
                 <h1 className="mt-3 text-2xl font-black tracking-tight sm:text-[30px]">Bài học của em</h1>
                 <p className="mt-1.5 max-w-3xl text-sm leading-6 text-white/85">
@@ -5153,6 +5300,7 @@ useEffect(() => {
                   key={lesson.lesson_id}
                   lesson={lesson}
                   onClick={() => openLesson(lesson)}
+                  onPreLessonClick={() => openPreLessonVideo(lesson)}
                   variant="student"
                   highlight={index === 0 && lesson.is_locked !== true}
                   progress={currentStudentProgressByLesson[lesson.lesson_id] || null}
@@ -6100,7 +6248,7 @@ useEffect(() => {
                     ['Tên đăng nhập', user.ten_dang_nhap],
                     ['Vai trò', getRoleLabel(user)],
                     ['Khối', user.vai_tro === 'teacher' ? formatManagedGrades(user) : (user.khoi || '-')],
-                    ['Lớp', user.vai_tro === 'teacher' ? 'Không áp dụng' : (user.lop_id || '-')],
+                    ['Lớp', user.vai_tro === 'teacher' ? 'Không áp dụng' : (currentUserClassLabel || '-')],
                   ].map((row) => (
                     <tr key={String(row[0])} className="border-b border-slate-50 last:border-0">
                       <td className="px-3 py-3 font-medium text-slate-700">{row[0]}</td>
@@ -6120,7 +6268,7 @@ useEffect(() => {
 
   return (
     <>
-      <Layout user={user} onLogout={handleLogout} activeMenu={activeMenu} setActiveMenu={setActiveMenu}>
+      <Layout user={user} classes={classes} onLogout={handleLogout} activeMenu={activeMenu} setActiveMenu={setActiveMenu}>
         <Suspense fallback={<DataModuleSkeleton message="Đang tải mô-đun chức năng..." />}>
           {(isCoreDataLoading || isMenuDataLoading)
             ? <DataModuleSkeleton message={isCoreDataLoading ? 'Đang đồng bộ danh mục cốt lõi từ Firebase...' : menuLoadingMessage} />
@@ -6173,11 +6321,11 @@ useEffect(() => {
       />
 
       {selfStudyAccessLesson ? (
-        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-slate-950/55 p-4" onClick={() => !selfStudyAccessSaving && setSelfStudyAccessLesson(null)}>
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-slate-950/55 p-4" onClick={() => !(selfStudyAccessSaving || selfStudyAccessRepairing) && setSelfStudyAccessLesson(null)}>
           <div className="w-full max-w-xl overflow-hidden rounded-3xl bg-white shadow-2xl" onClick={(event) => event.stopPropagation()}>
             <div className="flex items-start justify-between bg-gradient-to-r from-indigo-600 to-violet-600 px-6 py-5 text-white">
               <div><p className="text-xs font-black uppercase tracking-[0.18em] text-indigo-100">Quản lý tự học theo lớp</p><h3 className="mt-1 text-xl font-black">{selfStudyAccessLesson.tieu_de}</h3><p className="mt-1 text-sm text-indigo-100">Chọn một hoặc nhiều lớp được phép tự mở toàn bộ hoạt động.</p></div>
-              <button type="button" disabled={selfStudyAccessSaving} onClick={() => setSelfStudyAccessLesson(null)} className="rounded-xl bg-white/15 p-2 hover:bg-white/25 disabled:opacity-50"><XCircle className="h-5 w-5" /></button>
+              <button type="button" disabled={selfStudyAccessSaving || selfStudyAccessRepairing} onClick={() => setSelfStudyAccessLesson(null)} className="rounded-xl bg-white/15 p-2 hover:bg-white/25 disabled:opacity-50"><XCircle className="h-5 w-5" /></button>
             </div>
             <div className="p-6">
               {(() => {
@@ -6200,13 +6348,13 @@ useEffect(() => {
                     })}
                     {!options.length ? <div className="rounded-2xl bg-amber-50 p-4 text-sm text-amber-700">Chưa tìm thấy lớp phù hợp với khối của bài học.</div> : null}
                   </div>
-                  <div className="mt-5 rounded-2xl bg-slate-50 p-4 text-xs leading-5 text-slate-600">Khóa tự học không phải khóa toàn bài. Lớp chưa được mở tự học vẫn có thể học theo các hoạt động giáo viên mở từng mục. {allSelected ? 'Hiện tất cả lớp đều được tự học.' : ''}</div>
+                  <div className="mt-5 rounded-2xl bg-slate-50 p-4 text-xs leading-5 text-slate-600">Khóa tự học không phải khóa toàn bài. Lớp chưa được mở tự học vẫn có thể học theo các hoạt động giáo viên mở từng mục. {allSelected ? 'Hiện tất cả lớp đều được tự học.' : ''} {selfStudyAccessRepairing ? 'Hệ thống đang đồng bộ quyền truy cập của các lớp đã chọn…' : 'Quyền truy cập được đồng bộ tự động theo tên lớp và mã lớp.'}</div>
                 </>;
               })()}
             </div>
             <div className="flex justify-end gap-2 border-t border-slate-100 px-6 py-4">
-              <button type="button" disabled={selfStudyAccessSaving} onClick={() => setSelfStudyAccessLesson(null)} className="rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-bold text-slate-600">Hủy</button>
-              <button type="button" disabled={selfStudyAccessSaving} onClick={() => void saveSelfStudyAccess()} className="rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-bold text-white shadow-lg shadow-indigo-200 disabled:opacity-60">{selfStudyAccessSaving ? 'Đang lưu...' : 'Lưu phạm vi tự học'}</button>
+              <button type="button" disabled={selfStudyAccessSaving || selfStudyAccessRepairing} onClick={() => setSelfStudyAccessLesson(null)} className="rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-bold text-slate-600">Hủy</button>
+              <button type="button" disabled={selfStudyAccessSaving || selfStudyAccessRepairing} onClick={() => void saveSelfStudyAccess()} className="rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-bold text-white shadow-lg shadow-indigo-200 disabled:opacity-60">{selfStudyAccessRepairing ? 'Đang đồng bộ...' : selfStudyAccessSaving ? 'Đang lưu...' : 'Lưu phạm vi tự học'}</button>
             </div>
           </div>
         </div>

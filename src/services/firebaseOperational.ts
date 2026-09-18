@@ -60,8 +60,8 @@ let bootstrapPromise: { uid: string; value: Promise<Record<string, any[]>> } | n
 let lessonPublishRulesVerifiedKey = '';
 let selfStudyRulesVerifiedKey = '';
 const LESSON_PUBLISH_CAPABILITY = 'lesson_publish_v2';
-const LESSON_PUBLISH_RULES_LABEL = 'V6.88.5';
-const CLASS_SCOPED_SELF_STUDY_CAPABILITY = 'class_scoped_self_study_v1';
+const LESSON_PUBLISH_RULES_LABEL = 'V6.88.17';
+const CLASS_SCOPED_SELF_STUDY_CAPABILITY = 'class_scoped_self_study_v5';
 
 function clean(value: unknown) { return value == null ? '' : String(value).trim(); }
 function sameGrade(left: unknown, right: unknown) { return clean(left).replace(/\.0+$/, '') === clean(right).replace(/\.0+$/, ''); }
@@ -295,8 +295,8 @@ function matchesMemberAudience(data: any, member: any) {
   const requiredGrade = clean(data?.khoi);
   const currentClass = clean(member?.classId);
   const currentGrade = clean(member?.grade);
-  const matchesMetadata = (!requiredClass || requiredClass === currentClass)
-    && (!requiredGrade || requiredGrade === currentGrade);
+  const matchesMetadata = (!requiredClass || sameClassId(requiredClass, currentClass))
+    && (!requiredGrade || sameGrade(requiredGrade, currentGrade));
   if (requiredClass || requiredGrade) return matchesMetadata;
 
   // Tài liệu dùng chung toàn trường và tài liệu cũ chưa có audienceKeys.
@@ -422,6 +422,8 @@ function row(data: any, lessonId: string): LessonRow {
       ? data.self_study_scope
       : (data.access_mode === 'self_study' ? 'all' : 'none'),
     self_study_class_ids: cleanStringList(data.self_study_class_ids),
+    self_study_class_access_keys: cleanStringList(data.self_study_class_access_keys),
+    self_study_access_version: Number.isFinite(Number(data.self_study_access_version)) ? Number(data.self_study_access_version) : undefined,
     allow_retake_after_completion: data.allow_retake_after_completion === true,
     locked_at: clean(data.locked_at), locked_by_uid: clean(data.locked_by_uid), locked_by_name: clean(data.locked_by_name),
     intro_video_url: clean(data.intro_video_url), intro_video_embed_url: clean(data.intro_video_embed_url),
@@ -451,7 +453,11 @@ function selfStudyEnabledForClass(data: any, classId: unknown) {
   if (scope === 'all') return true;
   if (scope !== 'classes') return false;
   const normalizedClass = clean(classId);
-  return Boolean(normalizedClass && cleanStringList(data?.self_study_class_ids).some((item) => sameClassId(item, normalizedClass)));
+  const configured = [
+    ...cleanStringList(data?.self_study_class_ids),
+    ...cleanStringList(data?.self_study_class_access_keys),
+  ];
+  return Boolean(normalizedClass && configured.some((item) => sameClassId(item, normalizedClass)));
 }
 
 function rowForViewer(data: any, id: string, me: any): LessonRow {
@@ -463,6 +469,7 @@ function rowForViewer(data: any, id: string, me: any): LessonRow {
     access_mode: enabled ? 'self_study' : 'teacher_controlled',
     self_study_scope: resolveSelfStudyScope(data),
     self_study_class_ids: cleanStringList(data?.self_study_class_ids),
+    self_study_class_access_keys: cleanStringList(data?.self_study_class_access_keys),
   };
 }
 
@@ -509,14 +516,20 @@ export async function listFirebaseLessons(filters: Record<string, unknown> = {})
       if (!teacherCanManageGrade(me, item.khoi)) return false;
       if (item.pham_vi !== 'shared' && item.nguoi_tao_id !== clean(me.userId)) return false;
     }
-    if (me.role === 'student' && (source.content_status === 'preparing' || !matchesMemberAudience(source, me))) return false;
+    if (me.role === 'student') {
+      if (source.content_status === 'preparing') return false;
+      // V6.88.10: một lớp được giáo viên mở tự học là một phạm vi truy cập rõ
+      // ràng. Không để metadata lớp/khối legacy trên lesson/member làm thẻ bài bị
+      // ẩn dù giáo viên đã chọn đúng lớp trong Quản lý tự học.
+      if (!matchesMemberAudience(source, me) && !selfStudyEnabledForClass(source, me.classId)) return false;
+    }
     return true;
   }).map(({ lesson }) => lesson)
     .sort((left, right) => clean(right.updated_at).localeCompare(clean(left.updated_at)));
 }
 
 
-export async function getFirebaseLesson(lessonId: string): Promise<LessonContentResponse | null> {
+export async function getFirebaseLesson(lessonId: string, selfStudyRetry = 0): Promise<LessonContentResponse | null> {
   const me = await identity();
   let metadataSnap;
   try {
@@ -524,7 +537,7 @@ export async function getFirebaseLesson(lessonId: string): Promise<LessonContent
   } catch (error) {
     const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: unknown }).code || '') : '';
     if (code === 'permission-denied' || code === 'firestore/permission-denied') {
-      throw new Error('Firestore đã cho thấy bài trong danh sách nhưng từ chối đọc metadata bài theo ID. Hãy xác minh Firestore Rules hiện hành, trạng thái tài khoản và phạm vi lớp/khối.');
+      throw Object.assign(new Error('Chưa thể mở bài học lúc này. Em hãy tải lại danh sách bài học và thử lại.'), { diagnosticCode: 'LESSON_METADATA_READ_DENIED' });
     }
     throw error;
   }
@@ -532,8 +545,9 @@ export async function getFirebaseLesson(lessonId: string): Promise<LessonContent
   const data = metadataSnap.data() as any;
   const lesson = rowForViewer(data, metadataSnap.id, me);
   if (me.role === 'student') {
-    if (!matchesMemberAudience(data, me)) {
-      throw new Error(`Bài học không khớp phạm vi tài khoản hiện tại (học sinh: khối ${clean(me.grade) || '-'}, lớp ${clean(me.classId) || '-'}; bài: khối ${clean(data.khoi) || '-'}, lớp ${clean(data.lop_id) || 'dùng chung'}).`);
+    const selfStudyAccess = selfStudyEnabledForClass(data, me.classId);
+    if (!matchesMemberAudience(data, me) && !selfStudyAccess) {
+      throw new Error('Bài học hiện chưa được mở cho lớp của em. Em hãy tải lại danh sách bài học hoặc liên hệ giáo viên.');
     }
     if (lesson.is_locked === true) {
       throw new Error('Bài học hiện đang được giáo viên khóa. Em hãy chờ giáo viên mở bài rồi thử lại.');
@@ -594,10 +608,35 @@ export async function getFirebaseLesson(lessonId: string): Promise<LessonContent
         if (selfStudy && selfStudyLoadErrors.length) {
           const denied = selfStudyLoadErrors.filter((item) => item.includes('permission-denied'));
           if (denied.length === selfStudyLoadErrors.length) {
-            const scope = resolveSelfStudyScope(data);
-            throw new Error(`Firestore đã cho phép học sinh thấy bài nhưng đang từ chối đọc các hoạt động tự học (${selfStudyLoadErrors.join(', ')}). Phạm vi tự học: ${scope}${scope === 'classes' ? `; lớp hiện tại: ${clean(me.classId) || '-'}` : ''}. Hãy deploy Firestore Rules ${LESSON_PUBLISH_RULES_LABEL}, chờ Rules cập nhật rồi đăng xuất/đăng nhập lại. [SELF_STUDY_ACTIVITY_READ_DENIED]`);
+            // V6.88.17: một lần làm mới danh tính/token trước khi kết luận quyền tự học
+            // bị từ chối. Điều này xử lý phiên học sinh còn cache classId cũ sau khi
+            // roster/member vừa được đồng bộ mà không làm lặp request vô hạn.
+            if (selfStudyRetry < 1) {
+              try {
+                clearFirebaseIdentityCache();
+                await firebaseAuth.currentUser?.getIdToken(true);
+                await identity();
+                return await getFirebaseLesson(lessonId, selfStudyRetry + 1);
+              } catch (retryError) {
+                console.warn('[EduSmart][SelfStudy] Identity refresh retry did not restore activity access', {
+                  lessonId,
+                  error: firebaseErrorMessage(retryError),
+                });
+              }
+            }
+            throw Object.assign(new Error('Chưa thể mở đầy đủ nội dung tự học lúc này. Em hãy tải lại bài học và thử lại.'), {
+              diagnosticCode: 'SELF_STUDY_ACTIVITY_READ_DENIED',
+              technicalDetail: [
+                selfStudyLoadErrors.join(', '),
+                `class=${clean(me.classId)}`,
+                `scope=${resolveSelfStudyScope(data)}`,
+                `ids=${cleanStringList(data.self_study_class_ids).join('|')}`,
+                `keys=${cleanStringList(data.self_study_class_access_keys).join('|')}`,
+                `accessV=${Number(data.self_study_access_version || 0)}`,
+              ].join('; '),
+            });
           }
-          throw new Error(`Không tải được đầy đủ nội dung tự học (${selfStudyLoadErrors.join(', ')}). Hãy xác minh Firestore Rules hiện hành rồi mở lại bài học. [SELF_STUDY_ACTIVITY_LOAD_INCOMPLETE]`);
+          throw Object.assign(new Error('Một số nội dung của bài học chưa tải xong. Em hãy tải lại bài học và thử lại.'), { diagnosticCode: 'SELF_STUDY_ACTIVITY_LOAD_INCOMPLETE', technicalDetail: selfStudyLoadErrors.join(', ') });
         }
         lessonJson = { ...lessonJson, activities: activityDocs, teaching_session: session };
       } else {
@@ -617,7 +656,7 @@ export async function getFirebaseLesson(lessonId: string): Promise<LessonContent
   } catch (error) {
     const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: unknown }).code || '') : '';
     if (code === 'permission-denied' || code === 'firestore/permission-denied') {
-      throw new Error('Firestore đã cho phép đọc metadata nhưng từ chối document nội dung. Hãy xác minh Firestore Rules hiện hành và quyền truy cập bài học.');
+      throw Object.assign(new Error('Nội dung bài học chưa tải được đầy đủ. Em hãy tải lại bài học và thử lại.'), { diagnosticCode: 'LESSON_CONTENT_READ_DENIED' });
     }
     throw error;
   }
@@ -667,7 +706,7 @@ async function verifyClassScopedSelfStudyRulesCapability(uid: string, grade: unk
     selfStudyRulesVerifiedKey = capabilityKey;
   } catch (error) {
     if (firebaseErrorCode(error).includes('permission-denied')) {
-      throw new Error(`Firestore Rules hiện hành chưa hỗ trợ tự học theo lớp an toàn. Hãy deploy Rules ${LESSON_PUBLISH_RULES_LABEL} rồi đăng xuất/đăng nhập lại. [SELF_STUDY_RULES_CAPABILITY_DENIED]`);
+      throw Object.assign(new Error('Chưa thể cập nhật phạm vi tự học theo lớp. Vui lòng tải lại và thử lại.'), { diagnosticCode: 'SELF_STUDY_RULES_CAPABILITY_DENIED' });
     }
     throw error;
   }
@@ -681,6 +720,25 @@ async function verifyClassScopedSelfStudyRulesCapability(uid: string, grade: unk
       error: firebaseErrorMessage(cleanupError),
     });
   }
+}
+
+async function resolveSelfStudyClassAccessKeys(classIds: string[]) {
+  const keys = new Set<string>();
+  const normalizedIds = Array.from(new Set(classIds.map(clean).filter(Boolean)));
+  await Promise.all(normalizedIds.map(async (classId) => {
+    keys.add(classId);
+    // Alias rút gọn phổ biến: L9_C3 -> 9C3. Chỉ dùng làm khóa tương thích,
+    // không thay ID kỹ thuật đang lưu trong dữ liệu.
+    const compact = classId.toUpperCase().match(/^L?(\d+)[_\-\s]*C?(\d+)$/);
+    if (compact) keys.add(`${compact[1]}C${compact[2]}`);
+    try {
+      const classSnap = await getDoc(doc(school(), 'classes', classId));
+      if (!classSnap.exists()) return;
+      const classData = classSnap.data() as any;
+      [classData?.lop_id, classData?.ten_lop].map(clean).filter(Boolean).forEach((value) => keys.add(value));
+    } catch { /* alias lookup is best effort; ID canonical vẫn được giữ */ }
+  }));
+  return Array.from(keys);
 }
 
 export async function setFirebaseLessonSelfStudyAccess(lessonId: string, scope: SelfStudyScope, classIds: string[] = []) {
@@ -700,10 +758,15 @@ export async function setFirebaseLessonSelfStudyAccess(lessonId: string, scope: 
   if (normalizedScope === 'classes') {
     await verifyClassScopedSelfStudyRulesCapability(me.uid, current.khoi);
   }
+  const classAccessKeys = normalizedScope === 'classes'
+    ? await resolveSelfStudyClassAccessKeys(normalizedClassIds)
+    : [];
   const now = new Date().toISOString();
   const patch = withoutUndefined({
     self_study_scope: normalizedScope,
     self_study_class_ids: normalizedScope === 'classes' ? normalizedClassIds : [],
+    self_study_class_access_keys: classAccessKeys,
+    self_study_access_version: 5,
     access_mode: normalizedScope === 'all' ? 'self_study' : 'teacher_controlled',
     updated_at: now,
     updatedAt: serverTimestamp(),
@@ -1237,6 +1300,10 @@ export async function saveFirebaseLesson(payload: LessonComposerValues, updating
         ? resolveSelfStudyScope(existingData)
         : (normalizedPayload.access_mode === 'self_study' ? 'all' : 'none'),
       self_study_class_ids: existingData ? cleanStringList(existingData.self_study_class_ids) : [],
+      self_study_class_access_keys: existingData ? cleanStringList(existingData.self_study_class_access_keys) : [],
+      self_study_access_version: existingData && Number.isFinite(Number(existingData.self_study_access_version))
+        ? Number(existingData.self_study_access_version)
+        : (existingData && resolveSelfStudyScope(existingData) === 'classes' ? 4 : 5),
       access_mode: existingData && resolveSelfStudyScope(existingData) === 'classes'
         ? 'teacher_controlled'
         : (normalizedPayload.access_mode === 'self_study' ? 'self_study' : 'teacher_controlled'),
@@ -2596,8 +2663,8 @@ export async function getFirebasePreLessonSubmission(lessonId: string): Promise<
     return normalized.video_revision === videoRevision ? normalized : null;
   } catch (error) {
     const code = String((error as any)?.code || '').toLowerCase();
-    if (code.includes('permission-denied')) throw preLessonSyncError('PRELESSON_SUBMISSION_LOAD_DENIED', 'Firestore từ chối đọc kết quả chuẩn bị bài đã gửi.', error);
-    if (code.includes('unavailable') || code.includes('network') || code.includes('offline')) throw preLessonSyncError('PRELESSON_NETWORK', 'Không thể đọc kết quả chuẩn bị bài do kết nối Firestore chưa ổn định.', error);
+    if (code.includes('permission-denied')) throw preLessonSyncError('PRELESSON_SUBMISSION_LOAD_DENIED', 'Chưa tải được trạng thái kết quả chuẩn bị bài. Tiến độ xem của em vẫn được giữ.', error);
+    if (code.includes('unavailable') || code.includes('network') || code.includes('offline')) throw preLessonSyncError('PRELESSON_NETWORK', 'Kết nối đang gián đoạn. Tiến độ xem của em vẫn được giữ.', error);
     throw error;
   }
 }
@@ -2633,20 +2700,25 @@ export async function submitFirebasePreLessonSubmission(
     return normalizePreLessonSubmissionData(current.id, current.data() as any, { lessonId: normalizedLessonId, lessonData, memberData: me });
   }
 
-  // V6.88.0: security envelope tối giản. Không ghi lớp/khối/deadline/status vào
-  // document để tránh Rules phụ thuộc dữ liệu legacy. Giáo viên suy ra lớp/khối
-  // từ member profile và trạng thái đúng hạn từ submittedAt + deadline bài học.
-  const data = withoutUndefined({
-    schemaVersion: 3,
-    lessonId: normalizedLessonId,
-    user_id: clean(me.userId),
-    ownerUid: clean(me.uid),
-    videoRevision,
-    watchPercent: percent,
-    watchedSeconds: watched,
-    durationSeconds: duration,
+  // V6.88.6: security envelope thực sự tối giản và gắn với Firebase Auth UID.
+  // Không lặp lại user_id/lớp/khối/deadline/status từ client. Trước đây schema v3
+  // vẫn ghi user_id rồi Rules so sánh với member.userId; hồ sơ legacy có kiểu/field
+  // khác nhau có thể đọc bài bình thường nhưng bị permission-denied khi nộp kết quả.
+  // Teacher analytics suy ra user_id/lớp/khối từ member document bằng ownerUid.
+  // V6.88.12: làm sạch các giá trị primitive trước, sau đó mới gắn
+  // serverTimestamp() để FieldValue của Firestore không bị duyệt đệ quy.
+  const data = {
+    ...withoutUndefined({
+      schemaVersion: 4,
+      lessonId: normalizedLessonId,
+      ownerUid: clean(me.uid),
+      videoRevision,
+      watchPercent: percent,
+      watchedSeconds: watched,
+      durationSeconds: duration,
+    }),
     submittedAt: serverTimestamp(),
-  });
+  };
 
   try {
     await setDoc(ref, data, { merge: false });
@@ -2658,25 +2730,25 @@ export async function submitFirebasePreLessonSubmission(
       const after = await getDoc(ref);
       if (after.exists()) return normalizePreLessonSubmissionData(after.id, after.data() as any, { lessonId: normalizedLessonId, lessonData, memberData: me });
     } catch { /* giữ lỗi gốc */ }
-    if (code.includes('permission-denied')) throw preLessonSyncError('PRELESSON_SUBMIT_DENIED', 'Firestore từ chối ghi kết quả chuẩn bị bài. Hãy xác minh Firestore Rules hiện hành đã được deploy.', error);
+    if (code.includes('permission-denied')) throw preLessonSyncError('PRELESSON_SUBMIT_RULES_DENIED', 'Chưa gửi được kết quả chuẩn bị bài. Tiến độ xem của em vẫn được giữ an toàn; hãy thử gửi lại.', error);
     if (code.includes('unavailable') || code.includes('network') || code.includes('offline')) throw preLessonSyncError('PRELESSON_NETWORK', 'Mạng chưa ổn định khi gửi kết quả chuẩn bị bài.', error);
     throw error;
   }
 
   try {
     const verify = await getDoc(ref);
-    if (!verify.exists()) throw preLessonSyncError('PRELESSON_SUBMIT_VERIFY_FAILED', 'Đã gửi nhưng chưa xác minh được kết quả chuẩn bị bài.');
+    if (!verify.exists()) throw preLessonSyncError('PRELESSON_SUBMIT_VERIFY_FAILED', 'Kết quả đang được đồng bộ. Tiến độ xem của em vẫn được giữ an toàn.');
     const result = normalizePreLessonSubmissionData(verify.id, verify.data() as any, { lessonId: normalizedLessonId, lessonData, memberData: me });
     if (result.video_revision !== videoRevision || Number(result.watch_percent || 0) + 0.001 < threshold) {
-      throw preLessonSyncError('PRELESSON_SUBMIT_VERIFY_FAILED', 'Kết quả chuẩn bị bài trên Firestore chưa khớp dữ liệu vừa gửi.');
+      throw preLessonSyncError('PRELESSON_SUBMIT_VERIFY_FAILED', 'Kết quả chuẩn bị bài đang được đồng bộ. Vui lòng thử lại sau ít phút.');
     }
     return result;
   } catch (error) {
     if ((error as any)?.diagnosticCode) throw error;
     const code = String((error as any)?.code || '').toLowerCase();
-    if (code.includes('permission-denied')) throw preLessonSyncError('PRELESSON_SUBMIT_VERIFY_DENIED', 'Firestore đã ghi nhưng từ chối bước xác minh kết quả chuẩn bị bài.', error);
-    if (code.includes('unavailable') || code.includes('network') || code.includes('offline')) throw preLessonSyncError('PRELESSON_NETWORK', 'Đã gửi kết quả nhưng chưa thể xác minh do kết nối Firestore.', error);
-    throw preLessonSyncError('PRELESSON_SUBMIT_VERIFY_FAILED', 'Không xác minh được kết quả chuẩn bị bài.', error);
+    if (code.includes('permission-denied')) throw preLessonSyncError('PRELESSON_SUBMIT_VERIFY_DENIED', 'Kết quả chuẩn bị bài đang được đồng bộ. Vui lòng tải lại và kiểm tra sau ít phút.', error);
+    if (code.includes('unavailable') || code.includes('network') || code.includes('offline')) throw preLessonSyncError('PRELESSON_NETWORK', 'Đã gửi kết quả nhưng kết nối đang gián đoạn. Vui lòng tải lại và kiểm tra sau ít phút.', error);
+    throw preLessonSyncError('PRELESSON_SUBMIT_VERIFY_FAILED', 'Kết quả chuẩn bị bài chưa được xác nhận. Vui lòng thử lại.', error);
   }
 }
 
@@ -2735,7 +2807,8 @@ export async function listFirebasePreLessonSubmissions(filters: Record<string, u
     const member = memberCache.get(ownerUid) || {};
     const normalized = normalizePreLessonSubmissionData(item.id, raw, { lessonId: lesson.lesson_id, lessonData: lesson, memberData: member });
     if (normalized.video_revision !== Math.max(1, Number(lesson.pre_lesson_video_revision || 1))) return;
-    merged.set(`${clean(normalized.user_id)}__${lesson.lesson_id}`, normalized);
+    const identityKey = ownerUid ? `uid:${ownerUid}` : `user:${clean(normalized.user_id)}`;
+    merged.set(`${identityKey}__${lesson.lesson_id}`, normalized);
   });
 
   // Tương thích submissions cũ: chỉ đọc best-effort, dữ liệu V6.88.0 luôn ưu tiên.
@@ -2752,8 +2825,11 @@ export async function listFirebasePreLessonSubmissions(filters: Record<string, u
       const lesson = lessonDataById.get(lessonId);
       if (!lesson) return;
       const normalized = normalizePreLessonSubmissionData(item.id, raw, { lessonId, lessonData: lesson });
-      const key = `${clean(normalized.user_id)}__${lessonId}`;
-      if (!merged.has(key) && normalized.video_revision === Math.max(1, Number(lesson.pre_lesson_video_revision || 1))) merged.set(key, normalized);
+      const key = `user:${clean(normalized.user_id)}__${lessonId}`;
+      const alreadyCanonical = Array.from(merged.values()).some((value) => clean(value.lesson_id) === lessonId
+        && ((clean(value.ownerUid) && clean(value.ownerUid) === clean(normalized.ownerUid))
+          || (clean(value.user_id) && clean(value.user_id) === clean(normalized.user_id))));
+      if (!alreadyCanonical && normalized.video_revision === Math.max(1, Number(lesson.pre_lesson_video_revision || 1))) merged.set(key, normalized);
     });
   } catch { /* legacy không được phép làm hỏng analytics mới */ }
 
@@ -3594,9 +3670,13 @@ export async function listFirebaseProgress(filters: Record<string, unknown> = {}
     throw preLessonSyncError('PRELESSON_ANALYTICS_LOAD_FAILED', 'Không tải được kết quả chuẩn bị bài đã gửi từ Firestore; hệ thống không chuyển lỗi thành 0%.', error);
   }
   const byKey = new Map(learningItems.map((item) => [`${clean(item.user_id)}__${clean(item.lesson_id)}`, item]));
+  const byUidLesson = new Map<string, LessonProgressRecord>(learningItems
+    .filter((item: any) => clean((item as any).ownerUid))
+    .map((item: any) => [`${clean(item.ownerUid)}__${clean(item.lesson_id)}`, item] as [string, LessonProgressRecord]));
   preItems.forEach((pre) => {
     const key = `${clean(pre.user_id)}__${clean(pre.lesson_id)}`;
-    const existing = byKey.get(key);
+    const uidKey = `${clean(pre.ownerUid)}__${clean(pre.lesson_id)}`;
+    const existing = (clean(pre.ownerUid) ? byUidLesson.get(uidKey) : undefined) || byKey.get(key);
     const patch = {
       pre_lesson_status: 'completed' as const,
       pre_lesson_watch_percent: Number(pre.watch_percent || 0),
@@ -3606,10 +3686,14 @@ export async function listFirebaseProgress(filters: Record<string, unknown> = {}
       pre_lesson_preparation_status: pre.preparation_status,
       pre_lesson_last_watched_at: clean(pre.submitted_at),
     };
-    if (existing) Object.assign(existing, patch);
-    else byKey.set(key, {
+    if (existing) {
+      Object.assign(existing, { ownerUid: clean(pre.ownerUid) || (existing as any).ownerUid, ...patch });
+    } else {
+      const syntheticUserId = clean(pre.user_id) || `UID:${clean(pre.ownerUid)}`;
+      byKey.set(`${syntheticUserId}__${clean(pre.lesson_id)}`, {
       progress_id: `PRE_${pre.submission_id}`,
-      user_id: clean(pre.user_id),
+      ownerUid: clean(pre.ownerUid),
+      user_id: syntheticUserId,
       lesson_id: clean(pre.lesson_id),
       lesson_title: '', mon_hoc: '', khoi: clean(pre.khoi), lop_id: clean(pre.lop_id),
       status: 'not_started', completion_percent: 0, completed_steps: 0, total_steps: 0,
@@ -3618,6 +3702,7 @@ export async function listFirebaseProgress(filters: Record<string, unknown> = {}
       result_state: 'valid',
       ...patch,
     } as LessonProgressRecord);
+    }
   });
   return Array.from(byKey.values());
 }
@@ -3625,6 +3710,11 @@ export async function listFirebaseProgress(filters: Record<string, unknown> = {}
 function mergeProgressPayloadMonotonic(current: any, incoming: LessonProgressRecord) {
   const currentSteps = current?.step_details || {};
   const incomingSteps = incoming?.step_details || {};
+  const currentFinalized = clean(current?.score_status) === 'finalized' && Number.isFinite(Number(current?.assessment_score));
+  const incomingFinalized = clean(incoming?.score_status) === 'finalized' && Number.isFinite(Number(incoming?.assessment_score));
+  // V6.88.9: autosave/in-progress packets can arrive after the official submit.
+  // Never let such a late packet erase or downgrade a score already finalized on server.
+  const preserveOfficialScore = currentFinalized && !incomingFinalized;
   const stageKeys = ['khoi_dong', 'hinh_thanh_kien_thuc', 'luyen_tap', 'van_dung', 'tong_ket'];
   const mergedSteps: Record<string, any> = {};
   stageKeys.forEach((stage) => {
@@ -3660,22 +3750,29 @@ function mergeProgressPayloadMonotonic(current: any, incoming: LessonProgressRec
     learning_process_score: Number(incoming.score_model_version || 0) >= 3
       ? incoming.learning_process_score
       : Math.max(Number(current?.learning_process_score || 0), Number(incoming.learning_process_score || 0)),
-    final_quiz_score: Number(incoming.score_model_version || 0) >= 3
-      ? incoming.final_quiz_score
-      : (Number.isFinite(Number(incoming.final_quiz_score)) ? Number(incoming.final_quiz_score) : current?.final_quiz_score),
-    current_score: Number(incoming.score_model_version || 0) >= 3
-      ? incoming.current_score
-      : (Number.isFinite(Number(incoming.current_score)) ? Number(incoming.current_score) : current?.current_score),
-    assessment_score: Number(incoming.score_model_version || 0) >= 3
-      ? (incoming.score_status === 'finalized' ? incoming.assessment_score : undefined)
-      : (Number.isFinite(Number(incoming.assessment_score)) ? Number(incoming.assessment_score) : current?.assessment_score),
-    score_status: incoming.score_status || current?.score_status,
+    final_quiz_score: preserveOfficialScore
+      ? current?.final_quiz_score
+      : Number(incoming.score_model_version || 0) >= 3
+        ? incoming.final_quiz_score
+        : (Number.isFinite(Number(incoming.final_quiz_score)) ? Number(incoming.final_quiz_score) : current?.final_quiz_score),
+    current_score: preserveOfficialScore
+      ? current?.current_score
+      : Number(incoming.score_model_version || 0) >= 3
+        ? incoming.current_score
+        : (Number.isFinite(Number(incoming.current_score)) ? Number(incoming.current_score) : current?.current_score),
+    assessment_score: preserveOfficialScore
+      ? current?.assessment_score
+      : Number(incoming.score_model_version || 0) >= 3
+        ? (incoming.score_status === 'finalized' ? incoming.assessment_score : undefined)
+        : (Number.isFinite(Number(incoming.assessment_score)) ? Number(incoming.assessment_score) : current?.assessment_score),
+    score_status: preserveOfficialScore ? 'finalized' : (incoming.score_status || current?.score_status),
+    status: preserveOfficialScore ? 'completed' : (incoming.status || current?.status),
     score_model_version: Number(incoming.score_model_version || current?.score_model_version || 0) || undefined,
     scored_section_count: incoming.scored_section_count ?? current?.scored_section_count,
     scorable_section_count: incoming.scorable_section_count ?? current?.scorable_section_count,
     preparation_score: Number(incoming.score_model_version || 0) >= 3 ? 0 : incoming.preparation_score ?? current?.preparation_score,
     preparation_weight: Number(incoming.score_model_version || 0) >= 3 ? 0 : incoming.preparation_weight ?? current?.preparation_weight,
-    score_calculated_at: clean(incoming.score_calculated_at) || clean(current?.score_calculated_at),
+    score_calculated_at: preserveOfficialScore ? clean(current?.score_calculated_at) : (clean(incoming.score_calculated_at) || clean(current?.score_calculated_at)),
     last_closed_at: clean(incoming.last_closed_at) || clean(current?.last_closed_at),
   });
 }
@@ -3722,13 +3819,17 @@ function progressFirestoreWriteData(data: LessonProgressRecord) {
 
 async function saveFirebaseProgressNow(payload: LessonProgressRecord) {
   const me = await identity();
-  const progressId = clean(payload.progress_id) || `${clean(payload.user_id || me.userId)}_${clean(payload.lesson_id)}`;
+  const canonicalUserId = me.role === 'student' ? clean(me.userId) : clean(payload.user_id || me.userId);
+  const canonicalLessonId = clean(payload.lesson_id);
+  const progressId = payload.study_mode === 'co_learning'
+    ? (clean(payload.progress_id) || `${canonicalUserId}_${canonicalLessonId}`)
+    : `${canonicalUserId}_${canonicalLessonId}`;
   const now = new Date().toISOString();
   const resultVersion = Math.max(Number(payload.result_version || 0) + 1, Date.now());
   const commonIncoming = withoutUndefined({
     ...payload,
     progress_id: progressId,
-    user_id: clean(payload.user_id || me.userId),
+    user_id: canonicalUserId,
     ownerUid: me.uid,
     khoi: clean(me.grade || payload.khoi),
     lop_id: clean(me.classId || payload.lop_id),
@@ -3860,7 +3961,18 @@ async function saveFirebaseProgressNow(payload: LessonProgressRecord) {
     if (ownIndex >= 0) {
       const ownRef = doc(school(), 'learningProgress', `${participants[ownIndex].userId}_${clean(payload.lesson_id)}`);
       const verifiedOwn = await getDoc(ownRef);
-      if (verifiedOwn.exists()) return verifiedOwn.data() as LessonProgressRecord;
+      if (verifiedOwn.exists()) {
+        const verified = verifiedOwn.data() as LessonProgressRecord;
+        if (clean(ownProgress?.score_status) === 'finalized' && Number.isFinite(Number(ownProgress?.assessment_score))) {
+          const expectedScore = Math.round(Math.max(0, Math.min(10, Number(ownProgress?.assessment_score))) * 10) / 10;
+          const serverScore = Number(verified.assessment_score);
+          if (clean(verified.score_status) !== 'finalized' || !Number.isFinite(serverScore) || Math.abs(serverScore - expectedScore) > 0.001) {
+            throw Object.assign(new Error('Điểm bài nộp chưa được ghi nhận đầy đủ. Bài làm của em vẫn được giữ an toàn; hãy thử nộp lại.'), { diagnosticCode: 'LEARNING_SCORE_VERIFY_FAILED' });
+          }
+        }
+        return verified;
+      }
+      throw Object.assign(new Error('Kết quả đang được đồng bộ. Bài làm của em vẫn được giữ an toàn; hãy thử lại.'), { diagnosticCode: 'LEARNING_RESULT_NOT_CONFIRMED' });
     }
     return ownProgress || common;
   }
@@ -3870,17 +3982,24 @@ async function saveFirebaseProgressNow(payload: LessonProgressRecord) {
   const currentData = currentSnap.exists() ? currentSnap.data() : {};
   const incoming = withoutUndefined({
     ...commonIncoming,
-    result_group_id: clean(payload.result_group_id) || `${clean(payload.user_id || me.userId)}_${clean(payload.lesson_id)}`,
+    result_group_id: clean(payload.result_group_id) || `${canonicalUserId}_${canonicalLessonId}`,
   }) as unknown as LessonProgressRecord;
   const data = mergeProgressPayloadMonotonic(currentData, incoming) as LessonProgressRecord;
   await setDoc(ref, progressFirestoreWriteData(data), { merge: true });
   // V6.84.11: read-after-write verification. Chỉ báo lưu thành công khi document
   // chính thức thực sự đọc lại được từ Firestore với version vừa ghi.
   const verifiedSnap = await getDoc(ref);
-  if (!verifiedSnap.exists()) throw new Error('Đã gửi kết quả nhưng Firestore chưa xác nhận document điểm chính thức. Hãy thử đồng bộ lại.');
+  if (!verifiedSnap.exists()) throw Object.assign(new Error('Kết quả đang được đồng bộ. Bài làm của em vẫn được giữ an toàn; hãy thử lại.'), { diagnosticCode: 'LEARNING_RESULT_NOT_CONFIRMED' });
   const verified = verifiedSnap.data() as LessonProgressRecord;
   if (Number(verified.result_version || 0) < Number(resultVersion || 0)) {
-    throw new Error('Firestore chưa xác nhận phiên bản kết quả mới nhất. Hãy giữ màn hình và thử đồng bộ lại.');
+    throw Object.assign(new Error('Kết quả đang được đồng bộ. Bài làm của em vẫn được giữ an toàn; hãy thử lại.'), { diagnosticCode: 'LEARNING_RESULT_VERSION_NOT_CONFIRMED' });
+  }
+  if (clean(data.score_status) === 'finalized' && Number.isFinite(Number(data.assessment_score))) {
+    const expectedScore = Math.round(Math.max(0, Math.min(10, Number(data.assessment_score))) * 10) / 10;
+    const verifiedScore = Number(verified.assessment_score);
+    if (clean(verified.score_status) !== 'finalized' || !Number.isFinite(verifiedScore) || Math.abs(verifiedScore - expectedScore) > 0.001) {
+      throw Object.assign(new Error('Điểm bài nộp chưa được ghi nhận đầy đủ. Bài làm của em vẫn được giữ an toàn; hãy thử nộp lại.'), { diagnosticCode: 'LEARNING_SCORE_VERIFY_FAILED' });
+    }
   }
   return verified;
 }
@@ -3888,7 +4007,7 @@ async function saveFirebaseProgressNow(payload: LessonProgressRecord) {
 const progressSaveQueues = new Map<string, Promise<unknown>>();
 
 export async function saveFirebaseProgress(payload: LessonProgressRecord) {
-  const queueKey = clean(payload.co_learning_session_id) || clean(payload.progress_id) || `${clean(payload.user_id)}_${clean(payload.lesson_id)}`;
+  const queueKey = clean(payload.co_learning_session_id) || `${clean(firebaseAuth.currentUser?.uid || payload.user_id)}_${clean(payload.lesson_id)}`;
   const previous = progressSaveQueues.get(queueKey) || Promise.resolve();
   const task = previous.catch(() => undefined).then(() => saveFirebaseProgressNow(payload));
   const tail = task.then(() => undefined, () => undefined);
@@ -4190,6 +4309,19 @@ export async function moderateFirebaseLearningResult(
   };
 }
 
+function boolValue(value: unknown) {
+  if (value === true || value === 1) return true;
+  const text = clean(value).toLowerCase();
+  return text === 'true' || text === '1' || text === 'yes' || text === 'co';
+}
+
+function lessonDeadlineMillis(lesson: LessonRow) {
+  const raw = clean(lesson.thoi_gian_ket_thuc);
+  if (!raw) return 0;
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 export async function finalizeFirebaseDeadlineZeros(
   lessonRows: LessonRow[],
   studentRows: Account[],
@@ -4285,9 +4417,42 @@ export async function finalizeFirebaseDeadlineZeros(
 
 export async function listFirebaseComments(lessonId: string) {
   await identity();
-  const snap = await getDocs(query(collection(school(), 'lessonComments'), where('lesson_id', '==', clean(lessonId))));
-  return snap.docs.map(item => ({ comment_id: item.id, ...item.data() } as unknown as LessonComment))
-    .filter(item => clean(item.lesson_id) === clean(lessonId));
+  const normalizedLessonId = clean(lessonId);
+  const [snap, lessonSnap] = await Promise.all([
+    getDocs(query(collection(school(), 'lessonComments'), where('lesson_id', '==', normalizedLessonId))),
+    getDoc(doc(lessons(), normalizedLessonId)).catch(() => null),
+  ]);
+  const lessonTitle = lessonSnap?.exists() ? clean((lessonSnap.data() as any)?.tieu_de) : '';
+  const rawItems = snap.docs
+    .map(item => ({ comment_id: item.id, ...item.data() } as any))
+    .filter(item => clean(item.lesson_id) === normalizedLessonId);
+
+  // V6.88.12: comment legacy có thể chưa có họ tên/lớp. Bổ sung từ member
+  // theo ownerUid khi đọc để học sinh/giáo viên luôn thấy danh tính đầy đủ.
+  const missingAuthorUids = Array.from(new Set(rawItems
+    .filter(item => !clean(item.ho_ten) && clean(item.ownerUid))
+    .map(item => clean(item.ownerUid))
+    .filter(Boolean)));
+  const memberMap = new Map<string, any>();
+  await Promise.all(missingAuthorUids.map(async (uid) => {
+    try {
+      const memberSnap = await getDoc(doc(school(), 'members', uid));
+      if (memberSnap.exists()) memberMap.set(uid, memberSnap.data());
+    } catch { /* fallback về user_id nếu hồ sơ cũ không đọc được */ }
+  }));
+
+  return rawItems.map((item) => {
+    const member = memberMap.get(clean(item.ownerUid)) || {};
+    return {
+      ...item,
+      ho_ten: clean(item.ho_ten || item.student_name || member.displayName || member.ho_ten),
+      student_name: clean(item.student_name || item.ho_ten || member.displayName || member.ho_ten),
+      lop_id: clean(item.lop_id || item.class_id || member.classId || member.lop_id),
+      class_id: clean(item.class_id || item.lop_id || member.classId || member.lop_id),
+      student_code: clean(item.student_code || member.studentCode || member.username),
+      lesson_title: clean(item.lesson_title || lessonTitle),
+    } as unknown as LessonComment;
+  });
 }
 
 export async function saveFirebaseComment(payload: Partial<LessonComment>, updating = false) {
@@ -4296,10 +4461,46 @@ export async function saveFirebaseComment(payload: Partial<LessonComment>, updat
   const target = doc(school(), 'lessonComments', commentId);
   const snap = await getDoc(target);
   if (updating && !snap.exists()) return null;
+  const existing = snap.exists() ? (snap.data() as any) : {};
   const now = new Date().toISOString();
-  const data = withoutUndefined({ ...payload, comment_id: commentId, user_id: clean(payload.user_id || me.userId), ownerUid: snap.exists() ? clean((snap.data() as any).ownerUid) : me.uid,
-    schoolId: FIREBASE_SCHOOL_ID, schemaVersion: 1, storageProvider: 'firebase', created_at: snap.exists() ? clean((snap.data() as any).created_at) : now,
-    updated_at: now, updatedAt: serverTimestamp(), trang_thai: clean(payload.trang_thai) || 'visible' });
+  const lessonId = clean(payload.lesson_id || existing.lesson_id);
+  if (!lessonId) throw new Error('Bình luận chưa gắn với bài học. Vui lòng mở lại bài học và thử lại.');
+  const lessonSnap = await getDoc(doc(lessons(), lessonId)).catch(() => null);
+  const lessonTitle = lessonSnap?.exists() ? clean((lessonSnap.data() as any)?.tieu_de) : clean(existing.lesson_title);
+
+  // Khi giáo viên xử lý/ẩn bình luận, giữ nguyên tác giả gốc.
+  const authorUid = snap.exists() ? clean(existing.ownerUid) : clean(me.uid);
+  const authorUserId = snap.exists() ? clean(existing.user_id) : clean(payload.user_id || me.userId);
+  const authorName = snap.exists()
+    ? clean(existing.ho_ten || existing.student_name)
+    : clean(payload.ho_ten || me.displayName || me.username || me.userId);
+  const authorClassId = snap.exists()
+    ? clean(existing.lop_id || existing.class_id)
+    : clean(payload.lop_id || me.classId);
+  const studentCode = snap.exists()
+    ? clean(existing.student_code)
+    : clean((payload as any).student_code || me.studentCode || me.username);
+
+  const safePayload = withoutUndefined({
+    ...payload,
+    comment_id: commentId,
+    lesson_id: lessonId,
+    lesson_title: lessonTitle,
+    user_id: authorUserId,
+    ownerUid: authorUid,
+    ho_ten: authorName,
+    student_name: authorName,
+    student_code: studentCode,
+    lop_id: authorClassId,
+    class_id: authorClassId,
+    schoolId: FIREBASE_SCHOOL_ID,
+    schemaVersion: 2,
+    storageProvider: 'firebase',
+    created_at: snap.exists() ? clean(existing.created_at) : now,
+    updated_at: now,
+    trang_thai: clean(payload.trang_thai || existing.trang_thai) || 'visible',
+  });
+  const data = { ...safePayload, updatedAt: serverTimestamp() };
   await setDoc(target, data, { merge: updating });
   return data as unknown as LessonComment;
 }

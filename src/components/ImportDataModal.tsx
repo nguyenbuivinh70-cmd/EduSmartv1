@@ -40,8 +40,8 @@ const ENTITY_TIPS: Record<ImportEntity, string[]> = {
     'Có thể nhập trực tiếp file Danh sách học sinh xuất từ vnEdu dạng .xls/.xlsx.',
     'Cột bắt buộc: Lớp, Mã học sinh, Họ tên, Ngày sinh và Giới tính. Số điện thoại là cột không bắt buộc.',
     'Tên đăng nhập, mật khẩu ban đầu và mật khẩu sau khi reset đều là Mã học sinh.',
-    'Toàn bộ hồ sơ được lưu và hiển thị ngay từ Firestore; không tạo Authentication hàng loạt nên phù hợp gói Spark.',
-    'Firebase Authentication tự kích hoạt khi học sinh đăng nhập lần đầu bằng Mã học sinh.',
+    'Toàn bộ hồ sơ được lưu và hiển thị ngay sau khi nhập; hệ thống xử lý theo lô để bảo đảm ổn định.',
+    'Tài khoản đăng nhập được kích hoạt tự động khi học sinh đăng nhập lần đầu bằng Mã học sinh.',
     'Nếu lớp trong file vnEdu chưa có trong danh mục Lớp học, hệ thống sẽ báo lỗi và không nhập để tránh sinh lớp sai.',
   ],
   class: [
@@ -115,8 +115,8 @@ export default function ImportDataModal({
           ? `Đang lưu hồ sơ ${executionProgress.processed}/${executionProgress.total}...`
           : 'Đang nhập dữ liệu vào hệ thống...',
         description: executionProgress?.total
-          ? `Đã thêm ${executionProgress.created}, cập nhật ${executionProgress.updated}, lỗi ${executionProgress.failed}. Dữ liệu thành công đang hiển thị ngay từ Firestore.`
-          : 'Vui lòng chờ đến khi Firestore ghi xong danh sách học sinh.',
+          ? `Đã thêm ${executionProgress.created}, cập nhật ${executionProgress.updated}, lỗi ${executionProgress.failed}. Dữ liệu thành công đang được cập nhật vào danh sách.`
+          : 'Vui lòng chờ đến khi hệ thống ghi xong danh sách học sinh.',
       };
     }
     if (executionResult) {

@@ -173,6 +173,9 @@ export interface LessonRow {
   access_mode?: LessonAccessMode;
   self_study_scope?: SelfStudyScope;
   self_study_class_ids?: string[];
+  /** V6.88.16: các khóa lớp tương thích (ID kỹ thuật + tên lớp) dùng cho quyền tự học legacy-safe. */
+  self_study_class_access_keys?: string[];
+  self_study_access_version?: number;
   allow_retake_after_completion?: boolean;
   locked_at?: string;
   locked_by_uid?: string;
@@ -224,6 +227,9 @@ export interface Lesson {
   access_mode?: LessonAccessMode;
   self_study_scope?: SelfStudyScope;
   self_study_class_ids?: string[];
+  /** V6.88.16: các khóa lớp tương thích (ID kỹ thuật + tên lớp) dùng cho quyền tự học legacy-safe. */
+  self_study_class_access_keys?: string[];
+  self_study_access_version?: number;
   allow_retake_after_completion?: boolean;
   locked_at?: string;
   locked_by_uid?: string;
@@ -928,7 +934,11 @@ export interface LessonComment {
   lesson_id: string;
   user_id: string;
   ho_ten?: string;
+  student_name?: string;
+  student_code?: string;
   lop_id?: string;
+  class_id?: string;
+  lesson_title?: string;
   parent_id?: string;
   noi_dung: string;
   loai?: 'cau_hoi' | 'binh_luan' | 'tra_loi' | string;
@@ -1034,6 +1044,8 @@ export interface LearningStepProgress {
 
 export interface LessonProgressRecord {
   progress_id: string;
+  /** Firebase Auth UID của học sinh; dùng ghép submission chuẩn bị bài ổn định hơn user_id legacy. */
+  ownerUid?: string;
   user_id: string;
   lesson_id: string;
   lesson_title: string;
@@ -1203,6 +1215,8 @@ export interface ScoreTrackingConfig {
 
 export interface StudentLearningAnalyticsRow {
   user_id: string;
+  /** Firebase Auth UID nếu dữ liệu đến từ Firestore canonical/preparation submission. */
+  ownerUid?: string;
   ho_ten: string;
   vai_tro: Role;
   khoi?: string;

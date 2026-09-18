@@ -94,7 +94,7 @@ export default function CoLearningModal({
             <div className="min-w-0">
               <p className="inline-flex items-center gap-2 rounded-full bg-white/15 px-3 py-1 text-xs font-bold uppercase tracking-wide"><Users className="h-4 w-4" /> Học cùng nhóm</p>
               <h2 className="mt-3 text-xl font-black sm:text-2xl">Chọn cách học “{lesson.tieu_de}”</h2>
-              <p className="mt-1 max-w-3xl text-sm leading-6 text-white/85">Chọn liên tiếp tối đa 5 bạn cùng lớp. Việc chọn bạn chỉ diễn ra trên thiết bị; Firestore chỉ được gọi khi em bấm xác nhận tạo/cập nhật nhóm.</p>
+              <p className="mt-1 max-w-3xl text-sm leading-6 text-white/85">Chọn liên tiếp tối đa 5 bạn cùng lớp. Danh sách chỉ được lưu khi em bấm xác nhận tạo hoặc cập nhật nhóm.</p>
             </div>
             <button type="button" onClick={onClose} className="rounded-2xl bg-white/10 p-2 hover:bg-white/20" aria-label="Đóng"><X className="h-5 w-5" /></button>
           </div>

@@ -1,12 +1,24 @@
 export const BACKEND_URL = 'https://script.google.com/macros/s/AKfycbyptQ6tatlONK04hPowA-QaMpfvSLkb0CaxTUMzicfk2s6vVyCSmiBt8S4iQLqPqtoKUw/exec';
 
+// V6.88.14: danh sách ưu tiên chỉ dùng để xếp hạng; model thực tế được lấy động từ Gemini Models API.
 export const AI_MODELS = [
+  'gemini-3.8-flash',
+  'gemini-3.7-flash',
+  'gemini-3.6-flash',
+  'gemini-3.5-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  // Giữ 2.5 để tương thích các API key/dự án cũ còn được cấp quyền.
   'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
   'gemini-2.5-pro',
-  'gemini-3.1-pro-preview',
-  'gemini-3.1-flash-lite-preview'
 ];
+
+export function normalizeGeminiModelName(value?: string | null) {
+  const normalized = String(value || '').trim().replace(/^models\//, '');
+  return /^gemini-[a-z0-9][a-z0-9._-]{1,118}$/i.test(normalized) ? normalized : AI_MODELS[0];
+}
+
 
 export const SUBJECTS = ['Toán', 'Văn', 'Anh', 'Lý', 'Hóa', 'Sinh', 'Sử', 'Địa', 'GDCD', 'Tin học'];
 export const SUPPORTED_GRADES = Array.from({ length: 12 }, (_, index) => String(index + 1));

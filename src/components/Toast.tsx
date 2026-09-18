@@ -1,6 +1,7 @@
 import { motion, AnimatePresence } from 'motion/react';
 import { CheckCircle, XCircle, AlertCircle, X } from 'lucide-react';
 import { useEffect } from 'react';
+import { professionalUserMessage } from '../utils/userMessages';
 
 export type ToastType = 'success' | 'error' | 'info';
 
@@ -11,6 +12,7 @@ interface ToastProps {
 }
 
 export default function Toast({ message, type, onClose }: ToastProps) {
+  const visibleMessage = professionalUserMessage(message);
   useEffect(() => {
     const timer = setTimeout(onClose, 5000);
     return () => clearTimeout(timer);
@@ -32,13 +34,13 @@ export default function Toast({ message, type, onClose }: ToastProps) {
 
   return (
     <motion.div
-      initial={{ opacity: 0, y: 50, scale: 0.9 }}
+      initial={{ opacity: 0, y: -36, scale: 0.96 }}
       animate={{ opacity: 1, y: 0, scale: 1 }}
-      exit={{ opacity: 0, scale: 0.9 }}
-      className={`fixed bottom-6 left-1/2 z-[23000] flex w-full max-w-md -translate-x-1/2 items-center gap-3 rounded-xl border p-4 shadow-lg ${bgColors[safeType]}`}
+      exit={{ opacity: 0, y: -24, scale: 0.96 }}
+      className={`fixed left-1/2 top-[calc(env(safe-area-inset-top)+1rem)] z-[23000] flex w-[calc(100%-2rem)] max-w-md -translate-x-1/2 items-center gap-3 rounded-xl border p-4 shadow-xl sm:top-5 ${bgColors[safeType]}`}
     >
       <div className="flex-shrink-0">{icons[safeType]}</div>
-      <p className="flex-1 text-sm font-medium text-gray-800">{message}</p>
+      <p className="flex-1 text-sm font-medium text-gray-800">{visibleMessage}</p>
       <button onClick={onClose} className="rounded-full p-1 hover:bg-black/5">
         <X className="h-4 w-4 text-gray-500" />
       </button>

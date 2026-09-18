@@ -5,7 +5,7 @@ import {
   Settings, LogOut, User as UserIcon, CheckSquare,
   Bell, Search, FolderKanban, Trophy, BarChart3, MonitorPlay, CalendarDays, WifiOff, BookOpenCheck
 } from 'lucide-react';
-import { User } from '../types';
+import { CatalogClass, User } from '../types';
 import { formatManagedGrades } from '../utils/gradeScope';
 
 
@@ -17,13 +17,14 @@ function hasAdminPermission(user: User) {
 
 interface LayoutProps {
   user: User;
+  classes?: CatalogClass[];
   onLogout: () => void;
   children: React.ReactNode;
   activeMenu: string;
   setActiveMenu: (menu: string) => void;
 }
 
-export default function Layout({ user, onLogout, children, activeMenu, setActiveMenu }: LayoutProps) {
+export default function Layout({ user, classes = [], onLogout, children, activeMenu, setActiveMenu }: LayoutProps) {
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isMobile, setIsMobile] = useState(window.innerWidth < 1024);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
@@ -91,6 +92,15 @@ export default function Layout({ user, onLogout, children, activeMenu, setActive
   // không biến sidebar giáo viên thành sidebar quản trị viên.
   const menuItems = user.vai_tro === 'admin' ? adminMenu : user.vai_tro === 'teacher' ? teacherMenu : studentMenu;
   const roleLabel = user.vai_tro === 'admin' ? 'Quản trị viên' : user.vai_tro === 'teacher' ? (adminLike ? 'Giáo viên + quyền admin' : 'Giáo viên') : 'Học sinh';
+  const classKey = (value: unknown) => String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const userClassDisplay = user.vai_tro === 'student' && user.lop_id
+    ? (classes.find((item) => {
+        const target = classKey(user.lop_id);
+        const id = classKey(item.lop_id);
+        const name = classKey(item.ten_lop);
+        return Boolean(target && (target === id || target === name || id.endsWith(target) || target.endsWith(id)));
+      })?.ten_lop || user.lop_id)
+    : '';
 
   return (
     <div className="notranslate flex h-dvh overflow-hidden bg-bg-main" translate="no">
@@ -216,7 +226,7 @@ export default function Layout({ user, onLogout, children, activeMenu, setActive
                   {roleLabel}
                   {user.vai_tro === 'teacher' ? ` • ${adminLike ? 'Toàn trường' : formatManagedGrades(user)}` : ''}
                   {user.vai_tro === 'student' && user.khoi ? ` • Khối ${user.khoi}` : ''}
-                  {user.vai_tro === 'student' && user.lop_id ? ` • ${user.lop_id}` : ''}
+                  {user.vai_tro === 'student' && userClassDisplay ? ` • ${userClassDisplay}` : ''}
                 </p>
               </div>
               <div className="h-10 w-10 rounded-full bg-gradient-to-br from-[#667eea] to-[#764ba2] ring-2 ring-white shadow-sm"></div>
