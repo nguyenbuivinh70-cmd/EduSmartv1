@@ -1386,7 +1386,10 @@ useEffect(() => {
     }
   }, [user?.user_id]);
 
-  const showToast = (message: string, type: ToastType) => setToast({ message: professionalUserMessage(message), type });
+  const showToast = (message: string, type: ToastType) => setToast({
+    message: professionalUserMessage(message, undefined, user?.vai_tro === 'student' ? 'student' : 'staff'),
+    type,
+  });
 
   // Khi học sinh đang ở trong bài, theo dõi metadata bài học theo thời gian thực.
   // Nếu giáo viên khóa bài, viewer đóng ngay và Rules hiện hành đồng thời chặn đọc content.
@@ -6758,7 +6761,7 @@ useEffect(() => {
           <div className="fixed inset-0 z-[12500] flex items-center justify-center p-4">
             <motion.button type="button" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setRetakeChoiceLesson(null)} className="absolute inset-0 bg-slate-950/55 backdrop-blur-sm" aria-label="Đóng" />
             <motion.div initial={{ opacity: 0, scale: 0.96, y: 12 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.96, y: 8 }} className="relative z-10 w-full max-w-xl rounded-[28px] bg-white p-6 shadow-2xl">
-              <div className="flex items-start justify-between gap-4"><div><p className="text-xs font-black uppercase tracking-[0.16em] text-violet-600">Bài đã hoàn thành</p><h3 className="mt-2 text-xl font-black text-slate-900">{retakeChoiceLesson.tieu_de}</h3></div><button type="button" onClick={() => setRetakeChoiceLesson(null)} className="rounded-xl bg-slate-100 p-2 text-slate-500 hover:bg-slate-200"><XCircle className="h-5 w-5" /></button></div>
+              <div className="flex items-start justify-between gap-4"><div><p className="text-xs font-black uppercase tracking-[0.16em] text-violet-600">{Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.official_retake_remaining || 0) > 0 ? 'Được phép học lại' : 'Bài đã hoàn thành'}</p><h3 className="mt-2 text-xl font-black text-slate-900">{retakeChoiceLesson.tieu_de}</h3></div><button type="button" onClick={() => setRetakeChoiceLesson(null)} className="rounded-xl bg-slate-100 p-2 text-slate-500 hover:bg-slate-200"><XCircle className="h-5 w-5" /></button></div>
               {Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.official_retake_remaining || 0) > 0 ? (
                 <div className="mt-5 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm leading-6 text-emerald-900"><b>Giáo viên đã cấp 1 lượt học lại cập nhật điểm.</b> Điểm cũ đã được chuyển vào lịch sử và tạm ẩn khỏi bảng điểm. Khi em nộp lượt mới, điểm mới sẽ trở thành điểm chính thức.</div>
               ) : (
@@ -6767,7 +6770,7 @@ useEffect(() => {
               {retakeHistory.length ? <p className="mt-3 text-xs font-semibold text-slate-500">Đã có {retakeHistory.length} phiên học lại{retakeHistory[0]?.reference_score !== undefined ? ` • gần nhất ${Number(retakeHistory[0].reference_score).toFixed(1)}/10` : ''}.</p> : null}
               <div className="mt-6 grid gap-3 sm:grid-cols-2">
                 <button type="button" onClick={() => void handleReviewOfficialLesson()} className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-black text-slate-700 hover:bg-slate-50">Xem lại bài chính thức</button>
-                {Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.official_retake_remaining || 0) > 0 ? <button type="button" onClick={() => void handleStartOfficialRetake()} className="rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-black text-white shadow-lg shadow-emerald-200 hover:bg-emerald-700">Học lại để cập nhật điểm</button> : null}
+                {Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.official_retake_remaining || 0) > 0 ? <button type="button" onClick={() => void handleStartOfficialRetake()} className="rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-black text-white shadow-lg shadow-emerald-200 hover:bg-emerald-700">Bắt đầu học lại cập nhật điểm</button> : null}
                 {retakeChoiceLesson.allow_retake_after_completion === true ? <button type="button" onClick={() => void handleStartReferenceRetake()} className="rounded-2xl bg-violet-600 px-4 py-3 text-sm font-black text-white shadow-lg shadow-violet-200 hover:bg-violet-700">Học lại luyện tập</button> : null}
               </div>
             </motion.div>

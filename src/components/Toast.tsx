@@ -1,7 +1,6 @@
 import { motion, AnimatePresence } from 'motion/react';
 import { CheckCircle, XCircle, AlertCircle, X } from 'lucide-react';
 import { useEffect } from 'react';
-import { professionalUserMessage } from '../utils/userMessages';
 
 export type ToastType = 'success' | 'error' | 'info';
 
@@ -12,7 +11,7 @@ interface ToastProps {
 }
 
 export default function Toast({ message, type, onClose }: ToastProps) {
-  const visibleMessage = professionalUserMessage(message);
+  const visibleMessage = message;
   useEffect(() => {
     const timer = setTimeout(onClose, 5000);
     return () => clearTimeout(timer);

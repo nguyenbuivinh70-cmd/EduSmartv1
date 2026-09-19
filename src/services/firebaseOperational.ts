@@ -3427,7 +3427,11 @@ export async function finalizeFirebaseOfficialRetake(attempt: LessonRetakeAttemp
   const me = await identity();
   if (me.role !== 'student') throw new Error('Chỉ học sinh mới có thể nộp lượt học lại chính thức.');
   if (!(attempt.is_official === true || clean(attempt.retake_mode) === 'official_update')) throw new Error('Đây không phải lượt học lại cập nhật điểm.');
-  const progress = attempt.progress;
+  // V6.88.22: official retakes must be promoted with the same canonical
+  // Score Model V4 envelope as a normal official submission. Retake practice
+  // may still calculate learning-process/reference metrics locally, but the
+  // official grade is the final-quiz score only.
+  const progress = normalizeScoreModelV4SubmissionEnvelope(attempt.progress);
   if (progress.score_status !== 'finalized' || !Number.isFinite(Number(progress.assessment_score))) throw new Error('Lượt học lại chưa có điểm hợp lệ để cập nhật.');
   const officialId = `${clean(me.userId)}_${clean(attempt.lesson_id)}`;
   const officialRef = doc(school(), 'learningProgress', officialId);
@@ -3462,6 +3466,19 @@ export async function finalizeFirebaseOfficialRetake(attempt: LessonRetakeAttemp
       updated_at: now,
       updatedAt: serverTimestamp(),
     });
+    // V6.88.22: update the durable official-submission ledger in the same
+    // atomic promotion. Without this, analytics could overlay the previous score
+    // from finalSubmissions after a successful official retake.
+    const durableRetake = buildCanonicalFinalSubmission({ ...progress, score_reason: 'official_retake' } as LessonProgressRecord, me);
+    if (durableRetake) {
+      tx.set(finalSubmissionRef(clean(me.userId), clean(attempt.lesson_id)), {
+        ...durableRetake,
+        score_reason: 'official_retake',
+        result_version: Number(next.result_version || durableRetake.result_version || Date.now()),
+        updated_at: now,
+        updatedAt: serverTimestamp(),
+      }, { merge: true });
+    }
     tx.set(officialRef, next, { merge: false });
     tx.set(attemptRef, { status: 'completed', promoted_to_official: true, promoted_at: now, updatedAt: serverTimestamp() }, { merge: true });
     return next as unknown as LessonProgressRecord;
@@ -3638,6 +3655,14 @@ function overlayFinalSubmissionsOnProgress(items: LessonProgressRecord[], submis
     const key = `${clean(submission.user_id)}__${clean(submission.lesson_id)}`;
     const uidKey = `${clean(submission.ownerUid)}__${clean(submission.lesson_id)}`;
     const existing = (clean(submission.ownerUid) ? byUidLesson.get(uidKey) : undefined) || byKey.get(key);
+    // V6.88.22: finalSubmissions is the durable score ledger, but an active
+    // official-retake grant intentionally hides the old score until the learner
+    // submits again. Likewise an invalidated result must never be resurrected by
+    // the historical durable submission overlay.
+    if (existing && (
+      (clean(existing.score_status) === 'retake_pending' && Number(existing.official_retake_remaining || 0) > 0)
+      || clean(existing.result_state) === 'invalid_cheating'
+    )) return;
     const score = Math.round(Math.max(0, Math.min(10, Number(submission.assessment_score ?? submission.score ?? 0))) * 10) / 10;
     const finalExamPatch = {
       status: clean(submission.final_exam_status) || 'submitted',
@@ -4381,42 +4406,79 @@ export async function moderateFirebaseLearningResult(
     throw new Error('Vui lòng nhập lý do xác nhận gian lận.');
   }
 
-  // V6.84.11: preflight đọc lại dữ liệu thật trước khi tạo batch. Không tin dữ liệu
-  // đang hiển thị trong bảng vì progress legacy có thể thiếu khoi/lop_id.
+  // V6.88.22: bảng điểm có thể lấy điểm chính thức từ finalSubmissions khi
+  // learningProgress legacy chưa ghi được score. Vì vậy chức năng Học lại phải
+  // đọc cả hai nguồn và không được giả định learningProgress luôn chứa điểm.
   const selectedRef = doc(school(), 'learningProgress', progressId);
-  const selectedSnap = await getDoc(selectedRef);
-  if (!selectedSnap.exists()) throw new Error('Không tìm thấy kết quả học tập cần xử lý.');
-  const selected = { progress_id: selectedSnap.id, ...selectedSnap.data() } as any;
-  const lessonId = clean(selected.lesson_id);
-  const targetUserId = clean(selected.user_id);
-  if (!lessonId || !targetUserId) {
-    throw new Error('Kết quả học tập cũ thiếu mã bài học hoặc mã học sinh. Vui lòng tải lại dữ liệu hoặc chuẩn hóa hồ sơ trước khi cho học lại.');
+  const durableRef = doc(school(), 'finalSubmissions', progressId);
+  const [selectedSnap, durableSnap] = await Promise.all([
+    getDoc(selectedRef).catch(() => null),
+    getDoc(durableRef).catch(() => null),
+  ]);
+  const durable = durableSnap?.exists() ? ({ submission_id: durableSnap.id, ...durableSnap.data() } as any) : null;
+  if (!selectedSnap?.exists() && !durable) {
+    throw new Error('Không tìm thấy kết quả đã nộp để xử lý. Vui lòng làm mới bảng theo dõi và thử lại.');
   }
 
-  // Học lại chính thức luôn sử dụng document canonical {userId}_{lessonId}.
-  // Nếu bảng điểm đang trỏ vào một duplicate legacy, ưu tiên canonical để grant
-  // xuất hiện đúng nơi học sinh đọc khi bắt đầu official retake.
+  const selected = selectedSnap?.exists()
+    ? ({ progress_id: selectedSnap.id, ...selectedSnap.data() } as any)
+    : ({
+        progress_id: progressId,
+        ...durable,
+        status: 'completed',
+        score_status: 'finalized',
+        assessment_score: Number(durable?.assessment_score ?? durable?.score),
+        current_score: Number(durable?.assessment_score ?? durable?.score),
+        final_quiz_score: Number(durable?.assessment_score ?? durable?.score),
+        result_state: 'valid',
+        study_mode: 'single',
+      } as any);
+  const lessonId = clean(selected.lesson_id || durable?.lesson_id);
+  const targetUserId = clean(selected.user_id || durable?.user_id);
+  if (!lessonId || !targetUserId) {
+    throw new Error('Kết quả cũ chưa đủ thông tin học sinh hoặc bài học. Vui lòng làm mới dữ liệu trước khi xử lý.');
+  }
+
+  // Học lại chính thức luôn dùng document canonical {userId}_{lessonId}.
   const canonicalProgressId = `${targetUserId}_${lessonId}`;
   const canonicalRef = doc(school(), 'learningProgress', canonicalProgressId);
-  const canonicalSnap = progressId === canonicalProgressId ? selectedSnap : await getDoc(canonicalRef);
-  const canonicalIsValid = canonicalSnap.exists()
+  const canonicalSnap = progressId === canonicalProgressId ? selectedSnap : await getDoc(canonicalRef).catch(() => null);
+  const canonicalDurableRef = finalSubmissionRef(targetUserId, lessonId);
+  const canonicalDurableSnap = canonicalProgressId === progressId && durableSnap?.exists()
+    ? durableSnap
+    : await getDoc(canonicalDurableRef).catch(() => null);
+  const canonicalDurable = canonicalDurableSnap?.exists()
+    ? ({ submission_id: canonicalDurableSnap.id, ...canonicalDurableSnap.data() } as any)
+    : durable;
+  const canonicalIsValid = Boolean(canonicalSnap?.exists()
     && clean(canonicalSnap.data()?.user_id) === targetUserId
-    && clean(canonicalSnap.data()?.lesson_id) === lessonId;
-  if (payload.action === 'allow_retake' && !canonicalIsValid) {
-    throw new Error('Kết quả học tập đang ở định dạng legacy và chưa có document điểm chính thức chuẩn. Hãy yêu cầu học sinh mở lại bài một lần hoặc chuẩn hóa kết quả trước khi cấp quyền học lại cập nhật điểm.');
+    && clean(canonicalSnap.data()?.lesson_id) === lessonId);
+  if (payload.action === 'allow_retake' && !canonicalIsValid && !canonicalDurable) {
+    throw new Error('Chưa xác định được điểm chính thức của học sinh. Vui lòng làm mới bảng theo dõi và thử lại.');
   }
-  const primarySnap = canonicalIsValid ? canonicalSnap : selectedSnap;
-  const primaryRef = canonicalIsValid ? canonicalRef : selectedRef;
-  const target = { progress_id: primarySnap.id, ...primarySnap.data() } as any;
+
+  const target = canonicalIsValid
+    ? ({ progress_id: canonicalSnap!.id, ...canonicalSnap!.data() } as any)
+    : ({
+        progress_id: canonicalProgressId,
+        ...canonicalDurable,
+        status: 'completed',
+        score_status: 'finalized',
+        assessment_score: Number(canonicalDurable?.assessment_score ?? canonicalDurable?.score),
+        current_score: Number(canonicalDurable?.assessment_score ?? canonicalDurable?.score),
+        final_quiz_score: Number(canonicalDurable?.assessment_score ?? canonicalDurable?.score),
+        result_state: 'valid',
+        study_mode: 'single',
+      } as any);
 
   const lessonRef = doc(lessons(), lessonId);
   const lessonSnap = await getDoc(lessonRef);
   if (!lessonSnap.exists()) throw new Error('Không tìm thấy bài học của kết quả cần xử lý.');
   const lessonData = lessonSnap.data() as any;
-  const resolvedGrade = clean(target.khoi || lessonData.khoi).replace(/\.0+$/, '');
-  const resolvedClassId = clean(target.lop_id || lessonData.lop_id);
+  const resolvedGrade = clean(target.khoi || canonicalDurable?.khoi || lessonData.khoi).replace(/\.0+$/, '');
+  const resolvedClassId = clean(target.lop_id || canonicalDurable?.lop_id || lessonData.lop_id);
   if (me.role === 'teacher' && me.adminPermission !== true) {
-    if (!resolvedGrade) throw new Error('Không xác định được khối của bài học nên chưa thể kiểm tra quyền giáo viên.');
+    if (!resolvedGrade) throw new Error('Chưa xác định được khối của bài học. Vui lòng làm mới dữ liệu và thử lại.');
     assertTeacherCanManageGrade(me, resolvedGrade);
   }
 
@@ -4428,37 +4490,69 @@ export async function moderateFirebaseLearningResult(
     sessionRef = doc(school(), 'coLearningSessions', resultGroupId);
     const sessionSnap = await getDoc(sessionRef);
     if (!sessionSnap.exists()) {
-      throw new Error('Không tìm thấy phiên học cùng của kết quả này. Hệ thống chưa thực hiện thay đổi để tránh cập nhật thiếu thành viên.');
+      throw new Error('Không tìm thấy phiên học cùng của kết quả này. Hệ thống chưa thay đổi dữ liệu.');
     }
     const session = sessionSnap.data() as any;
     const fromSession = getCoLearningParticipants(session).map((item) => clean(item.userId)).filter(Boolean);
     participantUserIds = Array.from(new Set([targetUserId, ...fromSession]));
   }
 
-  // Solo: chỉ cập nhật document canonical chính thức. Học cùng: cập nhật nguyên tử
-  // canonical progress của tất cả thành viên; không kéo duplicate legacy vào batch.
+  // Solo: ưu tiên canonical. Nếu learningProgress chưa tồn tại nhưng sổ nộp bài
+  // finalSubmissions đã xác nhận điểm, V6.88.22 có thể tạo một progress shell
+  // retake_pending an toàn để quyền học lại không phụ thuộc dữ liệu legacy.
   const progressRefs = target.study_mode === 'co_learning' && resultGroupId
     ? participantUserIds.map((userId) => doc(school(), 'learningProgress', `${userId}_${lessonId}`))
-    : [primaryRef];
-  const progressSnaps = await Promise.all(progressRefs.map((ref) => getDoc(ref)));
-  const affected = progressSnaps
-    .filter((snap) => snap.exists())
-    .map((snap) => ({ ref: snap.ref, data: { progress_id: snap.id, ...snap.data() } as any }))
-    .filter((item) => clean(item.data.lesson_id) === lessonId);
-  if (!affected.length) throw new Error('Không còn kết quả hợp lệ để xử lý.');
+    : [canonicalRef];
+  const progressSnaps = await Promise.all(progressRefs.map((ref) => getDoc(ref).catch(() => null)));
+  const affected: Array<{ ref: DocumentReference<DocumentData>; data: any; create?: boolean; durable?: any }> = [];
+  for (let index = 0; index < progressRefs.length; index += 1) {
+    const ref = progressRefs[index];
+    const snap = progressSnaps[index];
+    if (snap?.exists()) {
+      const data = { progress_id: snap.id, ...snap.data() } as any;
+      if (clean(data.lesson_id) !== lessonId) continue;
+      const ledgerSnap = await getDoc(finalSubmissionRef(clean(data.user_id), lessonId)).catch(() => null);
+      affected.push({ ref, data, durable: ledgerSnap?.exists() ? ({ submission_id: ledgerSnap.id, ...ledgerSnap.data() } as any) : null });
+      continue;
+    }
+    if (payload.action === 'allow_retake' && progressRefs.length === 1 && canonicalDurable) {
+      affected.push({
+        ref,
+        create: true,
+        durable: canonicalDurable,
+        data: {
+          progress_id: canonicalProgressId,
+          user_id: targetUserId,
+          lesson_id: lessonId,
+          ownerUid: clean(canonicalDurable.ownerUid),
+          lesson_title: clean(canonicalDurable.lesson_title || lessonData.tieu_de || lessonData.title),
+          mon_hoc: clean(canonicalDurable.mon_hoc || lessonData.mon_hoc),
+          khoi: resolvedGrade,
+          lop_id: resolvedClassId,
+          status: 'completed',
+          completion_percent: Number(canonicalDurable.completion_percent || 100),
+          result_state: 'valid',
+          study_mode: 'single',
+          result_version: Number(canonicalDurable.result_version || 0),
+          updated_at: clean(canonicalDurable.updated_at || canonicalDurable.submitted_at),
+        },
+      });
+    }
+  }
+  if (!affected.length) throw new Error('Không còn kết quả hợp lệ để xử lý. Vui lòng làm mới bảng theo dõi và thử lại.');
 
   if (target.study_mode === 'co_learning' && resultGroupId) {
     const foundUserIds = new Set(affected.map((item) => clean(item.data.user_id)).filter(Boolean));
     const missing = participantUserIds.filter((userId) => !foundUserIds.has(userId));
     if (missing.length) {
-      throw new Error(`Chưa thể xử lý học cùng vì thiếu kết quả của ${missing.length} thành viên. Không có dữ liệu nào được thay đổi.`);
+      throw new Error(`Chưa thể xử lý học cùng vì thiếu kết quả của ${missing.length} thành viên. Hệ thống chưa thay đổi dữ liệu.`);
     }
   }
 
   if (payload.action === 'allow_retake') {
     const alreadyGranted = affected.filter((item) => Number(item.data.official_retake_remaining || 0) > 0 && clean(item.data.official_retake_grant_id));
     if (alreadyGranted.length === affected.length) {
-      throw new Error('Học sinh đã có quyền học lại cập nhật điểm. Hãy yêu cầu học sinh đăng xuất/đăng nhập lại hoặc làm mới dữ liệu để bắt đầu lượt học lại.');
+      throw new Error('Học sinh đã được cấp quyền học lại. Vui lòng làm mới bảng theo dõi để xem trạng thái mới nhất.');
     }
   }
 
@@ -4466,22 +4560,21 @@ export async function moderateFirebaseLearningResult(
   const actionId = id('RESULT_ACTION');
   const state = payload.action === 'allow_retake' ? 'valid' : 'invalid_cheating';
   const actionRef = doc(school(), 'learningResultActions', actionId);
-
-  // V6.84.11: quyền học lại là thao tác chính. Chỉ batch các progress/session cần
-  // thay đổi để giảm số Rules evaluator trong một atomic request. Lịch sử xử lý
-  // được ghi SAU khi đã xác minh grant/trạng thái thành công; lỗi audit không được
-  // phép làm mất quyền học lại vừa cấp.
   const progressBatch = writeBatch(firestoreDb);
-  affected.forEach(({ ref, data }) => {
-    const nextVersion = Math.max(Number(data.result_version || 0) + 1, Date.now());
+
+  affected.forEach(({ ref, data, create, durable: itemDurable }) => {
+    const nextVersion = Math.max(Number(data.result_version || itemDurable?.result_version || 0) + 1, Date.now());
     if (payload.action === 'allow_retake') {
+      const durableScore = Number(itemDurable?.assessment_score ?? itemDurable?.score);
       const previousScore = Number.isFinite(Number(data.assessment_score))
         ? Number(data.assessment_score)
-        : (Number.isFinite(Number(data.previous_official_score)) ? Number(data.previous_official_score) : undefined);
+        : Number.isFinite(Number(data.previous_official_score))
+          ? Number(data.previous_official_score)
+          : Number.isFinite(durableScore) ? durableScore : undefined;
       if (!Number.isFinite(Number(previousScore))) {
-        throw new Error('Kết quả hiện tại chưa có điểm chính thức hợp lệ để chuyển sang trạng thái học lại.');
+        throw new Error('Chưa xác định được điểm chính thức để cấp quyền học lại. Vui lòng làm mới bảng theo dõi và thử lại.');
       }
-      progressBatch.update(ref, {
+      const grantPatch = {
         result_state: 'valid',
         retake_allowed: true,
         official_retake_remaining: 1,
@@ -4490,20 +4583,56 @@ export async function moderateFirebaseLearningResult(
         official_retake_granted_by_uid: me.uid,
         official_retake_granted_by_name: clean(me.displayName || me.username || me.userId),
         previous_official_score: Number(previousScore),
-        previous_official_completed_at: clean(data.completed_at || data.last_closed_at || data.updated_at || now),
+        previous_official_completed_at: clean(data.completed_at || data.last_closed_at || data.updated_at || itemDurable?.submitted_at || now),
         score_status: 'retake_pending',
         score_reason: 'official_retake_pending',
-        assessment_score: deleteField(),
-        current_score: deleteField(),
-        final_quiz_score: deleteField(),
         invalidated_reason: reason || '',
         last_result_action_id: actionId,
         result_version: nextVersion,
         updated_at: now,
         updatedAt: serverTimestamp(),
-      });
+      } as Record<string, unknown>;
+
+      if (create) {
+        progressBatch.set(ref, withoutUndefined({
+          schoolId: FIREBASE_SCHOOL_ID,
+          schemaVersion: 2,
+          progress_id: clean(data.progress_id),
+          ownerUid: clean(data.ownerUid || itemDurable?.ownerUid),
+          user_id: clean(data.user_id),
+          lesson_id: lessonId,
+          lesson_title: clean(data.lesson_title || itemDurable?.lesson_title || lessonData.tieu_de || lessonData.title),
+          mon_hoc: clean(data.mon_hoc || itemDurable?.mon_hoc || lessonData.mon_hoc),
+          khoi: clean(data.khoi || itemDurable?.khoi || resolvedGrade),
+          lop_id: clean(data.lop_id || itemDurable?.lop_id || resolvedClassId),
+          status: 'completed',
+          completion_percent: Math.max(0, Math.min(100, Number(data.completion_percent || itemDurable?.completion_percent || 100))),
+          completed_steps: 5,
+          total_steps: 5,
+          last_stage: 'tong_ket',
+          step_details: emptyProgressSteps(),
+          quiz_total: Number(itemDurable?.total_count || 0),
+          quiz_answered: Number(itemDurable?.total_count || 0),
+          quiz_correct: Number(itemDurable?.correct_count || 0),
+          quiz_percent: Number(itemDurable?.total_count || 0) > 0 ? Math.round((Number(itemDurable?.correct_count || 0) / Number(itemDurable?.total_count || 1)) * 100) : 0,
+          score_model_version: 4,
+          preparation_score: 0,
+          preparation_weight: 0,
+          study_mode: 'single',
+          result_group_id: `${clean(data.user_id)}_${lessonId}`,
+          ...grantPatch,
+        }), { merge: false });
+      } else {
+        progressBatch.update(ref, {
+          ...grantPatch,
+          assessment_score: deleteField(),
+          current_score: deleteField(),
+          final_quiz_score: deleteField(),
+        });
+      }
       return;
     }
+
     progressBatch.update(ref, {
       result_state: 'invalid_cheating',
       retake_allowed: false,
@@ -4519,6 +4648,7 @@ export async function moderateFirebaseLearningResult(
       updatedAt: serverTimestamp(),
     });
   });
+
   if (sessionRef && payload.action === 'invalidate_cheating') {
     progressBatch.set(sessionRef, {
       status: state,
@@ -4536,14 +4666,14 @@ export async function moderateFirebaseLearningResult(
       ? clean((error as { code?: unknown }).code)
       : '';
     if (code.includes('permission-denied')) {
-      const actionName = payload.action === 'allow_retake' ? 'cấp quyền học lại cập nhật điểm' : 'hủy kết quả do gian lận';
-      throw new Error(`Firestore từ chối ${actionName}. Hãy xác minh Firestore Rules hiện hành, tài khoản đang active và giáo viên được phân công khối ${resolvedGrade || '-'}. Hệ thống chưa thay đổi kết quả.`);
+      throw new Error(payload.action === 'allow_retake'
+        ? 'Chưa thể cấp quyền học lại lúc này. Hệ thống chưa thay đổi điểm của học sinh; vui lòng làm mới bảng theo dõi và thử lại.'
+        : 'Chưa thể cập nhật trạng thái kết quả lúc này. Hệ thống chưa thay đổi dữ liệu; vui lòng làm mới bảng theo dõi và thử lại.');
     }
     throw error;
   }
 
-  // Read-after-write: chỉ báo grant thành công khi toàn bộ progress đã phản ánh
-  // actionId mới. Với học cùng, batch ở trên bảo đảm hoặc tất cả cùng đổi hoặc không ai đổi.
+  // Read-after-write: chỉ báo thành công khi trạng thái mới đọc lại đúng.
   const verificationSnaps = await Promise.all(affected.map((item) => getDoc(item.ref)));
   const verificationFailed = verificationSnaps.some((snap) => {
     if (!snap.exists()) return true;
@@ -4566,11 +4696,11 @@ export async function moderateFirebaseLearningResult(
       || clean(data.result_state) !== 'invalid_cheating';
   });
   if (verificationFailed) {
-    throw new Error('Firestore đã nhận thao tác nhưng hệ thống chưa xác minh được trạng thái mới. Hãy bấm Làm mới trước khi thao tác lại để tránh cấp trùng quyền học lại.');
+    throw new Error(payload.action === 'allow_retake'
+      ? 'Quyền học lại đang được cập nhật. Vui lòng làm mới bảng theo dõi trước khi thao tác lại.'
+      : 'Trạng thái kết quả đang được cập nhật. Vui lòng làm mới bảng theo dõi trước khi thao tác lại.');
   }
 
-  // Audit history is secondary. Never roll back/pretend failure after the grant
-  // itself has already been verified on Firestore.
   let auditSaved = true;
   let auditWarning = '';
   try {
@@ -4580,19 +4710,19 @@ export async function moderateFirebaseLearningResult(
       result_state: state,
       result_group_id: resultGroupId,
       lesson_id: lessonId,
-      lesson_title: clean(target.lesson_title || lessonData.tieu_de || lessonData.title),
+      lesson_title: clean(target.lesson_title || canonicalDurable?.lesson_title || lessonData.tieu_de || lessonData.title),
       khoi: resolvedGrade,
       lop_id: resolvedClassId,
       affected_user_ids: affected.map((item) => clean(item.data.user_id)),
       affected_progress_ids: affected.map((item) => clean(item.data.progress_id)),
-      previous_results: affected.map((item) => moderationSnapshot(item.data)),
+      previous_results: affected.map((item) => moderationSnapshot({ ...item.data, assessment_score: item.data.assessment_score ?? item.durable?.assessment_score ?? item.durable?.score })),
       reason,
       actorUid: me.uid,
       actor_user_id: clean(me.userId),
       actor_name: clean(me.displayName || me.username || me.userId),
       schoolId: FIREBASE_SCHOOL_ID,
       schemaVersion: 1,
-      moderationVersion: 3,
+      moderationVersion: 4,
       created_at: now,
       createdAt: serverTimestamp(),
     }));

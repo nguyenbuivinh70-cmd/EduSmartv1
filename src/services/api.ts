@@ -2406,7 +2406,10 @@ export async function moderateLearningResultApi(
       data,
     };
   } catch (error) {
-    return { ok: false, message: firebaseErrorMessage(error), error };
+    const message = payload.action === 'allow_retake'
+      ? 'Chưa thể cấp quyền học lại lúc này. Hệ thống chưa thay đổi điểm của học sinh; vui lòng làm mới bảng theo dõi và thử lại.'
+      : 'Chưa thể cập nhật trạng thái kết quả lúc này. Hệ thống chưa thay đổi dữ liệu; vui lòng làm mới bảng theo dõi và thử lại.';
+    return { ok: false, message, error };
   }
 }
 
