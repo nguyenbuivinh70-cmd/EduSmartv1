@@ -161,9 +161,11 @@ import type { ImportEntity, ImportPreviewResult } from './utils/importValidators
 import Login from './components/Login';
 import Layout from './components/Layout';
 import LessonCard from './components/LessonCard';
+import OfflineLessonExportModal from './components/OfflineLessonExportModal';
 import LoadingOverlay from './components/LoadingOverlay';
 import Toast from './components/Toast';
 import { professionalUserMessage } from './utils/userMessages';
+import { exportOfflineLessonPackage, type OfflineLessonExportOptions } from './utils/offlineLessonExporter';
 import DataToolbar from './components/DataToolbar';
 import AccountFormModal from './components/AccountFormModal';
 import ClassFormModal from './components/ClassFormModal';
@@ -954,6 +956,8 @@ export default function App() {
   const [activeMenu, setActiveMenu] = useState('learning');
   const [isAIConfigOpen, setIsAIConfigOpen] = useState(false);
   const [isComposerOpen, setIsComposerOpen] = useState(false);
+  const [offlineExportLesson, setOfflineExportLesson] = useState<Lesson | null>(null);
+  const [isOfflineExporting, setIsOfflineExporting] = useState(false);
   const [isAssistantReady, setIsAssistantReady] = useState(false);
 
   const [aiConfig, setAIConfig] = useState<AIConfig>({ apiKey: '', model: AI_MODELS[0] });
@@ -2561,7 +2565,14 @@ useEffect(() => {
       : queuedCoLearningRecord
         ? { ...scopedRecord }
         : { ...scopedRecord, study_mode: 'single', co_learning_session_id: '', co_learner_ids: '', co_learner_user_ids: [], co_learner_names: [], result_group_id: `${record.user_id}_${record.lesson_id}` };
-    const res = await saveLearningProgressApi(user.token, payload);
+    let res = await saveLearningProgressApi(user.token, payload);
+    // V6.88.20: khi nộp điểm chính thức, thử làm mới danh tính/token đúng 1 lần
+    // trước khi đưa vào hàng đợi local. Điều này xử lý phiên đăng nhập lâu ngày
+    // mà không tạo vòng lặp retry và không làm thay đổi logic Rules.
+    if (!res.ok && payload.score_status === 'finalized') {
+      clearFirebaseIdentityCache();
+      res = await saveLearningProgressApi(user.token, payload);
+    }
     if (!res.ok) {
       queuePendingLearningProgress(user.user_id, payload);
       setProgressRecordsSync((current) => current.map((item) => item.progress_id === record.progress_id ? { ...item, ...payload, save_state: 'save_failed' } : item));
@@ -3456,6 +3467,33 @@ useEffect(() => {
     const { normalizeLessonContent } = await import('./services/gemini');
     setEditingContent(loadedContent ? normalizeLessonContent(loadedContent) : null);
     setIsComposerOpen(true);
+  };
+
+  const handleOfflineLessonExport = async (options: OfflineLessonExportOptions) => {
+    if (!user || !offlineExportLesson) return;
+    setIsOfflineExporting(true);
+    try {
+      const res = await getLessonContentApi(user.token, offlineExportLesson.lesson_id);
+      if (!res.ok) {
+        if (!handleSessionError(res.message)) showToast(res.message || 'Chưa thể tải nội dung bài học để xuất offline.', 'error');
+        return;
+      }
+      const payload = res.data as LessonContentResponse;
+      const { normalizeLessonContent } = await import('./services/gemini');
+      const normalizedContent = payload?.content ? normalizeLessonContent(payload.content) : null;
+      if (!normalizedContent) {
+        showToast('Bài học chưa có đủ nội dung để tạo gói offline.', 'error');
+        return;
+      }
+      const result = await exportOfflineLessonPackage(offlineExportLesson, normalizedContent, options);
+      setOfflineExportLesson(null);
+      showToast(`Đã tạo ${result.format === 'zip' ? 'gói ZIP' : 'file HTML'} offline: ${result.fileName}`, 'success');
+    } catch (error) {
+      console.error('Offline lesson export failed', error);
+      showToast('Chưa thể tạo gói bài học offline. Hãy thử lại hoặc chọn video có dung lượng nhỏ hơn.', 'error');
+    } finally {
+      setIsOfflineExporting(false);
+    }
   };
 
   const handleComposerSave = async (values: LessonComposerValues) => {
@@ -4771,6 +4809,19 @@ useEffect(() => {
                   <UploadCloud className="h-3.5 w-3.5" /> Gửi admin duyệt
                 </button>
               ) : null}
+              {canModify && lesson.trang_thai !== 'archived' ? (
+                <button
+                  onClick={(event) => {
+                    stopTileAction(event);
+                    event.currentTarget.closest('details')?.removeAttribute('open');
+                    setOfflineExportLesson(lesson);
+                  }}
+                  className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold text-sky-700 hover:bg-sky-50"
+                  title="Tạo gói bài học sử dụng không cần Internet"
+                >
+                  <Download className="h-3.5 w-3.5" /> Xuất bài học Offline
+                </button>
+              ) : null}
               {canModify ? <div className="my-1 border-t border-slate-100" /> : null}
               {canModify && lesson.trang_thai !== 'archived' ? (
                 <button disabled={Boolean(lessonDeletingId)} onClick={(event) => { stopTileAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); askDeleteLesson(lesson); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold text-rose-700 hover:bg-rose-50 disabled:cursor-wait disabled:opacity-60">
@@ -4886,6 +4937,11 @@ useEffect(() => {
                   <button onClick={(event) => { stopCardAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); void handleSubmitReview(lesson); }} className="flex w-full items-center rounded-lg px-3 py-2 text-left text-xs font-semibold text-amber-700 transition hover:bg-amber-50">Gửi admin duyệt</button>
                 )}
                 {canModify && lesson.trang_thai !== 'archived' && (
+                  <button onClick={(event) => { stopCardAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); setOfflineExportLesson(lesson); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-semibold text-indigo-700 transition hover:bg-indigo-50">
+                    <Download className="h-3.5 w-3.5" /> Xuất bài học Offline
+                  </button>
+                )}
+                {canModify && lesson.trang_thai !== 'archived' && (
                   <button disabled={Boolean(lessonDeletingId)} onClick={(event) => { stopCardAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); askDeleteLesson(lesson); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-semibold text-rose-700 transition hover:bg-rose-50 disabled:cursor-wait disabled:opacity-60">
                     {lessonDeletingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />} {lessonDeletingId === lesson.lesson_id ? 'Đang lưu trữ...' : 'Lưu trữ bài học'}
                   </button>
@@ -4937,6 +4993,11 @@ useEffect(() => {
               {lessonLockUpdatingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : lesson.is_locked ? <Unlock className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5" />}
               {lesson.is_locked ? 'Mở khóa' : 'Khóa'}
             </span>
+          </button>
+        )}
+        {canModify && (
+          <button onClick={(event) => { stopCardAction(event); setOfflineExportLesson(lesson); }} className="rounded-full bg-indigo-50 px-3 py-2 text-xs font-semibold text-indigo-700 hover:bg-indigo-100">
+            <span className="inline-flex items-center gap-1"><Download className="h-3.5 w-3.5" /> Xuất Offline</span>
           </button>
         )}
         {canModify && (
@@ -6535,6 +6596,16 @@ useEffect(() => {
         onSave={handleComposerSave}
         onOpenConfig={openAIConfigModal}
       />
+      )}
+
+      {user.vai_tro !== 'student' && (
+        <OfflineLessonExportModal
+          isOpen={Boolean(offlineExportLesson)}
+          lesson={offlineExportLesson}
+          isExporting={isOfflineExporting}
+          onClose={() => { if (!isOfflineExporting) setOfflineExportLesson(null); }}
+          onExport={handleOfflineLessonExport}
+        />
       )}
 
       <SchoolYearTransferModal

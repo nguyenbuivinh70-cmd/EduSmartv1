@@ -48,6 +48,7 @@ const legacyPreLessonSubmissionRef = (userId: string, lessonId: string) => doc(s
 const lessonPreparationSubmissionsCollection = (lessonId: string) => collection(firestoreDb, 'schools', FIREBASE_SCHOOL_ID, 'lessons', lessonId, 'preparationSubmissions');
 const lessonPreparationSubmissionRef = (lessonId: string, authUid: string, revision: number) => doc(lessonPreparationSubmissionsCollection(lessonId), `${clean(authUid)}_r${Math.max(1, Math.floor(Number(revision || 1)))}`);
 const lessonDeletionJobRef = (lessonId: string) => doc(school(), 'lessonDeletionJobs', clean(lessonId));
+const finalSubmissionRef = (userId: string, lessonId: string) => doc(school(), 'finalSubmissions', `${clean(userId)}_${clean(lessonId)}`);
 const archivedGradeRecordRef = (lessonId: string, progressId: string) => doc(school(), 'archivedGradeRecords', `${clean(lessonId)}__${clean(progressId)}`);
 const retakesCollection = (progressId: string) => collection(firestoreDb, 'schools', FIREBASE_SCHOOL_ID, 'learningProgress', progressId, 'retakes');
 const retakeRef = (progressId: string, attemptId: string) => doc(firestoreDb, 'schools', FIREBASE_SCHOOL_ID, 'learningProgress', progressId, 'retakes', attemptId);
@@ -60,7 +61,7 @@ let bootstrapPromise: { uid: string; value: Promise<Record<string, any[]>> } | n
 let lessonPublishRulesVerifiedKey = '';
 let selfStudyRulesVerifiedKey = '';
 const LESSON_PUBLISH_CAPABILITY = 'lesson_publish_v2';
-const LESSON_PUBLISH_RULES_LABEL = 'V6.88.17';
+const LESSON_PUBLISH_RULES_LABEL = 'V6.88.21';
 const CLASS_SCOPED_SELF_STUDY_CAPABILITY = 'class_scoped_self_study_v5';
 
 function clean(value: unknown) { return value == null ? '' : String(value).trim(); }
@@ -3588,6 +3589,112 @@ export function subscribeFirebaseLearningProgress(
   };
 }
 
+
+async function listFirebaseFinalSubmissions(filters: Record<string, unknown> = {}) {
+  const me = await identity();
+  const base = namedCollection('finalSubmissions');
+  const filterUserId = clean(filters.user_id);
+  const filterLessonId = clean(filters.lesson_id);
+  const filterClassId = clean(filters.lop_id);
+  const filterGrade = clean(filters.khoi);
+  let docs: QueryDocumentSnapshot<DocumentData>[] = [];
+
+  if (me.role === 'admin' || me.adminPermission === true) {
+    let target: any = base;
+    if (filterUserId) target = query(base, where('user_id', '==', filterUserId));
+    else if (filterLessonId) target = query(base, where('lesson_id', '==', filterLessonId));
+    else if (filterClassId) target = query(base, where('lop_id', '==', filterClassId));
+    else if (filterGrade) target = query(base, where('khoi', '==', filterGrade));
+    docs = (await getAllQueryDocs(target)).docs;
+  } else if (me.role === 'teacher') {
+    let grades = await teacherQueryGrades(me);
+    if (filterGrade) grades = grades.filter((grade) => sameGrade(grade, filterGrade));
+    if (!grades.length) return [];
+    const snapshots = await Promise.all(grades.map((grade) => getAllQueryDocs(query(base, where('khoi', '==', grade)))));
+    const merged = new Map<string, QueryDocumentSnapshot<DocumentData>>();
+    snapshots.forEach(snapshot => snapshot.docs.forEach(item => merged.set(item.id, item)));
+    docs = Array.from(merged.values());
+  } else {
+    docs = (await getAllQueryDocs(query(base, where('ownerUid', '==', me.uid)))).docs;
+  }
+
+  return docs.map((item) => ({ submission_id: item.id, ...item.data() } as any)).filter((item: any) => {
+    if (me.role === 'teacher' && me.adminPermission !== true && !teacherCanManageGrade(me, item.khoi)) return false;
+    if (filterUserId && clean(item.user_id) !== filterUserId) return false;
+    if (filterLessonId && clean(item.lesson_id) !== filterLessonId) return false;
+    if (filterClassId && clean(item.lop_id) !== filterClassId) return false;
+    if (filterGrade && !sameGrade(item.khoi, filterGrade)) return false;
+    return clean(item.score_status) === 'finalized' && Number.isFinite(Number(item.assessment_score ?? item.score));
+  });
+}
+
+function overlayFinalSubmissionsOnProgress(items: LessonProgressRecord[], submissions: any[]) {
+  const byKey = new Map(items.map(item => [`${clean(item.user_id)}__${clean(item.lesson_id)}`, item]));
+  const byUidLesson = new Map<string, LessonProgressRecord>(items
+    .filter((item: any) => clean((item as any).ownerUid))
+    .map((item: any) => [`${clean(item.ownerUid)}__${clean(item.lesson_id)}`, item] as [string, LessonProgressRecord]));
+
+  submissions.forEach((submission: any) => {
+    const key = `${clean(submission.user_id)}__${clean(submission.lesson_id)}`;
+    const uidKey = `${clean(submission.ownerUid)}__${clean(submission.lesson_id)}`;
+    const existing = (clean(submission.ownerUid) ? byUidLesson.get(uidKey) : undefined) || byKey.get(key);
+    const score = Math.round(Math.max(0, Math.min(10, Number(submission.assessment_score ?? submission.score ?? 0))) * 10) / 10;
+    const finalExamPatch = {
+      status: clean(submission.final_exam_status) || 'submitted',
+      score,
+      total_score: score,
+      correct_count: Number(submission.correct_count || 0),
+      total_count: Number(submission.total_count || 0),
+      attempt_number: Number(submission.attempt_number || 1),
+      submitted_at: clean(submission.submitted_at),
+    };
+    if (existing) {
+      const learning = existing.step_details?.luyen_tap || ({} as any);
+      Object.assign(existing, {
+        ownerUid: clean(submission.ownerUid) || existing.ownerUid,
+        lesson_title: clean(existing.lesson_title) || clean(submission.lesson_title),
+        khoi: clean(existing.khoi) || clean(submission.khoi),
+        lop_id: clean(existing.lop_id) || clean(submission.lop_id),
+        status: 'completed',
+        score_status: 'finalized',
+        score_model_version: 4,
+        final_quiz_score: score,
+        current_score: score,
+        assessment_score: score,
+        score_reason: clean(submission.score_reason) || 'submitted',
+        result_state: 'valid',
+        result_version: Math.max(Number(existing.result_version || 0), Number(submission.result_version || 0)),
+        updated_at: clean(submission.updated_at || submission.submitted_at) || existing.updated_at,
+        step_details: {
+          ...(existing.step_details || {}),
+          luyen_tap: { ...learning, completed: true, finalExam: { ...(learning as any).finalExam, ...finalExamPatch } },
+        },
+      });
+      return;
+    }
+    const syntheticUserId = clean(submission.user_id) || `UID:${clean(submission.ownerUid)}`;
+    byKey.set(`${syntheticUserId}__${clean(submission.lesson_id)}`, {
+      progress_id: `${syntheticUserId}_${clean(submission.lesson_id)}`,
+      ownerUid: clean(submission.ownerUid),
+      user_id: syntheticUserId,
+      lesson_id: clean(submission.lesson_id),
+      lesson_title: clean(submission.lesson_title),
+      mon_hoc: clean(submission.mon_hoc),
+      khoi: clean(submission.khoi),
+      lop_id: clean(submission.lop_id),
+      status: 'completed', completion_percent: Number(submission.completion_percent || 100), completed_steps: 0, total_steps: 5,
+      updated_at: clean(submission.updated_at || submission.submitted_at),
+      step_details: { luyen_tap: { completed: true, finalExam: finalExamPatch } } as any,
+      quiz_total: Number(submission.total_count || 0), quiz_answered: Number(submission.total_count || 0), quiz_correct: Number(submission.correct_count || 0),
+      quiz_percent: Number(submission.total_count || 0) > 0 ? Math.round(Number(submission.correct_count || 0) / Number(submission.total_count) * 100) : 0,
+      assessment_score: score, final_quiz_score: score, current_score: score,
+      score_status: 'finalized', score_model_version: 4, score_reason: clean(submission.score_reason) || 'submitted',
+      result_state: 'valid', result_version: Number(submission.result_version || 0), retake_allowed: true,
+    } as LessonProgressRecord);
+  });
+  return Array.from(byKey.values());
+}
+
 export async function listFirebaseProgress(filters: Record<string, unknown> = {}) {
   const me = await identity();
   const base = collection(school(), 'learningProgress');
@@ -3643,7 +3750,7 @@ export async function listFirebaseProgress(filters: Record<string, unknown> = {}
     docs = snap.docs;
   }
 
-  const learningItems = docs.map(item => {
+  let learningItems = docs.map(item => {
     const row = { progress_id: item.id, ...item.data() } as unknown as LessonProgressRecord;
     // V6.86.0: dữ liệu preLessonProgress cũ không còn là nguồn sự thật của thống kê.
     // Giáo viên chỉ thấy kết quả đã được học sinh chủ động gửi trong preLessonSubmissions.
@@ -3663,6 +3770,15 @@ export async function listFirebaseProgress(filters: Record<string, unknown> = {}
     if (filterGrade && !sameGrade(item.khoi, filterGrade)) return false;
     return true;
   });
+  try {
+    const finalSubmissions = await listFirebaseFinalSubmissions(filters);
+    learningItems = overlayFinalSubmissionsOnProgress(learningItems, finalSubmissions);
+  } catch (error) {
+    // Không biến một lỗi đọc ledger thành mất toàn bộ Theo dõi học tập; learningProgress
+    // vẫn được trả về. Các lần refresh sau sẽ thử overlay lại.
+    console.warn('[EduSmart][V6.88.21] finalSubmissions overlay deferred', { code: firebaseErrorCode(error) });
+  }
+
   let preItems: PreLessonSubmission[];
   try {
     preItems = await listFirebasePreLessonSubmissions(filters);
@@ -3777,17 +3893,67 @@ function mergeProgressPayloadMonotonic(current: any, incoming: LessonProgressRec
   });
 }
 
+/**
+ * V6.88.20: canonical Score Model V4 submission envelope.
+ *
+ * The UI may calculate a mathematically exact fraction (for example 10/15 =
+ * 6.6666...), while the official V4 score is intentionally stored to one
+ * decimal place (6.7). Firestore Rules verify that finalExam.score equals the
+ * top-level official score. Normalize both representations at the last write
+ * boundary so old local pending packets and new submissions behave identically.
+ */
+function normalizeScoreModelV4SubmissionEnvelope(input: LessonProgressRecord): LessonProgressRecord {
+  if (Number(input.score_model_version || 0) !== 4) return input;
+  const stepDetails: any = input.step_details || {};
+  const learning: any = stepDetails.luyen_tap || {};
+  const finalExam: any = learning.finalExam || {};
+  const finalStatus = clean(finalExam.status);
+  const submitted = ['submitted', 'auto_submitted', 'expired'].includes(finalStatus);
+  const totalCount = Number(finalExam.total_count || 0);
+  const rawScore = Number(finalExam.score ?? input.final_quiz_score);
+  if (!submitted || totalCount <= 0 || !Number.isFinite(rawScore)) return input;
+
+  const score = Math.round(Math.max(0, Math.min(10, rawScore)) * 10) / 10;
+  const sectionItems = Object.values(learning.sectionProgress || {}) as any[];
+  const allSectionsCompleted = sectionItems.length === 0 || sectionItems.every((item: any) => clean(item?.status) === 'completed');
+  const finalized = clean(input.score_status) === 'finalized';
+
+  return withoutUndefined({
+    ...input,
+    step_details: {
+      ...stepDetails,
+      luyen_tap: {
+        ...learning,
+        completed: Boolean(learning.completed || (allSectionsCompleted && submitted)),
+        finalExam: {
+          ...finalExam,
+          score,
+          total_score: finalized ? score : (Number.isFinite(Number(finalExam.total_score)) ? Number(finalExam.total_score) : undefined),
+        },
+      },
+    },
+    final_quiz_score: score,
+    current_score: finalized ? score : input.current_score,
+    assessment_score: finalized ? score : input.assessment_score,
+    learning_component_weight: 0,
+    final_component_weight: totalCount > 0 ? 100 : 0,
+    preparation_score: 0,
+    preparation_weight: 0,
+  }) as unknown as LessonProgressRecord;
+}
+
 function progressFirestoreWriteData(data: LessonProgressRecord) {
-  const output: Record<string, any> = { ...data, updatedAt: serverTimestamp() };
-  if (Number(data.score_model_version || 0) >= 3) {
+  const normalized = normalizeScoreModelV4SubmissionEnvelope(data);
+  const output: Record<string, any> = { ...normalized, updatedAt: serverTimestamp() };
+  if (Number(normalized.score_model_version || 0) >= 3) {
     // V6.79.0: xóa điểm legacy chưa đủ điều kiện thay vì để điểm cũ tiếp tục hiện.
-    if (data.score_status !== 'finalized' || !Number.isFinite(Number(data.assessment_score))) output.assessment_score = deleteField();
-    if (!Number.isFinite(Number(data.current_score))) output.current_score = deleteField();
-    if (!Number.isFinite(Number(data.learning_process_score))) output.learning_process_score = deleteField();
-    if (!Number.isFinite(Number(data.final_quiz_score))) output.final_quiz_score = deleteField();
+    if (normalized.score_status !== 'finalized' || !Number.isFinite(Number(normalized.assessment_score))) output.assessment_score = deleteField();
+    if (!Number.isFinite(Number(normalized.current_score))) output.current_score = deleteField();
+    if (!Number.isFinite(Number(normalized.learning_process_score))) output.learning_process_score = deleteField();
+    if (!Number.isFinite(Number(normalized.final_quiz_score))) output.final_quiz_score = deleteField();
   }
 
-  if (Number(data.score_model_version || 0) === 4) {
+  if (Number(normalized.score_model_version || 0) === 4) {
     // V6.84.11: tạo payload Score Model V4 duy nhất, không để trường điểm legacy
     // từ document cũ làm Rules từ chối bài nộp hợp lệ.
     output.section_scores = {};
@@ -3798,23 +3964,137 @@ function progressFirestoreWriteData(data: LessonProgressRecord) {
     output.scored_section_count = 0;
     output.scorable_section_count = 0;
 
-    const finalExam = data.step_details?.luyen_tap?.finalExam;
+    const finalExam = normalized.step_details?.luyen_tap?.finalExam;
     const finalStatus = clean(finalExam?.status);
     const finalSubmitted = ['submitted', 'auto_submitted', 'expired'].includes(finalStatus);
-    const finalScore = Number(finalExam?.score ?? data.final_quiz_score);
+    const finalScore = Number(finalExam?.score ?? normalized.final_quiz_score);
     const finalQuizExists = Number(finalExam?.total_count || 0) > 0;
     output.final_component_weight = finalQuizExists ? 100 : 0;
 
-    if (data.score_status === 'finalized' && finalSubmitted && finalQuizExists && Number.isFinite(finalScore)) {
+    if (normalized.score_status === 'finalized' && finalSubmitted && finalQuizExists && Number.isFinite(finalScore)) {
       const normalizedScore = Math.round(Math.max(0, Math.min(10, finalScore)) * 10) / 10;
       output.final_quiz_score = normalizedScore;
       output.current_score = normalizedScore;
       output.assessment_score = normalizedScore;
       output.score_status = 'finalized';
-      output.score_reason = clean(data.score_reason) || 'submitted';
+      output.score_reason = clean(normalized.score_reason) || 'submitted';
     }
   }
   return output;
+}
+
+
+/**
+ * V6.88.21: durable official final-submission ledger.
+ *
+ * learningProgress is a large, legacy-compatible document and historically may
+ * be rejected by one of its many validation branches even when the final exam
+ * itself is valid.  The small finalSubmissions document is the canonical proof
+ * that the student pressed Nộp bài and that the official score was accepted.
+ * Analytics overlays this ledger onto learningProgress, so a valid submission
+ * is never shown as "chưa nộp" merely because a secondary progress write was
+ * rejected.
+ */
+function buildCanonicalFinalSubmission(payload: LessonProgressRecord, me: any) {
+  const normalized = normalizeScoreModelV4SubmissionEnvelope(payload);
+  const finalExam: any = normalized.step_details?.luyen_tap?.finalExam || {};
+  const finalStatus = clean(finalExam.status);
+  const score = Number(normalized.assessment_score ?? normalized.final_quiz_score ?? finalExam.score);
+  const totalCount = Number(finalExam.total_count || 0);
+  const correctCount = Number(finalExam.correct_count || 0);
+  if (Number(normalized.score_model_version || 0) !== 4
+    || clean(normalized.score_status) !== 'finalized'
+    || !['submitted', 'auto_submitted', 'expired'].includes(finalStatus)
+    || !Number.isFinite(score) || totalCount <= 0 || !Number.isFinite(correctCount)) return null;
+  const roundedScore = Math.round(Math.max(0, Math.min(10, score)) * 10) / 10;
+  return withoutUndefined({
+    submission_id: `${clean(me.userId)}_${clean(normalized.lesson_id)}`,
+    schoolId: FIREBASE_SCHOOL_ID,
+    schemaVersion: 1,
+    ownerUid: clean(me.uid),
+    user_id: clean(me.userId),
+    lesson_id: clean(normalized.lesson_id),
+    lesson_title: clean(normalized.lesson_title),
+    mon_hoc: clean(normalized.mon_hoc),
+    khoi: clean(me.grade || normalized.khoi),
+    lop_id: clean(me.classId || normalized.lop_id),
+    status: 'finalized',
+    score_status: 'finalized',
+    score_model_version: 4,
+    score_reason: clean(normalized.score_reason) || 'submitted',
+    score: roundedScore,
+    assessment_score: roundedScore,
+    final_quiz_score: roundedScore,
+    correct_count: Math.max(0, Math.min(totalCount, Math.floor(correctCount))),
+    total_count: Math.max(1, Math.floor(totalCount)),
+    attempt_number: Math.max(1, Math.floor(Number(finalExam.attempt_number || 1))),
+    final_exam_status: finalStatus,
+    completion_percent: Math.max(0, Math.min(100, Number(normalized.completion_percent || 0))),
+    result_version: Math.max(Number(normalized.result_version || 0), Date.now()),
+    submitted_at: clean(finalExam.submitted_at) || new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+}
+
+async function saveCanonicalFinalSubmission(payload: LessonProgressRecord, me: any) {
+  const data = buildCanonicalFinalSubmission(payload, me);
+  if (!data) return null;
+  const ref = finalSubmissionRef(data.user_id, data.lesson_id);
+  await setDoc(ref, { ...data, updatedAt: serverTimestamp() }, { merge: true });
+  const verified = await getDoc(ref);
+  if (!verified.exists()) throw Object.assign(new Error('Kết quả nộp bài chưa được xác nhận. Hãy thử lại.'), { diagnosticCode: 'FINAL_SUBMISSION_NOT_CONFIRMED' });
+  const row = verified.data() as any;
+  const serverScore = Number(row.assessment_score ?? row.score);
+  if (clean(row.ownerUid) !== clean(me.uid)
+    || clean(row.user_id) !== clean(me.userId)
+    || clean(row.lesson_id) !== clean(data.lesson_id)
+    || clean(row.score_status) !== 'finalized'
+    || !Number.isFinite(serverScore)
+    || Math.abs(serverScore - Number(data.assessment_score)) > 0.001) {
+    throw Object.assign(new Error('Kết quả nộp bài chưa được xác nhận đầy đủ. Hãy thử lại.'), { diagnosticCode: 'FINAL_SUBMISSION_VERIFY_FAILED' });
+  }
+  return { ...data, ...row, assessment_score: serverScore, final_quiz_score: serverScore, score: serverScore };
+}
+
+function progressFallbackFromFinalSubmission(payload: LessonProgressRecord, submission: any): LessonProgressRecord {
+  const score = Number(submission?.assessment_score ?? submission?.score ?? payload.assessment_score ?? payload.final_quiz_score ?? 0);
+  const finalExam: any = payload.step_details?.luyen_tap?.finalExam || {};
+  return withoutUndefined({
+    ...payload,
+    progress_id: `${clean(submission?.user_id || payload.user_id)}_${clean(payload.lesson_id)}`,
+    ownerUid: clean(submission?.ownerUid || payload.ownerUid),
+    user_id: clean(submission?.user_id || payload.user_id),
+    khoi: clean(submission?.khoi || payload.khoi),
+    lop_id: clean(submission?.lop_id || payload.lop_id),
+    status: 'completed',
+    score_status: 'finalized',
+    score_model_version: 4,
+    final_quiz_score: score,
+    current_score: score,
+    assessment_score: score,
+    score_reason: clean(submission?.score_reason) || 'submitted',
+    result_state: 'valid',
+    result_version: Number(submission?.result_version || payload.result_version || Date.now()),
+    updated_at: clean(submission?.updated_at || submission?.submitted_at) || new Date().toISOString(),
+    save_state: 'saved',
+    step_details: {
+      ...(payload.step_details || {}),
+      luyen_tap: {
+        ...(payload.step_details?.luyen_tap || {}),
+        completed: true,
+        finalExam: {
+          ...finalExam,
+          status: clean(submission?.final_exam_status || finalExam.status) || 'submitted',
+          score,
+          total_score: score,
+          correct_count: Number(submission?.correct_count ?? finalExam.correct_count ?? 0),
+          total_count: Number(submission?.total_count ?? finalExam.total_count ?? 0),
+          attempt_number: Number(submission?.attempt_number ?? finalExam.attempt_number ?? 1),
+          submitted_at: clean(submission?.submitted_at || finalExam.submitted_at),
+        },
+      },
+    },
+  }) as unknown as LessonProgressRecord;
 }
 
 async function saveFirebaseProgressNow(payload: LessonProgressRecord) {
@@ -3977,19 +4257,43 @@ async function saveFirebaseProgressNow(payload: LessonProgressRecord) {
     return ownProgress || common;
   }
 
+  // V6.88.21: lưu sổ nộp bài chính thức độc lập trước. Nếu document tiến độ
+  // legacy bị một nhánh Rules cũ từ chối, bài nộp hợp lệ vẫn được ghi nhận và
+  // Theo dõi học tập vẫn lấy đúng điểm từ finalSubmissions.
+  let durableSubmission: any = null;
+  let durableSubmissionError: unknown = null;
+  if (clean(commonIncoming.score_status) === 'finalized' && Number(commonIncoming.score_model_version || 0) === 4) {
+    try { durableSubmission = await saveCanonicalFinalSubmission(commonIncoming, me); }
+    catch (error) { durableSubmissionError = error; }
+  }
+
   const ref = doc(school(), 'learningProgress', progressId);
-  const currentSnap = await getDoc(ref);
-  const currentData = currentSnap.exists() ? currentSnap.data() : {};
+  const currentSnap = await getDoc(ref).catch(() => null);
+  const currentData = currentSnap?.exists() ? currentSnap.data() : {};
   const incoming = withoutUndefined({
     ...commonIncoming,
     result_group_id: clean(payload.result_group_id) || `${canonicalUserId}_${canonicalLessonId}`,
   }) as unknown as LessonProgressRecord;
   const data = mergeProgressPayloadMonotonic(currentData, incoming) as LessonProgressRecord;
-  await setDoc(ref, progressFirestoreWriteData(data), { merge: true });
+  try {
+    await setDoc(ref, progressFirestoreWriteData(data), { merge: true });
+  } catch (error) {
+    if (durableSubmission) {
+      console.warn('[EduSmart][V6.88.21] learningProgress write deferred; official submission is durable', {
+        lessonId: clean(payload.lesson_id),
+        code: firebaseErrorCode(error),
+      });
+      return progressFallbackFromFinalSubmission(data, durableSubmission);
+    }
+    throw durableSubmissionError || error;
+  }
   // V6.84.11: read-after-write verification. Chỉ báo lưu thành công khi document
   // chính thức thực sự đọc lại được từ Firestore với version vừa ghi.
-  const verifiedSnap = await getDoc(ref);
-  if (!verifiedSnap.exists()) throw Object.assign(new Error('Kết quả đang được đồng bộ. Bài làm của em vẫn được giữ an toàn; hãy thử lại.'), { diagnosticCode: 'LEARNING_RESULT_NOT_CONFIRMED' });
+  const verifiedSnap = await getDoc(ref).catch(() => null);
+  if (!verifiedSnap?.exists()) {
+    if (durableSubmission) return progressFallbackFromFinalSubmission(data, durableSubmission);
+    throw durableSubmissionError || Object.assign(new Error('Kết quả đang được đồng bộ. Bài làm của em vẫn được giữ an toàn; hãy thử lại.'), { diagnosticCode: 'LEARNING_RESULT_NOT_CONFIRMED' });
+  }
   const verified = verifiedSnap.data() as LessonProgressRecord;
   if (Number(verified.result_version || 0) < Number(resultVersion || 0)) {
     throw Object.assign(new Error('Kết quả đang được đồng bộ. Bài làm của em vẫn được giữ an toàn; hãy thử lại.'), { diagnosticCode: 'LEARNING_RESULT_VERSION_NOT_CONFIRMED' });

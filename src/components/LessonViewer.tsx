@@ -1159,8 +1159,12 @@ export default function LessonViewer({
     const finalCorrectNow = activeFinalQuiz.filter((question, index) =>
       answerStates[getQuestionKey(question, index + allInteractiveQuestions.length)]?.isCorrect,
     ).length;
+    // V6.88.20: Điểm chính thức phải có cùng độ chính xác ở cả payload lồng
+    // finalExam.score và các trường điểm top-level. Rules V4 so sánh hai giá trị
+    // này để chống sửa điểm; score thô kiểu 10/15 = 6.666... trong khi top-level
+    // được làm tròn 6.7 khiến bài hợp lệ bị từ chối khi nộp.
     const finalScoreNow = activeFinalQuiz.length > 0
-      ? Math.min(10, Math.max(0, (finalCorrectNow / activeFinalQuiz.length) * 10))
+      ? Math.round(Math.min(10, Math.max(0, (finalCorrectNow / activeFinalQuiz.length) * 10)) * 10) / 10
       : undefined;
     const submittedAssessment = calculateFairAssessmentScore({
       finalQuizScore: finalScoreNow,
