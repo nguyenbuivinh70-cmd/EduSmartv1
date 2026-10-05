@@ -129,7 +129,7 @@ function getMilestoneLessonIds(config: ScoreTrackingConfig | null, key: Assessme
 
 function getPreparationEvaluation(lesson: Lesson, row?: StudentLearningAnalyticsRow) {
   const threshold = Math.max(50, Math.min(100, Number(lesson.pre_lesson_completion_threshold || 80)));
-  const watchPercent = Math.max(0, Math.min(100, Math.round(Number(row?.pre_lesson_watch_percent || 0))));
+  const watchPercent = Math.max(0, Math.min(100, Math.round(Number(row?.pre_lesson_watch_percent || 0) * 10) / 10));
   const late = row?.pre_lesson_preparation_status === 'late_completed'
     || (row?.pre_lesson_status === 'completed' && row?.pre_lesson_completed_before_deadline === false);
   const prepared = !late && (row?.pre_lesson_preparation_status === 'prepared'
@@ -604,7 +604,18 @@ export default function LearningAnalyticsPanel({
     const prepared = evaluations.filter((item) => item.state === 'prepared').length;
     const lateCompleted = evaluations.filter((item) => item.state === 'late_completed').length;
     const notStarted = evaluations.filter((item) => item.state === 'not_started').length;
-    return { lesson, total: lessonStudents.length, prepared, lateCompleted, notStarted, notPrepared: Math.max(0, lessonStudents.length - prepared), rate: lessonStudents.length ? Math.round((prepared / lessonStudents.length) * 100) : 0 };
+    const submitted = prepared + lateCompleted;
+    const submittedPercents = evaluations.filter((item) => item.state !== 'not_started').map((item) => item.watchPercent);
+    const averageWatchPercent = submittedPercents.length
+      ? Math.round((submittedPercents.reduce((sum, value) => sum + value, 0) / submittedPercents.length) * 10) / 10
+      : 0;
+    return {
+      lesson, total: lessonStudents.length, prepared, lateCompleted, submitted, notStarted,
+      notPrepared: Math.max(0, lessonStudents.length - submitted),
+      rate: lessonStudents.length ? Math.round((submitted / lessonStudents.length) * 1000) / 10 : 0,
+      onTimeRate: lessonStudents.length ? Math.round((prepared / lessonStudents.length) * 1000) / 10 : 0,
+      averageWatchPercent,
+    };
   }), [preparationLessons, visibleStudents, progressMap, preparationProgressByUid]);
 
   const preparationStats = useMemo(() => {
@@ -612,14 +623,24 @@ export default function LearningAnalyticsPanel({
       const total = preparationSummaryRows.reduce((sum, item) => sum + item.total, 0);
       const prepared = preparationSummaryRows.reduce((sum, item) => sum + item.prepared, 0);
       const lateCompleted = preparationSummaryRows.reduce((sum, item) => sum + item.lateCompleted, 0);
+      const submitted = prepared + lateCompleted;
       const notStarted = preparationSummaryRows.reduce((sum, item) => sum + item.notStarted, 0);
-      return { total, prepared, lateCompleted, notStarted, notPrepared: Math.max(0, total - prepared), rate: total ? Math.round((prepared / total) * 100) : 0 };
+      return {
+        total, prepared, lateCompleted, submitted, notStarted, notPrepared: Math.max(0, total - submitted),
+        rate: total ? Math.round((submitted / total) * 1000) / 10 : 0,
+        onTimeRate: total ? Math.round((prepared / total) * 1000) / 10 : 0,
+      };
     }
     const total = preparationDetailRowsAll.length;
     const prepared = preparationDetailRowsAll.filter((item) => item.evaluation.state === 'prepared').length;
     const lateCompleted = preparationDetailRowsAll.filter((item) => item.evaluation.state === 'late_completed').length;
+    const submitted = prepared + lateCompleted;
     const notStarted = preparationDetailRowsAll.filter((item) => item.evaluation.state === 'not_started').length;
-    return { total, prepared, lateCompleted, notStarted, notPrepared: Math.max(0, total - prepared), rate: total ? Math.round((prepared / total) * 100) : 0 };
+    return {
+      total, prepared, lateCompleted, submitted, notStarted, notPrepared: Math.max(0, total - submitted),
+      rate: total ? Math.round((submitted / total) * 1000) / 10 : 0,
+      onTimeRate: total ? Math.round((prepared / total) * 1000) / 10 : 0,
+    };
   }, [selectedPreparationLesson, preparationSummaryRows, preparationDetailRowsAll]);
 
   const gradebookRows = useMemo(() => {
@@ -869,7 +890,8 @@ export default function LearningAnalyticsPanel({
         'Đã chuẩn bị': preparationStats.prepared,
         'Hoàn thành muộn': preparationStats.lateCompleted,
         'Chưa gửi': preparationStats.notStarted,
-        'Tỷ lệ chuẩn bị': `${preparationStats.rate}%`,
+        'Tỷ lệ đã gửi': `${preparationStats.rate}%`,
+        'Tỷ lệ đúng hạn': `${preparationStats.onTimeRate}%`,
       }];
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(summary), 'TongHop');
     } else {
@@ -883,7 +905,9 @@ export default function LearningAnalyticsPanel({
         'Đã chuẩn bị': item.prepared,
         'Hoàn thành muộn': item.lateCompleted,
         'Chưa gửi': item.notStarted,
-        'Tỷ lệ chuẩn bị': `${item.rate}%`,
+        'Tỷ lệ đã gửi': `${item.rate}%`,
+        'Tỷ lệ đúng hạn': `${item.onTimeRate}%`,
+        'Độ phủ video TB khi gửi': `${item.averageWatchPercent}%`,
       }));
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(rowsForExport), 'TongHopChuanBi');
     }
@@ -1092,7 +1116,7 @@ export default function LearningAnalyticsPanel({
             </h2>
             <p className="mt-1 max-w-3xl text-sm text-slate-500">
               {analyticsModule === 'preparation'
-                ? 'Chỉ ghi nhận khi học sinh xem đủ ngưỡng và chủ động bấm Gửi kết quả chuẩn bị bài; kết quả không tham gia điểm.'
+                ? 'Chỉ ghi nhận kết quả đã gửi. Tỷ lệ đã gửi gồm cả đúng hạn và hoàn thành muộn; độ phủ video được giữ chính xác đến 0,1% và không tham gia điểm.'
                 : activeTab === 'class'
                   ? 'Chọn một lớp cụ thể để xem điểm chính thức và tính trung bình theo các mốc đã cấu hình.'
                   : activeTab === 'grade'
@@ -1505,17 +1529,17 @@ function GradeSummaryTable({ rows, grade, onSelectClass }: { rows: Array<any>; g
 }
 
 
-function PreparationSummaryTable({ rows, onSelectLesson }: { rows: Array<{ lesson: Lesson; total: number; prepared: number; lateCompleted: number; notStarted: number; notPrepared: number; rate: number }>; onSelectLesson: (lessonId: string) => void }) {
+function PreparationSummaryTable({ rows, onSelectLesson }: { rows: Array<{ lesson: Lesson; total: number; prepared: number; lateCompleted: number; submitted: number; notStarted: number; notPrepared: number; rate: number; onTimeRate: number; averageWatchPercent: number }>; onSelectLesson: (lessonId: string) => void }) {
   if (!rows.length) return <EmptyState title="Chưa có dữ liệu chuẩn bị bài" description="Các bài có video chuẩn bị sẽ xuất hiện tại đây." />;
   return (
     <div className="overflow-hidden rounded-[30px] bg-white shadow-sm ring-1 ring-slate-100">
       <div className="border-b border-fuchsia-100 bg-fuchsia-50 px-5 py-4">
         <h3 className="font-bold text-slate-900">Tổng hợp chuẩn bị bài theo bài học</h3>
-        <p className="mt-1 text-xs font-semibold text-slate-500">Đã chuẩn bị chỉ khi học sinh xem đủ ngưỡng và bấm gửi kết quả. Học sinh chưa gửi sẽ được hiển thị là chưa hoàn tất chuẩn bị bài.</p>
+        <p className="mt-1 text-xs font-semibold text-slate-500">Đã chuẩn bị = gửi đủ ngưỡng đúng hạn. Hoàn thành muộn vẫn được tính là đã gửi; tỷ lệ hoàn thành phản ánh toàn bộ kết quả đã gửi, còn tỷ lệ đúng hạn được theo dõi riêng.</p>
       </div>
       <div className="overflow-x-auto">
         <table className="min-w-full text-sm">
-          <thead className="bg-slate-50 text-left text-slate-500"><tr>{['Bài học', 'Ngưỡng', 'Học sinh', 'Đã chuẩn bị', 'Hoàn thành muộn', 'Chưa gửi', 'Tỷ lệ', 'Chi tiết'].map((item) => <th key={item} className="px-4 py-3 font-semibold">{item}</th>)}</tr></thead>
+          <thead className="bg-slate-50 text-left text-slate-500"><tr>{['Bài học', 'Ngưỡng', 'Học sinh', 'Đã chuẩn bị', 'Hoàn thành muộn', 'Chưa gửi', 'Tỷ lệ đã gửi', 'Đúng hạn', 'Chi tiết'].map((item) => <th key={item} className="px-4 py-3 font-semibold">{item}</th>)}</tr></thead>
           <tbody>{rows.map((item) => (
             <tr key={item.lesson.lesson_id} className="border-t border-slate-100 hover:bg-slate-50/60">
               <td className="min-w-[280px] px-4 py-4"><p className="font-bold text-slate-900">{getLessonColumnLabel(item.lesson)} • {item.lesson.tieu_de}</p><p className="mt-1 text-xs text-slate-500">{item.lesson.mon_hoc || item.lesson.mon_id} • Khối {item.lesson.khoi}</p></td>
@@ -1524,7 +1548,8 @@ function PreparationSummaryTable({ rows, onSelectLesson }: { rows: Array<{ lesso
               <td className="px-4 py-4"><span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-black text-emerald-700">{item.prepared}</span></td>
               <td className="px-4 py-4"><span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-black text-amber-700">{item.lateCompleted}</span></td>
               <td className="px-4 py-4"><span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-black text-slate-600">{item.notStarted}</span></td>
-              <td className="px-4 py-4"><span className="font-black text-indigo-700">{item.rate}%</span></td>
+              <td className="px-4 py-4"><span className="font-black text-indigo-700">{item.rate}%</span><p className="mt-1 text-[11px] font-semibold text-slate-400">{item.submitted}/{item.total} đã gửi</p></td>
+              <td className="px-4 py-4"><span className="font-black text-emerald-700">{item.onTimeRate}%</span><p className="mt-1 text-[11px] font-semibold text-slate-400">Video TB {item.averageWatchPercent}%</p></td>
               <td className="px-4 py-4"><button type="button" onClick={() => onSelectLesson(item.lesson.lesson_id)} className="rounded-xl bg-fuchsia-600 px-3 py-2 text-xs font-bold text-white hover:bg-fuchsia-700">Xem học sinh</button></td>
             </tr>
           ))}</tbody>

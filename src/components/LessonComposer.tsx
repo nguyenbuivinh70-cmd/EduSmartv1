@@ -3,16 +3,18 @@ import { AnimatePresence, motion } from 'motion/react';
 import { AlertTriangle, BookOpenCheck, CheckCircle2, ChevronLeft, ChevronRight, Edit3, FileText, KeyRound, Link2, Loader2, PlayCircle, Presentation, Rocket, Save, Settings2, Sparkles, Upload, Users, X, Youtube } from 'lucide-react';
 import {
   AIConfig,
+  Account,
   CatalogClass,
   Lesson,
   LessonComposerValues,
   LessonBuilderSettings,
   LessonContent,
+  LessonTeacherPermissionKey,
   Subject,
   User,
 } from '../types';
-import { analyzeLessonMaterial, fileToUploadedSourceFile, reviseLessonWithAI, upgradeLessonToV3 } from '../services/gemini';
-import { getLessonBuilderDefaultsApi, resetLessonBuilderDefaultsApi, saveLessonBuilderDefaultsApi } from '../services/api';
+import { analyzeLessonMaterial, fileToUploadedSourceFile, getLessonQuestionQuotaStatus, reviseLessonWithAI, upgradeLessonToV3 } from '../services/gemini';
+import { getLessonAssignmentDefaultsApi, getLessonBuilderDefaultsApi, resetLessonBuilderDefaultsApi, saveLessonAssignmentDefaultsApi, saveLessonBuilderDefaultsApi } from '../services/api';
 import { DEFAULT_ACTIVE_GRADES, sortGrades } from '../constants';
 import { buildLessonTitle, normalizeLessonName, normalizeLessonNumber, resolveLessonIdentity } from '../utils/lessonCatalog';
 import { getManagedGradeScope, teacherManagesAllGrades } from '../utils/gradeScope';
@@ -21,6 +23,7 @@ import AIRevisionPanel from './AIRevisionPanel';
 import GoogleSlidesPromptModal from './GoogleSlidesPromptModal';
 import LessonContentEditorWindow from './LessonContentEditorWindow';
 import YoutubeEmbedBlock, { getYoutubeEmbedUrl } from './YoutubeEmbedBlock';
+import { LESSON_TEACHER_PERMISSION_KEYS, LESSON_TEACHER_PERMISSION_LABELS, normalizeLessonTeacherPermissionList, normalizeLessonTeacherPermissionMap } from '../utils/lessonPermissions';
 
 function gradeIncluded(subjectGradeList: string | undefined, grade: string) {
   const normalizedGrade = String(grade || '').trim();
@@ -55,6 +58,7 @@ interface LessonComposerProps {
   aiConfig: AIConfig;
   subjects: Subject[];
   classes: CatalogClass[];
+  accounts?: Account[];
   existingLessons?: Lesson[];
   initialLesson?: Lesson | null;
   initialContent?: LessonContent | null;
@@ -145,6 +149,7 @@ function formatDefaultUpdatedAt(value?: string) {
 }
 
 function buildInitialValues(user: User, lesson?: Lesson | null, content?: LessonContent | null, systemSchoolYear?: string, defaultBuilderSettings?: LessonBuilderSettings | null): LessonComposerValues {
+  const quickDefaults = !lesson ? readSavedAssignmentConfiguration(user) : null;
   const savedBuilderSettings = (lesson?.raw as any)?.builder_settings as LessonBuilderSettings | undefined;
   const settings = mergeLessonBuilderSettings(savedBuilderSettings || content?.settings || (!lesson ? defaultBuilderSettings : null));
   const sectionVideoLinks = (content?.sections || []).map((section) => section.youtube_url || section.youtube_embed_url || '').join('\n');
@@ -166,8 +171,8 @@ function buildInitialValues(user: User, lesson?: Lesson | null, content?: Lesson
     tom_tat: lesson?.mo_ta || content?.metadata?.tom_tat || '',
     mon_id: lesson?.mon_id || '',
     khoi: lesson?.khoi || getManagedGradeScope(user)[0] || user.khoi || '6',
-    lop_id: lesson?.lop_id || '',
-    pham_vi: lesson?.pham_vi || 'private',
+    lop_id: lesson?.lop_id || quickDefaults?.values.lop_id || '',
+    pham_vi: lesson?.pham_vi || quickDefaults?.values.pham_vi || 'private',
     share_now: lesson?.trang_thai === 'pending_review',
     save_mode: lesson?.trang_thai === 'draft' ? 'draft' : 'publish',
     tu_khoa: content?.metadata?.tu_khoa?.join(', ') || '',
@@ -187,13 +192,23 @@ function buildInitialValues(user: User, lesson?: Lesson | null, content?: Lesson
     source_text: '',
     source_file: null,
     nam_hoc: lesson?.nam_hoc || lesson?.raw?.nam_hoc || systemSchoolYear || currentSchoolYear(),
-    hoc_ky: lesson?.hoc_ky || lesson?.raw?.hoc_ky || 'HK1',
+    hoc_ky: lesson?.hoc_ky || lesson?.raw?.hoc_ky || quickDefaults?.values.hoc_ky || 'HK1',
     thoi_gian_bat_dau: toDatetimeLocalValue(lesson?.thoi_gian_bat_dau || lesson?.raw?.thoi_gian_bat_dau || ''),
     thoi_gian_ket_thuc: toDatetimeLocalValue(lesson?.thoi_gian_ket_thuc || lesson?.raw?.thoi_gian_ket_thuc || ''),
-    cho_phep_hoc_sau_han: lesson?.cho_phep_hoc_sau_han === true || String(lesson?.cho_phep_hoc_sau_han || lesson?.raw?.cho_phep_hoc_sau_han || '').toLowerCase() === 'true',
-    cho_phep_nop_sau_han: lesson?.cho_phep_nop_sau_han === true || String(lesson?.cho_phep_nop_sau_han || lesson?.raw?.cho_phep_nop_sau_han || '').toLowerCase() === 'true',
-    access_mode: lesson?.access_mode || lesson?.raw?.access_mode || 'teacher_controlled',
-    allow_retake_after_completion: lesson?.allow_retake_after_completion === true || lesson?.raw?.allow_retake_after_completion === true,
+    cho_phep_hoc_sau_han: lesson ? (lesson?.cho_phep_hoc_sau_han === true || String(lesson?.cho_phep_hoc_sau_han || lesson?.raw?.cho_phep_hoc_sau_han || '').toLowerCase() === 'true') : Boolean(quickDefaults?.values.cho_phep_hoc_sau_han),
+    cho_phep_nop_sau_han: lesson ? (lesson?.cho_phep_nop_sau_han === true || String(lesson?.cho_phep_nop_sau_han || lesson?.raw?.cho_phep_nop_sau_han || '').toLowerCase() === 'true') : Boolean(quickDefaults?.values.cho_phep_nop_sau_han),
+    access_mode: lesson?.access_mode || lesson?.raw?.access_mode || quickDefaults?.values.access_mode || 'teacher_controlled',
+    allow_retake_after_completion: lesson ? (lesson?.allow_retake_after_completion === true || lesson?.raw?.allow_retake_after_completion === true) : Boolean(quickDefaults?.values.allow_retake_after_completion),
+    teacher_permissions_configured: lesson ? (lesson?.teacher_permissions_configured === true || lesson?.raw?.teacher_permissions_configured === true) : Boolean(quickDefaults?.values.teacher_permissions_configured),
+    teacher_permissions: normalizeLessonTeacherPermissionMap(lesson?.teacher_permissions || lesson?.raw?.teacher_permissions),
+    teacher_global_permissions: lesson
+      ? (() => {
+          const explicit = normalizeLessonTeacherPermissionList(lesson?.teacher_global_permissions || lesson?.raw?.teacher_global_permissions);
+          if (explicit.length) return explicit;
+          const legacy = normalizeLessonTeacherPermissionMap(lesson?.teacher_permissions || lesson?.raw?.teacher_permissions);
+          return normalizeLessonTeacherPermissionList(Object.values(legacy).flat());
+        })()
+      : normalizeLessonTeacherPermissionList(quickDefaults?.values.teacher_global_permissions),
   };
 }
 
@@ -213,6 +228,8 @@ type SavedAssignmentConfiguration = {
     | 'cho_phep_nop_sau_han'
     | 'access_mode'
     | 'allow_retake_after_completion'
+    | 'teacher_permissions_configured'
+    | 'teacher_global_permissions'
   >;
 };
 
@@ -244,6 +261,8 @@ function readSavedAssignmentConfiguration(user: User): SavedAssignmentConfigurat
         cho_phep_nop_sau_han: Boolean(parsed.values.cho_phep_nop_sau_han),
         access_mode: parsed.values.access_mode === 'self_study' ? 'self_study' : 'teacher_controlled',
         allow_retake_after_completion: Boolean(parsed.values.allow_retake_after_completion),
+        teacher_permissions_configured: Boolean(parsed.values.teacher_permissions_configured),
+        teacher_global_permissions: normalizeLessonTeacherPermissionList(parsed.values.teacher_global_permissions),
       },
     };
   } catch {
@@ -274,7 +293,7 @@ function lessonEditSnapshot(values: LessonComposerValues) {
   return JSON.stringify(rest);
 }
 
-export default function LessonComposer({ isOpen, user, aiConfig, subjects, classes, existingLessons = [], initialLesson, initialContent, currentSchoolYear: systemSchoolYear, onClose, onSave, onOpenConfig }: LessonComposerProps) {
+export default function LessonComposer({ isOpen, user, aiConfig, subjects, classes, accounts = [], existingLessons = [], initialLesson, initialContent, currentSchoolYear: systemSchoolYear, onClose, onSave, onOpenConfig }: LessonComposerProps) {
   const [lessonBuilderDefaults, setLessonBuilderDefaults] = useState<LessonBuilderSettings | null>(null);
   const [lessonBuilderDefaultsUpdatedAt, setLessonBuilderDefaultsUpdatedAt] = useState('');
   const [isLoadingLessonDefaults, setIsLoadingLessonDefaults] = useState(false);
@@ -319,6 +338,32 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
   }, [isOpen, user, initialLesson, initialContent, systemSchoolYear]);
 
   useEffect(() => {
+    if (!isOpen || !user.token || user.vai_tro === 'student' || initialLesson || initialContent) return;
+    let cancelled = false;
+    getLessonAssignmentDefaultsApi(user.token).then((res) => {
+      if (cancelled || !res.ok || !res.data) return;
+      const raw = res.data as any;
+      const saved: SavedAssignmentConfiguration = {
+        version: 1,
+        savedAt: String(raw.savedAt || raw.saved_at || ''),
+        values: {
+          lop_id: String(raw.lop_id || ''), pham_vi: raw.pham_vi === 'shared' ? 'shared' : 'private',
+          nam_hoc: String(raw.nam_hoc || ''), hoc_ky: String(raw.hoc_ky || 'HK1'),
+          thoi_gian_bat_dau: '', thoi_gian_ket_thuc: '',
+          cho_phep_hoc_sau_han: Boolean(raw.cho_phep_hoc_sau_han), cho_phep_nop_sau_han: Boolean(raw.cho_phep_nop_sau_han),
+          access_mode: raw.access_mode === 'self_study' ? 'self_study' : 'teacher_controlled',
+          allow_retake_after_completion: Boolean(raw.allow_retake_after_completion),
+          teacher_permissions_configured: Boolean(raw.teacher_permissions_configured),
+          teacher_global_permissions: normalizeLessonTeacherPermissionList(raw.teacher_global_permissions),
+        },
+      };
+      setSavedAssignmentConfig(saved);
+      setValues((prev) => ({ ...prev, ...saved.values, thoi_gian_bat_dau: prev.thoi_gian_bat_dau, thoi_gian_ket_thuc: prev.thoi_gian_ket_thuc, nam_hoc: saved.values.nam_hoc || prev.nam_hoc }));
+    }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [isOpen, user.token, user.vai_tro, initialLesson, initialContent]);
+
+  useEffect(() => {
     if (isEditMode && savedSnapshotRef.current && savedSnapshotRef.current !== currentSnapshot) {
       setSavedStatusMessage('');
     }
@@ -360,6 +405,24 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
   }, [gradeOptions, values.khoi]);
 
   const availableSubjects = useMemo(() => subjects.filter((item) => gradeIncluded(item.khoi_ap_dung, values.khoi)), [subjects, values.khoi]);
+  const canConfigureTeacherPermissions = !initialLesson
+    || user.vai_tro === 'admin'
+    || user.quyen_admin === true
+    || String(user.quyen_admin).toLowerCase() === 'true'
+    || initialLesson.nguoi_tao_id === user.user_id;
+  const permissionTeachers = useMemo(() => accounts
+    .filter((account) => account.vai_tro === 'teacher' && account.user_id !== user.user_id && String(account.trang_thai || 'active').toLowerCase() !== 'inactive')
+    .filter((account) => {
+      if (account.tat_ca_khoi === true || String(account.tat_ca_khoi).toLowerCase() === 'true') return true;
+      const scopes = Array.isArray(account.khoi_phu_trach)
+        ? account.khoi_phu_trach.map(normalizeGradeValue)
+        : String(account.khoi_phu_trach || '').split(/[;,|\s]+/).map(normalizeGradeValue).filter(Boolean);
+      const ownGrade = normalizeGradeValue(account.khoi);
+      const targetGrade = normalizeGradeValue(values.khoi);
+      return !targetGrade || scopes.includes(targetGrade) || ownGrade === targetGrade;
+    })
+    .sort((a, b) => String(a.ho_ten || a.ten_dang_nhap).localeCompare(String(b.ho_ten || b.ten_dang_nhap), 'vi')),
+  [accounts, user.user_id, values.khoi]);
   const selectedSubject = useMemo(() => subjects.find((item) => item.mon_id === values.mon_id)?.ten_mon || '', [subjects, values.mon_id]);
   const settings = mergeLessonBuilderSettings(values.builder_settings || lessonBuilderDefaults || DEFAULT_LESSON_BUILDER_SETTINGS);
   const duplicateLesson = useMemo(() => {
@@ -408,6 +471,26 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
     if (values.lesson_json) setContentNeedsRegeneration(true);
   };
 
+  const setGlobalTeacherPermission = (permission: LessonTeacherPermissionKey, enabled: boolean) => {
+    setValues((prev) => {
+      const current = new Set(normalizeLessonTeacherPermissionList(prev.teacher_global_permissions));
+      if (enabled) current.add(permission); else current.delete(permission);
+      return {
+        ...prev,
+        teacher_permissions_configured: true,
+        teacher_global_permissions: LESSON_TEACHER_PERMISSION_KEYS.filter((key) => current.has(key)),
+        teacher_permissions: {},
+      };
+    });
+  };
+
+  const setGlobalTeacherFullPermission = (enabled: boolean) => setValues((prev) => ({
+    ...prev,
+    teacher_permissions_configured: true,
+    teacher_global_permissions: enabled ? [...LESSON_TEACHER_PERMISSION_KEYS] : [],
+    teacher_permissions: {},
+  }));
+
   const withStructuredIdentity = (content: LessonContent): LessonContent => ({
     ...content,
     title: values.tieu_de,
@@ -445,6 +528,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
     ? (values.lesson_json?.activities || []).reduce((sum, activity) => sum + (activity.interactions?.length || 0), 0)
     : (values.lesson_json?.sections || []).reduce((sum, section) => sum + (section.interactive_questions?.length || 0), 0);
   const finalQuizCount = values.lesson_json?.final_quiz?.length || 0;
+  const questionQuotaStatus = values.lesson_json ? getLessonQuestionQuotaStatus(values.lesson_json, values.lesson_json.settings || settings) : null;
   const invalidSectionVideoCount = isLessonV3 ? 0 : (values.lesson_json?.sections || []).filter((section) => {
     const url = section.youtube_url || section.youtube_embed_url || '';
     return Boolean(url.trim() && !getYoutubeEmbedUrl(url));
@@ -507,6 +591,8 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
         cho_phep_nop_sau_han: Boolean(values.cho_phep_nop_sau_han),
         access_mode: values.access_mode === 'self_study' ? 'self_study' : 'teacher_controlled',
         allow_retake_after_completion: Boolean(values.allow_retake_after_completion),
+        teacher_permissions_configured: Boolean(values.teacher_permissions_configured),
+        teacher_global_permissions: normalizeLessonTeacherPermissionList(values.teacher_global_permissions),
       },
     };
     try {
@@ -656,6 +742,31 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
       setActiveStep('info');
       return;
     }
+    const lessonSettings = values.lesson_json.settings || values.builder_settings || settings;
+    if (saveMode === 'publish' && lessonSettings?.final_quiz_source_mode === 'random_bank') {
+      const bankCount = Array.isArray(values.lesson_json.question_bank) ? values.lesson_json.question_bank.length : 0;
+      const requiredCount = Math.max(1, Number(lessonSettings.final_quiz_count || 10));
+      if (bankCount < requiredCount) {
+        setErrorMessage(`Ngân hàng câu hỏi hiện có ${bankCount} câu nhưng kiểm tra cuối bài cần ${requiredCount} câu. Hãy bổ sung ngân hàng hoặc giảm số câu lấy ngẫu nhiên trước khi xuất bản.`);
+        setActiveStep('content');
+        return;
+      }
+    }
+    const quotaStatus = getLessonQuestionQuotaStatus(values.lesson_json, lessonSettings);
+    if (!quotaStatus.ok) {
+      const activityText = quotaStatus.activities.filter((item) => !item.ok).map((item) => `${item.title}: ${item.actual}/${item.target}`).join('; ');
+      const finalText = quotaStatus.final.ok ? '' : `Kiểm tra cuối bài: ${quotaStatus.final.actual}/${quotaStatus.final.target}`;
+      setErrorMessage(`Chưa đủ số câu theo cấu hình. ${[activityText, finalText].filter(Boolean).join('; ')}. Hãy tạo lại/bổ sung nội dung trước khi lưu.`);
+      setActiveStep('content');
+      return;
+    }
+    const effectiveSchoolYear = String(values.nam_hoc || currentSchoolYear || '').trim();
+    const effectiveSemester = String(values.hoc_ky || 'HK1').trim() || 'HK1';
+    if (values.thoi_gian_bat_dau && values.thoi_gian_ket_thuc && new Date(values.thoi_gian_ket_thuc).getTime() < new Date(values.thoi_gian_bat_dau).getTime()) {
+      setErrorMessage('Thời gian kết thúc phải sau thời gian bắt đầu.');
+      setActiveStep('publish');
+      return;
+    }
     const finalJson = withStructuredIdentity(mergeVideoLinks(values.lesson_json, values.section_video_links || '', values.intro_video_url || ''));
     setIsSaving(true);
     setErrorMessage('');
@@ -665,6 +776,8 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
         tieu_de: buildLessonTitle(values.lesson_number, values.lesson_name),
         lesson_number: normalizeLessonNumber(values.lesson_number),
         lesson_name: normalizeLessonName(values.lesson_name),
+        nam_hoc: effectiveSchoolYear,
+        hoc_ky: effectiveSemester,
         save_mode: saveMode,
         keep_editor_open: isEditMode,
         share_now: saveMode === 'publish' && values.pham_vi === 'shared',
@@ -676,6 +789,25 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
         tu_khoa: values.tu_khoa.trim(),
       };
       await onSave(savedValues);
+      if (user.token) {
+        void saveLessonBuilderDefaultsApi(user.token, mergeLessonBuilderSettings(savedValues.builder_settings || settings)).catch(() => undefined);
+      }
+      try {
+        const quick: SavedAssignmentConfiguration = {
+          version: 1, savedAt: new Date().toISOString(),
+          values: {
+            lop_id: savedValues.lop_id || '', pham_vi: savedValues.pham_vi, nam_hoc: savedValues.nam_hoc || '', hoc_ky: savedValues.hoc_ky || 'HK1',
+            thoi_gian_bat_dau: '', thoi_gian_ket_thuc: '',
+            cho_phep_hoc_sau_han: Boolean(savedValues.cho_phep_hoc_sau_han), cho_phep_nop_sau_han: Boolean(savedValues.cho_phep_nop_sau_han),
+            access_mode: savedValues.access_mode || 'teacher_controlled', allow_retake_after_completion: Boolean(savedValues.allow_retake_after_completion),
+            teacher_permissions_configured: Boolean(savedValues.teacher_permissions_configured),
+            teacher_global_permissions: normalizeLessonTeacherPermissionList(savedValues.teacher_global_permissions),
+          },
+        };
+        window.localStorage.setItem(assignmentConfigStorageKey(user), JSON.stringify(quick));
+        setSavedAssignmentConfig(quick);
+        if (user.token) void saveLessonAssignmentDefaultsApi(user.token, { ...quick.values, thoi_gian_bat_dau: '', thoi_gian_ket_thuc: '', savedAt: quick.savedAt }).catch(() => undefined);
+      } catch { /* cấu hình nhanh chỉ là best-effort */ }
       setValues(savedValues);
       savedSnapshotRef.current = lessonEditSnapshot(savedValues);
       setSavedStatusMessage(contentNeedsRegeneration
@@ -789,13 +921,31 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
   };
 
   const requestClose = () => {
-    if (isSaving) return;
-    if (isEditMode && hasUnsavedChanges) {
-      const discard = window.confirm('Bạn có thay đổi chưa được lưu. Bỏ các thay đổi và đóng cửa sổ chỉnh sửa?');
+    if (isSaving) {
+      const leaveWhileSaving = window.confirm('Hệ thống đang lưu dữ liệu. Bạn vẫn muốn đóng màn hình chỉnh sửa?');
+      if (!leaveWhileSaving) return;
+    } else if (hasUnsavedChanges) {
+      const discard = window.confirm('Bạn có thay đổi chưa lưu. Đóng màn hình và bỏ các thay đổi này?');
       if (!discard) return;
     }
+    setContentEditorOpen(false);
+    setSlidesPromptOpen(false);
+    setErrorMessage('');
+    setSavedStatusMessage('');
     onClose();
   };
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (contentEditorOpen || slidesPromptOpen) return;
+      event.preventDefault();
+      requestClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isOpen, contentEditorOpen, slidesPromptOpen, isSaving, hasUnsavedChanges]);
 
   const sectionVideoCount = isLessonV3 ? 0 : (values.lesson_json?.sections || []).filter((section) => getYoutubeEmbedUrl(section.youtube_url || section.youtube_embed_url)).length;
   const stepReady: Record<ComposerStep, boolean> = {
@@ -966,6 +1116,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
                       <div><p className="text-xs font-bold uppercase tracking-[0.18em] text-indigo-600">Bước 4</p><h3 className="mt-1 text-xl font-black text-slate-900">Tạo và biên tập hoạt động dạy học</h3><p className="mt-1 text-sm text-slate-500">AI đã chia bài thành hoạt động, các trang trình bày và tương tác. Giáo viên có thể rà soát trước khi xuất bản.</p></div>
                       {values.lesson_json ? <>
                         {contentNeedsRegeneration ? <div className="flex items-start justify-between gap-4 rounded-3xl border border-amber-200 bg-amber-50 p-5 text-sm text-amber-900"><div className="flex items-start gap-3"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" /><div><p className="font-black">Nội dung hiện tại không còn khớp</p><p className="mt-1">{isEditMode ? 'Cấu hình sinh nội dung đã thay đổi. Bạn có thể lưu cấu hình ngay và giữ nguyên nội dung hiện tại, hoặc tạo lại nội dung khi cần.' : 'Thông tin, thiết kế hoặc học liệu đã thay đổi sau lần tạo gần nhất. Không thể giao bài cho đến khi tạo lại.'}</p></div></div><button type="button" onClick={() => setActiveStep('material')} className="shrink-0 rounded-xl bg-amber-600 px-3 py-2 text-xs font-bold text-white">Tạo lại</button></div> : null}
+                        {questionQuotaStatus ? <div className={`rounded-3xl border p-4 ${questionQuotaStatus.ok ? 'border-emerald-200 bg-emerald-50' : 'border-rose-200 bg-rose-50'}`}><div className="flex flex-wrap items-center justify-between gap-2"><p className={`text-sm font-black ${questionQuotaStatus.ok ? 'text-emerald-800' : 'text-rose-800'}`}>Kiểm tra đủ số câu theo cấu hình</p><span className={`rounded-full px-3 py-1 text-xs font-black ${questionQuotaStatus.ok ? 'bg-white text-emerald-700' : 'bg-white text-rose-700'}`}>{questionQuotaStatus.ok ? 'Đạt yêu cầu' : 'Chưa đủ'}</span></div><div className="mt-3 flex flex-wrap gap-2 text-xs font-bold">{questionQuotaStatus.activities.map((item) => <span key={item.activity_id} className={`rounded-xl px-3 py-2 ${item.ok ? 'bg-white text-emerald-700' : 'bg-white text-rose-700'}`}>{item.title}: {item.actual}/{item.target}</span>)}<span className={`rounded-xl px-3 py-2 ${questionQuotaStatus.final.ok ? 'bg-white text-emerald-700' : 'bg-white text-rose-700'}`}>Cuối bài: {questionQuotaStatus.final.actual}/{questionQuotaStatus.final.target}</span></div></div> : null}
                         <div className="grid gap-4 md:grid-cols-2"><div className="md:col-span-2"><label className="mb-2 block text-sm font-semibold text-slate-700">Tóm tắt bài học</label><textarea value={values.tom_tat} onChange={(e) => setValues((prev) => ({ ...prev, tom_tat: e.target.value }))} rows={3} className="w-full rounded-3xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100" /></div><div className="md:col-span-2"><label className="mb-2 block text-sm font-semibold text-slate-700">Từ khóa</label><input value={values.tu_khoa} onChange={(e) => setValues((prev) => ({ ...prev, tu_khoa: e.target.value }))} className={fieldClass} placeholder="Ví dụ: bộ xử lí, máy tính, công nghệ thông tin" /></div></div>
                         <AIRevisionPanel value={values.ai_revision_request || ''} onChange={(next) => setValues((prev) => ({ ...prev, ai_revision_request: next }))} onRevise={() => void handleRevise()} disabled={!values.lesson_json || contentNeedsRegeneration} loading={isRevising} />
                         {!isLessonV3 ? <div className="flex flex-wrap items-center justify-between gap-3 rounded-3xl border border-cyan-200 bg-cyan-50 p-5"><div><h4 className="font-black text-slate-900">Nâng cấp bài cũ sang Hoạt động dạy học</h4><p className="mt-1 text-sm text-slate-600">Chuyển section hiện tại thành lesson_v3, giữ câu hỏi và kiểm tra cuối bài. Có thể dùng AI chỉnh sửa tiếp sau khi chuyển.</p></div><button type="button" onClick={upgradeExistingLessonToActivities} className="inline-flex items-center gap-2 rounded-2xl bg-cyan-600 px-4 py-3 text-sm font-bold text-white hover:bg-cyan-700"><Sparkles className="h-4 w-4" /> Nâng cấp sang lesson_v3</button></div> : null}
@@ -993,28 +1144,40 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
                     <div className="space-y-6">
                       <div><p className="text-xs font-bold uppercase tracking-[0.18em] text-indigo-600">Bước 5</p><h3 className="mt-1 text-xl font-black text-slate-900">Giao bài và xuất bản</h3><p className="mt-1 text-sm text-slate-500">Nội dung đã hoàn thiện. Bây giờ mới chọn lớp, phạm vi và thời gian học để tránh phải cấu hình vận hành quá sớm.</p></div>
 
-                      <div className="rounded-3xl border border-sky-100 bg-sky-50/70 p-4">
-                        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-                          <div>
-                            <div className="flex items-center gap-2">
-                              <Save className="h-4 w-4 text-sky-700" />
-                              <h4 className="font-black text-slate-900">Cấu hình giao bài dùng lại</h4>
-                            </div>
-                            <p className="mt-1 text-xs font-medium leading-5 text-slate-600">Lưu lớp, phạm vi, năm học, học kỳ, lịch mở/đóng bài, chế độ tự học và học lại để áp dụng nhanh cho bài học khác.</p>
-                            {savedAssignmentConfig?.savedAt ? <p className="mt-1 text-[11px] font-bold text-sky-700">Đã lưu: {formatSavedAssignmentTime(savedAssignmentConfig.savedAt)}</p> : <p className="mt-1 text-[11px] font-semibold text-slate-500">Chưa có cấu hình giao bài đã lưu.</p>}
-                          </div>
-                          <div className="flex flex-wrap gap-2">
-                            <button type="button" onClick={handleSaveAssignmentConfiguration} className="inline-flex items-center gap-2 rounded-xl bg-sky-600 px-3.5 py-2 text-xs font-black text-white shadow-sm hover:bg-sky-700"><Save className="h-3.5 w-3.5" /> Lưu cấu hình</button>
-                            <button type="button" onClick={handleApplyAssignmentConfiguration} disabled={!savedAssignmentConfig} className="inline-flex items-center gap-2 rounded-xl bg-white px-3.5 py-2 text-xs font-black text-sky-700 ring-1 ring-sky-200 hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-40"><CheckCircle2 className="h-3.5 w-3.5" /> Áp dụng đã lưu</button>
-                            <button type="button" onClick={handleClearAssignmentConfiguration} disabled={!savedAssignmentConfig} className="inline-flex items-center gap-2 rounded-xl bg-white px-3.5 py-2 text-xs font-black text-slate-600 ring-1 ring-slate-200 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"><X className="h-3.5 w-3.5" /> Xóa</button>
-                          </div>
-                        </div>
-                        {assignmentConfigStatus ? <div className="mt-3 rounded-2xl bg-white px-3.5 py-2.5 text-xs font-semibold text-sky-800 ring-1 ring-sky-100">{assignmentConfigStatus}</div> : null}
+                      <div className="rounded-3xl border border-slate-200 bg-slate-50/80 p-4 text-sm text-slate-700">
+                        <p className="font-bold text-slate-900">Thiết lập giao bài</p>
+                        <p className="mt-1">Các thông tin lớp áp dụng, năm học, học kỳ và lịch mở/đóng bài sẽ được lưu trực tiếp cùng bài học khi bạn bấm <b>Lưu bản nháp</b>, <b>Xuất bản bài học</b> hoặc <b>Lưu thay đổi</b>.</p>
                       </div>
+
+                      {canConfigureTeacherPermissions ? (
+                        <section className="rounded-3xl border border-indigo-100 bg-indigo-50/50 p-4">
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div>
+                              <div className="flex items-center gap-2 text-slate-900"><KeyRound className="h-5 w-5 text-indigo-600" /><h4 className="font-black">Quyền giáo viên khác</h4></div>
+                              <p className="mt-1 max-w-3xl text-xs leading-5 text-slate-600">Khi bật, các quyền được chọn áp dụng cho <b>toàn bộ giáo viên</b>. Chủ bài và quản trị viên luôn có đầy đủ quyền.</p>
+                            </div>
+                            <label className="inline-flex items-center gap-2 rounded-2xl bg-white px-3 py-2 text-xs font-bold text-indigo-700 ring-1 ring-indigo-100">
+                              <input type="checkbox" checked={values.teacher_permissions_configured === true} onChange={(e) => setValues((prev) => ({ ...prev, teacher_permissions_configured: e.target.checked, teacher_global_permissions: e.target.checked ? normalizeLessonTeacherPermissionList(prev.teacher_global_permissions) : [], teacher_permissions: {} }))} /> Bật quyền giáo viên
+                            </label>
+                          </div>
+                          {values.teacher_permissions_configured ? (() => {
+                            const selected = normalizeLessonTeacherPermissionList(values.teacher_global_permissions);
+                            const full = LESSON_TEACHER_PERMISSION_KEYS.every((key) => selected.includes(key));
+                            return <div className="mt-4 rounded-2xl border border-white bg-white p-3 shadow-sm">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <p className="text-xs font-semibold text-slate-500">Chọn các thao tác mà mọi giáo viên được phép thực hiện với bài học này.</p>
+                                <label className={`inline-flex items-center gap-2 rounded-xl px-3 py-2 text-xs font-black ${full ? 'bg-indigo-600 text-white' : 'bg-indigo-50 text-indigo-700'}`}><input type="checkbox" checked={full} onChange={(e) => setGlobalTeacherFullPermission(e.target.checked)} /> Toàn quyền</label>
+                              </div>
+                              <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">{LESSON_TEACHER_PERMISSION_KEYS.map((permission) => <label key={permission} className={`flex items-center gap-2 rounded-xl px-3 py-2 text-xs font-bold ${selected.includes(permission) ? 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-100' : 'bg-slate-50 text-slate-600'}`}><input type="checkbox" checked={selected.includes(permission)} onChange={(e) => setGlobalTeacherPermission(permission, e.target.checked)} />{LESSON_TEACHER_PERMISSION_LABELS[permission]}</label>)}</div>
+                              <p className="mt-3 text-[11px] font-semibold text-indigo-600">Cấu hình này được ghi nhớ để tự áp dụng nhanh cho bài học mới tiếp theo trên tài khoản hiện tại.</p>
+                            </div>;
+                          })() : <div className="mt-3 rounded-2xl bg-white px-4 py-3 text-xs font-semibold text-slate-600 ring-1 ring-indigo-100">Chưa bật quyền giáo viên. Giáo viên khác chỉ sử dụng các quyền mặc định của bài dùng chung.</div>}
+                        </section>
+                      ) : null}
 
                       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
                         <div><label className="mb-2 block text-sm font-semibold text-slate-700">Lớp áp dụng</label><select value={values.lop_id} onChange={(e) => setValues((prev) => ({ ...prev, lop_id: e.target.value }))} className={fieldClass} disabled={user.vai_tro === 'student'}><option value="">Tất cả / không cố định</option>{classes.filter((item) => !values.khoi || item.khoi === values.khoi).map((item) => <option key={item.lop_id} value={item.lop_id}>{item.ten_lop}</option>)}</select></div>
-                        <div><label className="mb-2 block text-sm font-semibold text-slate-700">Phạm vi sử dụng</label><select value={values.pham_vi} onChange={(e) => setValues((prev) => ({ ...prev, pham_vi: e.target.value as 'private' | 'shared' }))} className={fieldClass} disabled={user.vai_tro === 'student'}><option value="private">Dùng riêng</option><option value="shared">Dùng chung</option></select></div>
+                        <div><label className="mb-2 block text-sm font-semibold text-slate-700">Phạm vi sử dụng</label><select value={values.pham_vi} onChange={(e) => setValues((prev) => ({ ...prev, pham_vi: e.target.value as 'private' | 'shared' }))} className={fieldClass} disabled={user.vai_tro === 'student' || !canConfigureTeacherPermissions}><option value="private">Dùng riêng</option><option value="shared">Dùng chung</option></select></div>
                         <div><label className="mb-2 block text-sm font-semibold text-slate-700">Năm học</label><input value={values.nam_hoc || ''} onChange={(e) => setValues((prev) => ({ ...prev, nam_hoc: e.target.value }))} className={fieldClass} placeholder="2026-2027" /></div>
                         <div><label className="mb-2 block text-sm font-semibold text-slate-700">Học kỳ</label><select value={values.hoc_ky || 'HK1'} onChange={(e) => setValues((prev) => ({ ...prev, hoc_ky: e.target.value }))} className={fieldClass}><option value="HK1">Học kỳ 1</option><option value="HK2">Học kỳ 2</option></select></div>
                         <div><label className="mb-2 block text-sm font-semibold text-slate-700">Bắt đầu mở bài</label><input type="datetime-local" value={values.thoi_gian_bat_dau || ''} onChange={(e) => setValues((prev) => ({ ...prev, thoi_gian_bat_dau: e.target.value }))} className={fieldClass} /></div>
@@ -1025,36 +1188,10 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
                           <label className={`flex cursor-pointer items-start gap-3 rounded-2xl border px-4 py-3 text-sm font-semibold ${values.allow_retake_after_completion ? 'border-violet-200 bg-violet-50 text-violet-800' : 'border-slate-200 bg-slate-50 text-slate-700'}`}><input type="checkbox" className="mt-1" checked={Boolean(values.allow_retake_after_completion)} onChange={(e) => setValues((prev) => ({ ...prev, allow_retake_after_completion: e.target.checked }))} /><span><b>Cho phép học lại sau khi hoàn thành</b><span className="mt-1 block text-xs font-medium opacity-80">Điểm học lại chỉ để tham khảo, được lưu riêng và không thay thế điểm chính thức.</span></span></label>
                         </div>
                       </div>
-
-                      <div className="rounded-3xl border border-indigo-100 bg-indigo-50/60 p-5">
-                        <div className="flex items-start gap-3"><Users className="mt-0.5 h-5 w-5 shrink-0 text-indigo-600" /><div><h4 className="font-black text-slate-900">Trạng thái sau khi xuất bản</h4><p className="mt-1 text-sm leading-6 text-slate-600">{values.pham_vi === 'private' ? 'Bài học được lưu riêng và chỉ người tạo hoặc quản trị viên quản lý.' : (user.vai_tro === 'admin' || user.quyen_admin === true || String(user.quyen_admin).toLowerCase() === 'true') ? 'Bài học dùng chung của quản trị viên sẽ được xuất bản ngay.' : 'Bài học dùng chung của giáo viên sẽ được gửi quản trị viên duyệt trước khi học sinh sử dụng.'}</p></div></div>
-                      </div>
-
-                      <div className="rounded-3xl border border-slate-200 bg-white p-5">
-                        <div className="flex flex-wrap items-center justify-between gap-3"><div><h4 className="font-black text-slate-900">Rà soát nội dung bài học</h4><p className="mt-1 text-sm text-slate-600">Kiểm tra cấu trúc, nội dung, câu hỏi và video trong trình biên tập trước khi lưu hoặc xuất bản.</p></div><button type="button" onClick={() => setContentEditorOpen(true)} disabled={!contentReady} className="inline-flex items-center gap-2 rounded-2xl border border-violet-200 bg-violet-50 px-4 py-3 text-sm font-bold text-violet-700 disabled:opacity-40"><Edit3 className="h-4 w-4" /> Mở trình biên tập</button></div>
-                      </div>
                     </div>
                   ) : null}
                 </section>
-
-                <aside className="space-y-4 lg:sticky lg:top-5">
-                  <div className="rounded-[28px] border border-indigo-100 bg-gradient-to-br from-indigo-50 via-white to-violet-50 p-5 shadow-sm">
-                    <p className="text-xs font-bold uppercase tracking-[0.18em] text-indigo-600">Trạng thái bài học</p>
-                    <h3 className="mt-2 line-clamp-2 text-lg font-black text-slate-900">{values.lesson_json?.metadata?.tieu_de || values.tieu_de || 'Bài học chưa đặt tên'}</h3>
-                    <p className="mt-2 line-clamp-3 text-sm text-slate-600">{values.lesson_json?.metadata?.tom_tat || values.tom_tat || 'Hoàn thành thông tin và thêm học liệu để tạo nội dung.'}</p>
-                    <div className="mt-4 grid grid-cols-2 gap-2 text-sm"><div className="rounded-2xl bg-white p-3"><span className="text-xs text-slate-500">Nội dung</span><p className="font-black text-slate-900">{isLessonV3 ? `${values.lesson_json?.activities?.length || 0} hoạt động` : `${values.lesson_json?.sections?.length || 0} mục`}</p></div><div className="rounded-2xl bg-white p-3"><span className="text-xs text-slate-500">Tương tác</span><p className="font-black text-slate-900">{totalSectionQuestions} câu</p></div><div className="rounded-2xl bg-white p-3"><span className="text-xs text-slate-500">Cuối bài</span><p className="font-black text-slate-900">{finalQuizCount} câu</p></div><div className="rounded-2xl bg-white p-3"><span className="text-xs text-slate-500">Video</span><p className="font-black text-slate-900">{introVideoEmbedUrl ? 1 : 0} video trước bài{!isLessonV3 ? ` · ${sectionVideoCount} mục` : ''}</p></div></div>
-                    {contentNeedsRegeneration ? <div className="mt-4 flex items-start gap-2 rounded-2xl border border-amber-200 bg-amber-50 p-3 text-xs font-semibold text-amber-800"><AlertTriangle className="h-4 w-4 shrink-0" /> {isEditMode ? 'Cấu hình đã thay đổi; có thể lưu ngay và tạo lại nội dung sau.' : 'Cần tạo lại nội dung vì đầu vào đã thay đổi.'}</div> : null}
-                    <div className="mt-4 space-y-2 text-xs font-semibold"><p className={`flex items-center gap-2 ${stepReady.info ? 'text-emerald-700' : 'text-slate-400'}`}><CheckCircle2 className="h-4 w-4" /> Thông tin cơ bản</p><p className={`flex items-center gap-2 ${stepReady.settings ? 'text-emerald-700' : 'text-slate-400'}`}><CheckCircle2 className="h-4 w-4" /> Thiết kế đã xác nhận</p><p className={`flex items-center gap-2 ${stepReady.material ? 'text-emerald-700' : 'text-slate-400'}`}><CheckCircle2 className="h-4 w-4" /> Học liệu và video mở đầu</p><p className={`flex items-center gap-2 ${stepReady.content ? 'text-emerald-700' : 'text-slate-400'}`}><CheckCircle2 className="h-4 w-4" /> Nội dung đã đồng bộ</p></div>
-                  </div>
-
-                  {values.lesson_json ? <div className="rounded-[28px] border border-slate-200 bg-white p-4 shadow-sm">
-                    <p className="mb-3 text-xs font-bold uppercase tracking-[0.14em] text-slate-500">Công cụ kiểm tra</p>
-                    <div className="grid gap-2">
-                      <button type="button" onClick={() => setContentEditorOpen(true)} disabled={!values.lesson_json} className="inline-flex w-full items-center justify-center gap-2 rounded-2xl border border-violet-200 bg-violet-50 px-3 py-2.5 text-sm font-bold text-violet-700 disabled:opacity-40"><Edit3 className="h-4 w-4" /> Biên tập nội dung</button>
-                      <button type="button" onClick={() => setSlidesPromptOpen(true)} disabled={!values.lesson_json} className="inline-flex items-center justify-center gap-2 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm font-bold text-amber-700 disabled:opacity-40"><Presentation className="h-4 w-4" /> Prompt Google Slides</button>
-                    </div>
-                  </div> : null}
-                </aside>
+                <aside className="hidden" />
               </div>
             </div>
 

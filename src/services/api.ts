@@ -36,6 +36,7 @@ import {
   setFirebaseLessonSelfStudyAccess,
   startFirebaseLessonRetake,
   saveFirebaseLessonRetake,
+  saveFirebaseReferenceRetakeShadow,
   finalizeFirebaseOfficialRetake,
   finalizeFirebaseDeadlineZeros,
   listFirebaseLessonRetakes,
@@ -52,10 +53,14 @@ import {
   deleteFirebaseSlidesPrompt,
   getFirebaseConfig,
   getFirebaseIdentity,
+  refreshFirebaseCanonicalStudentIdentity,
   getFirebaseUserAIConfig,
   getFirebaseUserAISecret,
+  getFirebaseUserLessonComposerConfig,
   saveFirebaseUserAISecret,
+  saveFirebaseUserLessonComposerConfig,
   deleteFirebaseUserAISecret,
+  deleteFirebaseUserLessonComposerConfig,
   getFirebaseReview,
   getFirebaseSlidesPrompt,
   importFirebaseStudentAccountsBatch,
@@ -544,6 +549,8 @@ function normalizeReviewPracticeRow(raw: any): ReviewPracticeRow {
     activity_count: raw?.activity_count === undefined ? '' : Number(raw.activity_count || 0),
     max_score: raw?.max_score === undefined ? '' : Number(raw.max_score || 0),
     source_file_name: toCleanString(raw?.source_file_name),
+    game_schema_version: toCleanString(raw?.game_schema_version),
+    game_compatibility: toCleanString(raw?.game_compatibility),
     lesson_id: toCleanString(raw?.lesson_id),
     time_limit_minutes: Number(raw?.time_limit_minutes ?? raw?.thoi_gian ?? 0),
     max_attempts: Number(raw?.max_attempts ?? 0),
@@ -823,7 +830,7 @@ function normalizeCoLearningSession(raw: any): CoLearningSession | null {
     : [raw.host_user_id, raw.partner_user_id].map(toCleanString).filter(Boolean);
   const participantUids = Array.isArray(raw.participant_uids)
     ? raw.participant_uids.map(toCleanString).filter(Boolean)
-    : [raw.host_uid || raw.ownerUid, raw.partner_uid].map(toCleanString).filter(Boolean);
+    : [raw.hostUid || raw.host_uid || raw.ownerUid, raw.partner_uid].map(toCleanString).filter(Boolean);
   const participantNames = Array.isArray(raw.participant_names)
     ? raw.participant_names.map(toCleanString).filter(Boolean)
     : [raw.host_name || raw.host_user_id, raw.partner_name || raw.partner_user_id].map(toCleanString).filter(Boolean);
@@ -833,7 +840,8 @@ function normalizeCoLearningSession(raw: any): CoLearningSession | null {
     lesson_id: toCleanString(raw.lesson_id),
     lesson_title: toCleanString(raw.lesson_title),
     host_user_id: toCleanString(raw.host_user_id || participantUserIds[0]),
-    host_uid: toCleanString(raw.host_uid || participantUids[0]),
+    host_uid: toCleanString(raw.hostUid || raw.host_uid || participantUids[0]),
+    hostUid: toCleanString(raw.hostUid || raw.host_uid || participantUids[0]),
     partner_user_id: toCleanString(raw.partner_user_id || participantUserIds[1]),
     partner_uid: toCleanString(raw.partner_uid || participantUids[1]),
     partner_name: toCleanString(raw.partner_name || participantNames[1]),
@@ -1821,9 +1829,9 @@ export async function deleteSubjectApi(token: string, mon_id: string) {
   catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
 }
 
-export async function getLessonContentApi(token: string, lesson_id: string) {
+export async function getLessonContentApi(token: string, lesson_id: string, open_mode: 'official' | 'retake' | 'review' = 'official') {
   try {
-    const firebaseData = await getFirebaseLesson(lesson_id);
+    const firebaseData = await getFirebaseLesson(lesson_id, open_mode);
     if (!firebaseData) return { ok: false, message: 'Không tìm thấy bài học trên Firebase.' };
     return { ok: true, message: 'Đã tải nội dung bài học từ Firebase.', data: firebaseData };
   } catch (error) {
@@ -1852,20 +1860,30 @@ export async function saveUserConfigApi(_token: string, config: AIConfig): Promi
 }
 
 export async function getLessonBuilderDefaultsApi(token: string): Promise<ApiResponse<LessonBuilderDefaultsResponse>> {
-  const firebaseData = await getFirebaseConfig('lessonBuilderDefaults').catch(() => null);
-  if (firebaseData) return { ok: true, message: 'Đã tải cấu hình tạo bài học từ Firebase.', data: normalizeLessonBuilderDefaultsResponse(firebaseData) };
+  const firebaseData = await getFirebaseUserLessonComposerConfig().catch(() => null);
+  if (firebaseData?.builder_settings) return { ok: true, message: 'Đã tải cấu hình tạo bài học theo tài khoản.', data: normalizeLessonBuilderDefaultsResponse({ settings: firebaseData.builder_settings, has_defaults: true, updated_at: firebaseData.updated_at, updated_by: firebaseData.user_id }) };
   return { ok: true, message: 'Đang dùng cấu hình tạo bài học mặc định.', data: { settings: null, has_defaults: false, updated_at: '', updated_by: '' } };
 }
 
 export async function saveLessonBuilderDefaultsApi(token: string, settings: LessonBuilderSettings): Promise<ApiResponse<LessonBuilderDefaultsResponse>> {
   try {
-    const data = await saveFirebaseConfig('lessonBuilderDefaults', { settings, has_defaults: true });
-    return { ok: true, message: 'Đã lưu cấu hình tạo bài học trên Firebase.', data: normalizeLessonBuilderDefaultsResponse(data) };
+    const data = await saveFirebaseUserLessonComposerConfig({ builder_settings: settings, has_builder_defaults: true });
+    return { ok: true, message: 'Đã lưu cấu hình tạo bài học theo tài khoản.', data: normalizeLessonBuilderDefaultsResponse({ settings, has_defaults: true, updated_at: data.updated_at, updated_by: data.user_id }) };
   } catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
 }
 
 export async function resetLessonBuilderDefaultsApi(token: string): Promise<ApiResponse<LessonBuilderDefaultsResponse>> {
-  try { await deleteFirebaseConfig('lessonBuilderDefaults'); return { ok: true, message: 'Đã khôi phục cấu hình mặc định.', data: { settings: null, has_defaults: false, updated_at: '', updated_by: '' } }; }
+  try { await saveFirebaseUserLessonComposerConfig({ builder_settings: null, has_builder_defaults: false }); return { ok: true, message: 'Đã khôi phục cấu hình mặc định.', data: { settings: null, has_defaults: false, updated_at: '', updated_by: '' } }; }
+  catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
+}
+
+export async function getLessonAssignmentDefaultsApi(_token: string): Promise<ApiResponse<any>> {
+  try { const data = await getFirebaseUserLessonComposerConfig(); return { ok: true, message: 'Đã tải cấu hình giao bài theo tài khoản.', data: data?.assignment_defaults || null }; }
+  catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
+}
+
+export async function saveLessonAssignmentDefaultsApi(_token: string, assignment_defaults: Record<string, unknown>): Promise<ApiResponse<any>> {
+  try { const data = await saveFirebaseUserLessonComposerConfig({ assignment_defaults }); return { ok: true, message: 'Đã lưu cấu hình giao bài theo tài khoản.', data: (data as any).assignment_defaults }; }
   catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
 }
 
@@ -1890,8 +1908,15 @@ function reportCoLearningProgress(reporter: CoLearningProgressReporter | undefin
 }
 
 function coLearningStepError(error: unknown, context: string) {
-  const base = firebaseErrorMessage(error);
-  return new Error(`${context}${base ? ` ${base}` : ''}`.trim());
+  const rawCode = String((error as any)?.code || '').toLowerCase();
+  const rawMessage = String(error instanceof Error ? error.message : '').toLowerCase();
+  if (rawCode.includes('wrong-password') || rawCode.includes('invalid-credential') || rawCode.includes('invalid-login-credentials') || /mật khẩu|mat khau/.test(rawMessage)) {
+    return new Error(`${context} Mật khẩu chưa đúng; hãy kiểm tra và thử lại.`);
+  }
+  if (rawCode.includes('network') || rawCode.includes('unavailable') || rawCode.includes('offline') || /kết nối|ket noi|mạng|mang/.test(rawMessage)) {
+    return new Error(`${context} Kết nối chưa ổn định; hãy thử lại khi có mạng.`);
+  }
+  return new Error(`${context} Hãy thử lại.`);
 }
 
 export async function listClassmatesForStudyApi(token: string, lesson_id: string) {
@@ -1937,7 +1962,7 @@ export async function startCoLearningSessionApi(_token: string, lesson_id: strin
       return { ok: false, message: 'Vui lòng nhập mật khẩu xác nhận của tất cả bạn đã chọn.' };
     }
     const [me, lessonData] = await Promise.all([
-      getFirebaseIdentity(),
+      refreshFirebaseCanonicalStudentIdentity(),
       getFirebaseLesson(lesson_id),
     ]);
     if (!lessonData) return { ok: false, message: 'Không tìm thấy bài học cần mở.' };
@@ -1967,22 +1992,29 @@ export async function startCoLearningSessionApi(_token: string, lesson_id: strin
       }
       partners.push(partner);
     }
+    reportCoLearningProgress(onProgress, 'Đang chốt quyền tham gia của tài khoản đang tạo nhóm...');
+    let hostConsent: Awaited<ReturnType<typeof saveFirebaseHostConsent>>;
+    try {
+      hostConsent = await saveFirebaseHostConsent(sessionId, lesson_id);
+    } catch (error) {
+      throw coLearningStepError(error, 'Không chốt được quyền tham gia của tài khoản đang tạo nhóm.');
+    }
     const now = new Date().toISOString();
-    const hostPreparation = await getFirebasePreLessonSubmission(lesson_id).catch(() => null);
-    const hostPreparationStatus = toCleanString(hostPreparation?.preparation_status) || 'not_started';
-    const participantUserIds = [toCleanString(me.userId), ...partners.map((item) => toCleanString(item.userId))];
-    const participantUids = [toCleanString(me.uid), ...partners.map((item) => toCleanString(item.uid))];
+    const hostPreparationStatus = toCleanString(hostConsent.preparationStatus) || 'not_started';
+    const participantUserIds = [toCleanString(hostConsent.userId || me.userId), ...partners.map((item) => toCleanString(item.userId))];
+    const participantUids = [toCleanString(hostConsent.ownerUid || me.uid), ...partners.map((item) => toCleanString(item.uid))];
     const participantNames = [toCleanString(me.displayName || me.username || me.userId), ...partners.map((item) => toCleanString(item.displayName || item.username || item.userId))];
     const participantPreparationStatuses = [hostPreparationStatus, ...partners.map((item) => toCleanString(item.preLessonPreparationStatus) || 'not_started')] as CoLearningSession['participant_preparation_statuses'];
-    const participantPreparationScores = [hostPreparationStatus === 'prepared' ? 10 : 0, ...partners.map((item) => Number(item.preLessonPreparationScore || 0))];
-    const participantPreparationWatchPercents = [Number(hostPreparation?.watch_percent || 0), ...partners.map((item) => Number(item.preLessonWatchPercent || 0))];
+    const participantPreparationScores = [Number(hostConsent.preparationScore || 0), ...partners.map((item) => Number(item.preLessonPreparationScore || 0))];
+    const participantPreparationWatchPercents = [Number(hostConsent.preparationWatchPercent || 0), ...partners.map((item) => Number(item.preLessonWatchPercent || 0))];
     const data: CoLearningSession = {
       co_learning_session_id: sessionId,
       session_id: sessionId,
       lesson_id,
       lesson_title: toCleanString(lessonData.lesson.tieu_de),
-      host_user_id: toCleanString(me.userId),
-      host_uid: toCleanString(me.uid),
+      host_user_id: toCleanString(hostConsent.userId || me.userId),
+      host_uid: toCleanString(hostConsent.ownerUid || me.uid),
+      hostUid: toCleanString(hostConsent.ownerUid || me.uid),
       partner_user_id: participantUserIds[1],
       partner_uid: participantUids[1],
       partner_name: participantNames[1],
@@ -2002,19 +2034,16 @@ export async function startCoLearningSessionApi(_token: string, lesson_id: strin
       last_active_at: now,
       verified_at: now,
     };
-    reportCoLearningProgress(onProgress, 'Đang chốt quyền tham gia của cả nhóm...');
-    try {
-      await saveFirebaseHostConsent(sessionId, lesson_id);
-    } catch (error) {
-      throw coLearningStepError(error, 'Không chốt được quyền tham gia của tài khoản đang tạo nhóm.');
-    }
+    reportCoLearningProgress(onProgress, 'Đã xác nhận quyền tham gia của cả nhóm.');
     reportCoLearningProgress(onProgress, `Đang lưu nhóm ${participantUserIds.length} học sinh lên Firestore...`);
+    let savedSession: CoLearningSession;
     try {
-      await saveFirebaseCoLearningSession({ ...data, lop_id: toCleanString(me.classId), khoi: toCleanString(me.grade) });
+      savedSession = await saveFirebaseCoLearningSession({ ...data, lop_id: toCleanString(hostConsent.classId || me.classId), khoi: toCleanString(hostConsent.grade || me.grade) });
     } catch (error) {
       throw coLearningStepError(error, 'Không lưu được phiên học cùng sau khi đã xác nhận các thành viên.');
     }
-    return { ok: true, message: `Đã tạo nhóm học gồm ${participantUserIds.length} học sinh.`, data };
+    reportCoLearningProgress(onProgress, 'Nhóm học cùng đã sẵn sàng.');
+    return { ok: true, message: `Đã tạo nhóm học gồm ${participantUserIds.length} học sinh.`, data: savedSession };
   } catch (error) {
     await cleanupFirebaseCoLearningConsents(sessionId).catch(() => undefined);
     return { ok: false, message: firebaseErrorMessage(error), error };
@@ -2025,7 +2054,7 @@ export async function updateCoLearningSessionApi(_token: string, lesson_id: stri
   const newSessionId = `COLEARN_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
   try {
     const [me, lessonData, oldSession] = await Promise.all([
-      getFirebaseIdentity(),
+      refreshFirebaseCanonicalStudentIdentity(),
       getFirebaseLesson(lesson_id),
       getFirebaseCoLearningSession(base_session_id),
     ]);
@@ -2078,22 +2107,29 @@ export async function updateCoLearningSessionApi(_token: string, lesson_id: stri
         preparationPercent: Number(verified.preLessonWatchPercent || 0),
       });
     }
-    const hostPreparation = await getFirebasePreLessonSubmission(lesson_id).catch(() => null);
-    const hostPreparationStatus = toCleanString(hostPreparation?.preparation_status) || 'not_started';
-    const participantUserIds = [toCleanString(me.userId), ...partners.map((item) => item.userId)];
-    const participantUids = [toCleanString(me.uid), ...partners.map((item) => item.uid)];
+    reportCoLearningProgress(onProgress, 'Đang chốt quyền tham gia của tài khoản đang cập nhật nhóm...');
+    let hostConsent: Awaited<ReturnType<typeof saveFirebaseHostConsent>>;
+    try {
+      hostConsent = await saveFirebaseHostConsent(newSessionId, lesson_id);
+    } catch (error) {
+      throw coLearningStepError(error, 'Không chốt được quyền tham gia của tài khoản đang cập nhật nhóm.');
+    }
+    const hostPreparationStatus = toCleanString(hostConsent.preparationStatus) || 'not_started';
+    const participantUserIds = [toCleanString(hostConsent.userId || me.userId), ...partners.map((item) => item.userId)];
+    const participantUids = [toCleanString(hostConsent.ownerUid || me.uid), ...partners.map((item) => item.uid)];
     const participantNames = [toCleanString(me.displayName || me.username || me.userId), ...partners.map((item) => item.name)];
     const participantPreparationStatuses = [hostPreparationStatus, ...partners.map((item) => item.preparationStatus || 'unknown')] as CoLearningSession['participant_preparation_statuses'];
-    const participantPreparationScores = [hostPreparationStatus === 'prepared' ? 10 : 0, ...partners.map((item) => Number(item.preparationScore || 0))];
-    const participantPreparationWatchPercents = [Number(hostPreparation?.watch_percent || 0), ...partners.map((item) => Number(item.preparationPercent || 0))];
+    const participantPreparationScores = [Number(hostConsent.preparationScore || 0), ...partners.map((item) => Number(item.preparationScore || 0))];
+    const participantPreparationWatchPercents = [Number(hostConsent.preparationWatchPercent || 0), ...partners.map((item) => Number(item.preparationPercent || 0))];
     const now = new Date().toISOString();
     const data: CoLearningSession = {
       co_learning_session_id: newSessionId,
       session_id: newSessionId,
       lesson_id,
       lesson_title: toCleanString(lessonData.lesson.tieu_de),
-      host_user_id: toCleanString(me.userId),
-      host_uid: toCleanString(me.uid),
+      host_user_id: toCleanString(hostConsent.userId || me.userId),
+      host_uid: toCleanString(hostConsent.ownerUid || me.uid),
+      hostUid: toCleanString(hostConsent.ownerUid || me.uid),
       partner_user_id: participantUserIds[1],
       partner_uid: participantUids[1],
       partner_name: participantNames[1],
@@ -2117,20 +2153,17 @@ export async function updateCoLearningSessionApi(_token: string, lesson_id: stri
       membership_updated_at: now,
       membership_updated_by_uid: toCleanString(me.uid),
     };
-    reportCoLearningProgress(onProgress, 'Đang chốt quyền tham gia của nhóm cập nhật...');
-    try {
-      await saveFirebaseHostConsent(newSessionId, lesson_id);
-    } catch (error) {
-      throw coLearningStepError(error, 'Không chốt được quyền tham gia của tài khoản đang cập nhật nhóm.');
-    }
+    reportCoLearningProgress(onProgress, 'Đã xác nhận quyền tham gia của nhóm cập nhật.');
     reportCoLearningProgress(onProgress, `Đang lưu nhóm ${participantUserIds.length} học sinh lên Firestore...`);
+    let savedSession: CoLearningSession;
     try {
-      await saveFirebaseCoLearningSession({ ...data, schemaVersion: 5, lop_id: toCleanString(me.classId), khoi: toCleanString(me.grade) });
+      savedSession = await saveFirebaseCoLearningSession({ ...data, schemaVersion: 5, lop_id: toCleanString(hostConsent.classId || me.classId), khoi: toCleanString(hostConsent.grade || me.grade) });
     } catch (error) {
       throw coLearningStepError(error, 'Không lưu được nhóm cập nhật sau khi đã xác nhận các thành viên.');
     }
     await markFirebaseCoLearningSessionSuperseded(base_session_id, newSessionId).catch(() => undefined);
-    return { ok: true, message: `Đã cập nhật nhóm học gồm ${participantUserIds.length} học sinh.`, data };
+    reportCoLearningProgress(onProgress, 'Nhóm học cùng đã được cập nhật và sẵn sàng.');
+    return { ok: true, message: `Đã cập nhật nhóm học gồm ${participantUserIds.length} học sinh.`, data: savedSession };
   } catch (error) {
     await cleanupFirebaseCoLearningConsents(newSessionId).catch(() => undefined);
     return { ok: false, message: firebaseErrorMessage(error), error };
@@ -2160,7 +2193,7 @@ export async function getPreLessonSubmissionApi(_token: string, lesson_id: strin
 export async function submitPreLessonPreparationApi(
   _token: string,
   lesson_id: string,
-  payload: Pick<PreLessonSubmission, 'watch_percent' | 'watched_seconds' | 'duration_seconds'>,
+  payload: Pick<PreLessonSubmission, 'watch_percent' | 'watched_seconds' | 'duration_seconds'> & { video_revision?: number; video_id?: string },
 ): Promise<ApiResponse<PreLessonSubmission>> {
   try { return { ok: true, message: 'Đã ghi nhận kết quả chuẩn bị bài.', data: await submitFirebasePreLessonSubmission(lesson_id, payload) }; }
   catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
@@ -2249,14 +2282,19 @@ export async function saveLessonRetakeApi(_token: string, attempt: LessonRetakeA
   catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
 }
 
+export async function saveReferenceLessonRetakeShadowApi(_token: string, attempt: LessonRetakeAttempt): Promise<ApiResponse<LessonRetakeAttempt>> {
+  try { return { ok: true, message: 'Đã đồng bộ kết quả học lại luyện tập.', data: await saveFirebaseReferenceRetakeShadow(attempt) }; }
+  catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
+}
+
 
 export async function finalizeOfficialLessonRetakeApi(_token: string, attempt: LessonRetakeAttempt): Promise<ApiResponse<LessonProgressRecord>> {
   try { return { ok: true, message: 'Đã cập nhật điểm chính thức từ lượt học lại.', data: await finalizeFirebaseOfficialRetake(attempt) }; }
   catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
 }
 
-export async function listLessonRetakesApi(_token: string, lesson_id: string): Promise<ApiResponse<LessonRetakeAttempt[]>> {
-  try { return { ok: true, message: 'Đã tải lịch sử học lại.', data: await listFirebaseLessonRetakes(lesson_id) }; }
+export async function listLessonRetakesApi(_token: string, lesson_id: string, official_progress_id = ''): Promise<ApiResponse<LessonRetakeAttempt[]>> {
+  try { return { ok: true, message: 'Đã tải lịch sử học lại.', data: await listFirebaseLessonRetakes(lesson_id, official_progress_id) }; }
   catch (error) { return { ok: false, message: firebaseErrorMessage(error), error, data: [] }; }
 }
 
@@ -2451,9 +2489,12 @@ export async function createReviewPracticeApi(token: string, payload: Record<str
 export async function createInteractivePracticeApi(_token: string, payload: Record<string, unknown>) {
   try {
     const manifest = payload.practice_manifest;
-    if (!manifest || typeof manifest !== 'object') return { ok: false, message: 'Thiếu Practice Manifest đã chuẩn hóa.' };
+    const gameHtml = payload.game_html;
+    const isInteractive = Boolean(manifest && typeof manifest === 'object');
+    const isGame = typeof gameHtml === 'string' && gameHtml.trim().length > 0;
+    if (!isInteractive && !isGame) return { ok: false, message: 'Thiếu Practice Manifest hoặc mã trò chơi HTML.' };
     const data = await saveFirebaseReview(payload);
-    return { ok: true, message: 'Đã tạo bài luyện tập tương tác trên Firebase.', data: normalizeReviewPracticeRow(data) };
+    return { ok: true, message: isGame ? 'Đã tạo trò chơi luyện tập trên Firebase.' : 'Đã tạo bài luyện tập tương tác trên Firebase.', data: normalizeReviewPracticeRow(data) };
   } catch (error) { return { ok: false, message: firebaseErrorMessage(error), error }; }
 }
 
@@ -2478,7 +2519,7 @@ export async function getReviewPracticeApi(token: string, review_id: string) {
   if (firebaseReview) {
     const source = (firebaseReview as any).questions || (firebaseReview as any).questions_json || [];
     const questions = typeof source === 'string' ? (() => { try { return JSON.parse(source); } catch { return []; } })() : source;
-    return { ok: true, message: 'Đã tải bài ôn tập từ Firebase.', data: { review: normalizeReviewPracticeRow(firebaseReview), lessons: [], questions: Array.isArray(questions) ? questions : [], config: (firebaseReview as any).config || (firebaseReview as any).cau_hinh, practice_manifest: (firebaseReview as any).practice_manifest } };
+    return { ok: true, message: 'Đã tải bài ôn tập từ Firebase.', data: { review: normalizeReviewPracticeRow(firebaseReview), lessons: [], questions: Array.isArray(questions) ? questions : [], config: (firebaseReview as any).config || (firebaseReview as any).cau_hinh, practice_manifest: (firebaseReview as any).practice_manifest, game_html: (firebaseReview as any).game_html, game_manifest: (firebaseReview as any).game_manifest } };
   }
   return { ok: false, message: 'Không tìm thấy bài ôn tập trên Firebase.' };
 }

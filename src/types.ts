@@ -8,6 +8,9 @@ export type LessonSchemaVersion = 'lesson_v1' | 'lesson_v2' | 'lesson_v3';
 export type LearningStatus = 'not_started' | 'in_progress' | 'completed';
 export type StudyMode = 'single' | 'co_learning';
 export type LessonAccessMode = 'teacher_controlled' | 'self_study';
+export type LessonTeacherPermissionKey = 'edit' | 'results' | 'lock' | 'self_study' | 'offline_export' | 'archive';
+export type LessonTeacherPermissionMap = Record<string, LessonTeacherPermissionKey[]>;
+
 export type SelfStudyScope = 'none' | 'classes' | 'all';
 export type LearningResultState = 'valid' | 'cancelled_retake' | 'invalid_cheating';
 export type LearningResultActionType = 'allow_retake' | 'invalidate_cheating';
@@ -192,6 +195,11 @@ export interface LessonRow {
   pre_lesson_score_weight?: number;
   content_schema_version?: LessonSchemaVersion;
   builder_settings?: LessonBuilderSettings;
+  teacher_permissions_configured?: boolean;
+  teacher_permissions?: LessonTeacherPermissionMap;
+  teacher_global_permissions?: LessonTeacherPermissionKey[];
+  teacher_permission_user_ids?: string[];
+  teacher_permissions_version?: number;
   created_at?: string;
   updated_at?: string;
 }
@@ -245,6 +253,11 @@ export interface Lesson {
   pre_lesson_score_enabled?: boolean;
   pre_lesson_score_weight?: number;
   content_schema_version?: LessonSchemaVersion;
+  teacher_permissions_configured?: boolean;
+  teacher_permissions?: LessonTeacherPermissionMap;
+  teacher_global_permissions?: LessonTeacherPermissionKey[];
+  teacher_permission_user_ids?: string[];
+  teacher_permissions_version?: number;
   raw?: LessonRow;
 }
 
@@ -350,6 +363,8 @@ export interface LessonBuilderSettings {
   final_quiz_count: number;
   question_mix: 'mixed' | 'single_choice' | 'true_false' | 'fill_in_blank';
   final_quiz_question_types?: FinalQuizQuestionType[];
+  final_quiz_source_mode?: 'fixed' | 'random_bank';
+  question_bank_size?: number;
   difficulty: 'easy' | 'medium' | 'hard' | 'mixed';
   include_examples: boolean;
   include_summary: boolean;
@@ -365,6 +380,7 @@ export interface LessonBuilderSettings {
   shuffle_final_questions?: boolean;
   shuffle_final_options?: boolean;
   show_final_answers_after_submit?: boolean;
+  show_final_explanations_after_submit?: boolean;
   allow_exam_retry?: boolean;
   max_exam_attempts?: number;
   exam_score_policy?: ExamScorePolicy;
@@ -461,6 +477,18 @@ export interface InteractivePracticeImportSummary {
   warnings: string[];
 }
 
+
+export interface HtmlGamePracticeManifest {
+  schemaVersion: 'edusmart_game_v1';
+  compatibility: 'contract' | 'legacy_auto' | 'preview_only';
+  sourceFileName?: string;
+  title?: string;
+  adapter?: string;
+  warnings?: string[];
+  externalResources?: string[];
+  importedAt?: string;
+}
+
 export interface ReviewPracticeRow {
   review_id: string;
   tieu_de: string;
@@ -486,6 +514,8 @@ export interface ReviewPracticeRow {
   activity_count?: number | string;
   max_score?: number | string;
   source_file_name?: string;
+  game_schema_version?: string;
+  game_compatibility?: string;
   lesson_id?: string;
   time_limit_minutes?: number | string;
   max_attempts?: number | string;
@@ -518,7 +548,7 @@ export interface ReviewPracticeConfig {
   available_until?: string;
   target_class_ids?: string[];
   locked_class_ids?: string[];
-  source_mode?: 'random' | 'balanced' | 'manual' | 'interactive_file';
+  source_mode?: 'random' | 'balanced' | 'manual' | 'interactive_file' | 'html_game';
   include_interactive?: boolean;
 }
 
@@ -528,6 +558,8 @@ export interface ReviewPracticeContentResponse {
   questions: QuizQuestion[];
   config?: ReviewPracticeConfig;
   practice_manifest?: InteractivePracticeManifest;
+  game_html?: string;
+  game_manifest?: HtmlGamePracticeManifest;
 }
 
 export interface ReviewPracticeAttempt {
@@ -546,6 +578,11 @@ export interface ReviewPracticeAttempt {
   submitted_at?: string;
   auto_submitted?: boolean | string;
   time_spent_seconds?: number | string;
+  raw_game_score?: number | string;
+  max_combo?: number | string;
+  level_reached?: string;
+  mistakes?: string[];
+  game_result_json?: string;
   study_mode?: 'single' | 'co_learning' | string;
   co_learning_session_id?: string;
   participant_user_ids?: string[];
@@ -781,6 +818,7 @@ export interface LessonContent {
   sections?: LessonSectionV2[];
   activities?: LessonActivityV3[];
   final_quiz?: QuizQuestion[];
+  question_bank?: QuizQuestion[];
   assessment?: LessonAssessmentV2;
   metadata: LessonMetadata;
   khoi_dong: {
@@ -927,6 +965,9 @@ export interface LessonComposerValues {
   self_study_scope?: SelfStudyScope;
   self_study_class_ids?: string[];
   allow_retake_after_completion?: boolean;
+  teacher_permissions_configured?: boolean;
+  teacher_permissions?: LessonTeacherPermissionMap;
+  teacher_global_permissions?: LessonTeacherPermissionKey[];
 }
 
 export interface LessonComment {
@@ -1026,6 +1067,9 @@ export interface FinalExamProgressDetail {
   unanswered_count?: number;
   attempt_number?: number;
   security_events?: FinalExamSecurityEvents;
+  generated_question_ids?: string[];
+  question_snapshot?: QuizQuestion[];
+  question_bank_mode?: 'fixed' | 'random_bank';
 }
 
 export interface LearningStepProgress {
@@ -1124,6 +1168,7 @@ export interface LessonRetakeAttempt {
   attempt_id: string;
   attempt_number: number;
   lesson_id: string;
+  official_progress_id?: string;
   user_id: string;
   ownerUid?: string;
   status: 'in_progress' | 'completed';
@@ -1143,6 +1188,9 @@ export interface LessonRetakeAttempt {
   completed_at?: string;
   schoolId?: string;
   schemaVersion?: number;
+  /** V6.98.3: reference retake can run local-first and sync to Firestore asynchronously. */
+  storage_mode?: 'firestore' | 'local_first';
+  sync_state?: 'local' | 'syncing' | 'synced' | 'sync_failed';
 }
 
 export interface CoLearningSession {
@@ -1152,6 +1200,8 @@ export interface CoLearningSession {
   lesson_title?: string;
   host_user_id: string;
   host_uid?: string;
+  /** Firebase Auth UID của host theo security contract Firestore. */
+  hostUid?: string;
   partner_user_id?: string;
   partner_uid?: string;
   partner_name?: string;

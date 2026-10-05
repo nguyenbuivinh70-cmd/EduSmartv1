@@ -160,6 +160,7 @@ const VISUAL_TYPES = [
 export default function LessonActivityManualEditor({ content, onChange }: LessonActivityManualEditorProps) {
   const activities = content.activities || [];
   const finalQuiz = content.final_quiz || [];
+  const questionBank = content.question_bank || [];
 
   const updateContent = (patch: Partial<LessonContent>) => onChange({ ...content, ...patch });
   const syncActivities = (nextActivities: LessonActivityV3[]) => updateContent({
@@ -174,6 +175,7 @@ export default function LessonActivityManualEditor({ content, onChange }: Lesson
     [next[index], next[target]] = [next[target], next[index]]; syncActivities(next);
   };
   const updateFinalQuestion = (index: number, question: QuizQuestion) => updateContent({ final_quiz: finalQuiz.map((item, idx) => idx === index ? question : item) });
+  const updateBankQuestion = (index: number, question: QuizQuestion) => updateContent({ question_bank: questionBank.map((item, idx) => idx === index ? question : item) });
 
   return <div className="space-y-4">
     <div id="lesson-editor-general"><EditorCard title="Thông tin chung của bài học" icon={<BookOpen className="h-5 w-5" />} defaultOpen>
@@ -262,6 +264,18 @@ export default function LessonActivityManualEditor({ content, onChange }: Lesson
         })}
         {!activities.length ? <div className="rounded-3xl border border-dashed border-slate-200 bg-slate-50 px-6 py-10 text-center text-sm text-slate-500">Chưa có hoạt động. Bấm “Thêm hoạt động” hoặc dùng AI để tạo lại bài học.</div> : null}
       </div>
+    </EditorCard></div>
+
+    <div id="lesson-editor-question-bank"><EditorCard title={`Ngân hàng câu hỏi (${questionBank.length} câu)`} icon={<FileQuestion className="h-5 w-5" />} defaultOpen={false}>
+      <div className="mb-4 rounded-2xl bg-indigo-50 px-4 py-3 text-sm leading-6 text-indigo-800 ring-1 ring-indigo-100">
+        Ngân hàng dùng để tạo đề ngẫu nhiên cho từng học sinh/lượt làm. Mỗi câu nên có đáp án đúng và giải thích để học sinh xem lại sau khi nộp.
+      </div>
+      <div className="mb-4 flex flex-wrap justify-end gap-2">
+        {finalQuiz.length ? <button type="button" onClick={() => updateContent({ question_bank: finalQuiz.map((q, index) => ({ ...q, id: q.id || `QB_COPY_${index + 1}` })) })} className={`${smallButtonClass} bg-indigo-50 text-indigo-700 hover:bg-indigo-100`}>Sao chép bộ câu cuối bài vào ngân hàng</button> : null}
+        <button type="button" onClick={() => updateContent({ question_bank: [...questionBank, createEmptyQuestion('single_choice', questionBank.length + 1)] })} className={`${smallButtonClass} bg-indigo-600 text-white hover:bg-indigo-700`}><Plus className="h-4 w-4" /> Thêm câu ngân hàng</button>
+      </div>
+      <div className="space-y-3">{questionBank.map((question, index) => <QuestionEditor key={question.id || index} question={question} index={index} onChange={(next) => updateBankQuestion(index, next)} onDelete={() => updateContent({ question_bank: questionBank.filter((_, idx) => idx !== index) })} />)}</div>
+      {!questionBank.length ? <div className="rounded-2xl border border-dashed border-indigo-200 bg-white px-5 py-8 text-center text-sm text-slate-500">Chưa có câu hỏi trong ngân hàng. Có thể sao chép bộ câu cuối bài hiện tại hoặc thêm câu mới.</div> : null}
     </EditorCard></div>
 
     <div id="lesson-editor-final-quiz"><EditorCard title={`Kiểm tra cuối bài (${finalQuiz.length} câu)`} icon={<ListChecks className="h-5 w-5" />}>

@@ -75,6 +75,7 @@ import { getLessonScheduleAccess, getPreLessonVideoAccess } from './utils/lesson
 import { applyProgressScoreModelV3, finalizeProgressScore } from './utils/learningScoreEngine';
 import { formatPracticeDateTime, getPracticeAccessState, practiceAttemptSummary, resolvePracticeConfig } from './utils/practiceAccess';
 import { canManageGrade, formatManagedGrades, getManagedGradeScope, teacherManagesAllGrades } from './utils/gradeScope';
+import { lessonTeacherHasAnyPermission, lessonTeacherHasPermission } from './utils/lessonPermissions';
 import {
   createAccountApi,
   createClassApi,
@@ -130,6 +131,7 @@ import {
   setLessonSelfStudyAccessApi,
   startLessonRetakeApi,
   saveLessonRetakeApi,
+  saveReferenceLessonRetakeShadowApi,
   finalizeOfficialLessonRetakeApi,
   finalizeDeadlineZerosApi,
   listLessonRetakesApi,
@@ -140,6 +142,7 @@ import {
   startCoLearningSessionApi,
   updateCoLearningSessionApi,
   submitLessonReviewApi,
+  submitPreLessonPreparationApi,
   submitReviewPracticeApi,
   updateAccountApi,
   updateClassApi,
@@ -165,6 +168,13 @@ import OfflineLessonExportModal from './components/OfflineLessonExportModal';
 import LoadingOverlay from './components/LoadingOverlay';
 import Toast from './components/Toast';
 import { professionalUserMessage } from './utils/userMessages';
+import { getNextLocalReferenceRetakeNumber, getReusableLocalReferenceRetake, listLocalReferenceRetakes, saveLocalReferenceRetake } from './utils/referenceRetakeLocal';
+import {
+  PRELESSON_OUTBOX_EVENT,
+  listPreLessonOutboxItems,
+  markPreLessonOutboxAttempt,
+  removePreLessonOutboxItem,
+} from './utils/preLessonOutbox';
 import { exportOfflineLessonPackage, type OfflineLessonExportOptions } from './utils/offlineLessonExporter';
 import DataToolbar from './components/DataToolbar';
 import AccountFormModal from './components/AccountFormModal';
@@ -188,6 +198,7 @@ const ReviewPracticeViewer = lazy(() => import('./components/ReviewPracticeViewe
 const ReviewPracticeResultsModal = lazy(() => import('./components/ReviewPracticeResultsModal'));
 const InteractivePracticeImportModal = lazy(() => import('./components/InteractivePracticeImportModal'));
 const InteractivePracticeViewer = lazy(() => import('./components/InteractivePracticeViewer'));
+const HtmlGamePracticeViewer = lazy(() => import('./components/HtmlGamePracticeViewer'));
 const PracticeSettingsModal = lazy(() => import('./components/PracticeSettingsModal'));
 const ImportDataModal = lazy(() => import('./components/ImportDataModal'));
 const KnowledgeArena = lazy(() => import('./components/KnowledgeArena'));
@@ -257,6 +268,11 @@ function mapLessonRow(
     pre_lesson_score_enabled: false,
     pre_lesson_score_weight: 0,
     content_schema_version: row.content_schema_version || undefined,
+    teacher_permissions_configured: row.teacher_permissions_configured === true,
+    teacher_permissions: row.teacher_permissions || {},
+    teacher_global_permissions: Array.isArray(row.teacher_global_permissions) ? row.teacher_global_permissions.filter(Boolean) : [],
+    teacher_permission_user_ids: Array.isArray(row.teacher_permission_user_ids) ? row.teacher_permission_user_ids.filter(Boolean) : [],
+    teacher_permissions_version: Number.isFinite(Number(row.teacher_permissions_version)) ? Number(row.teacher_permissions_version) : undefined,
     raw: row,
   };
 }
@@ -967,6 +983,7 @@ export default function App() {
   const [isWelcomeVideoOpen, setIsWelcomeVideoOpen] = useState(false);
   const [isWelcomeVideoPreview, setIsWelcomeVideoPreview] = useState(false);
   const welcomeVideoSignatureRef = useRef('');
+  const preLessonOutboxSyncRef = useRef(false);
   const appDataLoadedRef = useRef(false);
   const coreDataLoadedRef = useRef(false);
   const coreLoadPromiseRef = useRef<Promise<void> | null>(null);
@@ -1124,6 +1141,11 @@ useEffect(() => {
   const [selectedInteractiveAllowRetry, setSelectedInteractiveAllowRetry] = useState(true);
   const [selectedInteractiveConfig, setSelectedInteractiveConfig] = useState<ReviewPracticeConfig | undefined>(undefined);
   const [selectedInteractiveAttemptCount, setSelectedInteractiveAttemptCount] = useState(0);
+  const [isHtmlGamePracticeViewerOpen, setIsHtmlGamePracticeViewerOpen] = useState(false);
+  const [selectedHtmlGamePractice, setSelectedHtmlGamePractice] = useState<ReviewPracticeRow | null>(null);
+  const [selectedHtmlGame, setSelectedHtmlGame] = useState('');
+  const [selectedHtmlGameConfig, setSelectedHtmlGameConfig] = useState<ReviewPracticeConfig | undefined>(undefined);
+  const [selectedHtmlGameAttemptCount, setSelectedHtmlGameAttemptCount] = useState(0);
   const [myReviewAttempts, setMyReviewAttempts] = useState<ReviewPracticeAttempt[]>([]);
   const [isPracticeSettingsOpen, setIsPracticeSettingsOpen] = useState(false);
   const [practiceSettingsReview, setPracticeSettingsReview] = useState<ReviewPracticeRow | null>(null);
@@ -1261,6 +1283,71 @@ useEffect(() => {
       isMounted = false;
     };
   }, []);
+
+  // V6.96.0: hàng đợi chuẩn bị bài chạy ở cấp App, không phụ thuộc modal video.
+  // Khi học sinh đã xem đủ, đóng modal/tải lại trang/mạng chập chờn không làm
+  // mất phiếu gửi. Mọi lần gửi đều idempotent theo Auth UID + video revision.
+  useEffect(() => {
+    if (!user || user.vai_tro !== 'student') return;
+    let disposed = false;
+    let debounceTimer = 0;
+
+    const syncOutbox = async () => {
+      if (disposed || preLessonOutboxSyncRef.current || !navigator.onLine || document.visibilityState !== 'visible') return;
+      const items = listPreLessonOutboxItems(user.firebase_uid || user.user_id, { retryableOnly: true, legacyUserId: user.user_id });
+      if (!items.length) return;
+      preLessonOutboxSyncRef.current = true;
+      try {
+        for (const item of items.slice(0, 8)) {
+          if (disposed || !navigator.onLine) break;
+          const lastAttempt = item.last_attempt_at ? new Date(item.last_attempt_at).getTime() : 0;
+          if (lastAttempt && Date.now() - lastAttempt < 12_000) continue;
+          const res = await submitPreLessonPreparationApi(user.token, item.lesson_id, {
+            watch_percent: item.watch_percent,
+            watched_seconds: item.watched_seconds,
+            duration_seconds: item.duration_seconds,
+            video_revision: item.video_revision,
+            video_id: item.video_id,
+          });
+          if (res.ok && res.data) {
+            removePreLessonOutboxItem(item.owner_uid, item.lesson_id, item.video_revision, item.user_id || user.user_id);
+            continue;
+          }
+          const diagnostic = String((res.error as any)?.diagnosticCode || '').trim();
+          const terminalReason = diagnostic === 'PRELESSON_VIDEO_REVISION_CHANGED'
+            ? 'video_revision_changed'
+            : diagnostic === 'PRELESSON_VIDEO_CHANGED'
+              ? 'video_changed'
+              : undefined;
+          markPreLessonOutboxAttempt(item, String((res as any).message || diagnostic || 'Chưa đồng bộ được'), terminalReason);
+          if (terminalReason) continue;
+          const code = String((res.error as any)?.code || '').toLowerCase();
+          if (diagnostic === 'PRELESSON_NETWORK' || code.includes('network') || code.includes('unavailable') || code.includes('offline')) break;
+        }
+      } finally {
+        preLessonOutboxSyncRef.current = false;
+      }
+    };
+
+    const scheduleSync = () => {
+      window.clearTimeout(debounceTimer);
+      debounceTimer = window.setTimeout(() => { void syncOutbox(); }, 1200);
+    };
+    const onVisibility = () => { if (document.visibilityState === 'visible') scheduleSync(); };
+    void syncOutbox();
+    window.addEventListener('online', scheduleSync);
+    window.addEventListener(PRELESSON_OUTBOX_EVENT, scheduleSync);
+    document.addEventListener('visibilitychange', onVisibility);
+    const interval = window.setInterval(() => { void syncOutbox(); }, 45_000);
+    return () => {
+      disposed = true;
+      window.clearTimeout(debounceTimer);
+      window.clearInterval(interval);
+      window.removeEventListener('online', scheduleSync);
+      window.removeEventListener(PRELESSON_OUTBOX_EVENT, scheduleSync);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [user?.user_id, user?.token, user?.vai_tro]);
 
   useEffect(() => {
     progressRecordsRef.current = progressRecords;
@@ -1816,7 +1903,8 @@ useEffect(() => {
       const isOwner = lesson.nguoi_tao_id === user.user_id;
       if (user.vai_tro === 'teacher') {
         const inManagedGrade = canManageGrade(user, lesson.khoi);
-        return inManagedGrade && (isOwner || lesson.trang_thai === 'approved_shared');
+        const hasExplicitPermission = lessonTeacherHasAnyPermission(lesson, user);
+        return isOwner || hasExplicitPermission || (inManagedGrade && lesson.trang_thai === 'approved_shared');
       }
       const sameGrade = !lesson.khoi || !user.khoi || String(lesson.khoi) === String(user.khoi);
       const classMatches = !lesson.lop_id || !user.lop_id || sameClassIdentity(lesson.lop_id, user.lop_id);
@@ -1841,6 +1929,7 @@ useEffect(() => {
     const timer = window.setTimeout(async () => {
       const subject = subjects.find((item) => String(item.mon_id) === String(analyticsSubjectFilter));
       const scoped = lessonSourcePool.filter((lesson) => {
+        if (user?.vai_tro === 'teacher' && !lessonTeacherHasPermission(lesson, user, 'results')) return false;
         const subjectMatch = String(lesson.mon_id) === String(analyticsSubjectFilter) || String(lesson.mon_hoc) === String(subject?.ten_mon || analyticsSubjectFilter);
         const yearMatch = !lesson.nam_hoc || String(lesson.nam_hoc) === String(analyticsSchoolYearFilter);
         const semesterMatch = analyticsSemesterFilter === 'ALL' || !lesson.hoc_ky || String(lesson.hoc_ky) === String(analyticsSemesterFilter);
@@ -1920,7 +2009,9 @@ useEffect(() => {
   }, [reviewPractices, user, currentUserIsAdmin, activeMenu, lessonSearch, lessonSubjectFilter, lessonGradeFilter, lessonScopeFilter, subjects]);
 
   const interactivePractices = useMemo(() => visibleReviewPractices.filter((review) => {
-    if (!(review.source_type === 'interactive_html' || review.loai_on_tap === 'interactive_file')) return false;
+    const isInteractiveFile = review.source_type === 'interactive_html' || review.loai_on_tap === 'interactive_file';
+    const isHtmlGame = review.source_type === 'html_game' || review.loai_on_tap === 'html_game';
+    if (!isInteractiveFile && !isHtmlGame) return false;
     const subjectName = subjects.find((item) => item.mon_id === review.mon_id)?.ten_mon || review.mon_hoc || review.mon_id || '';
     const classIds = Array.isArray(review.target_class_ids) ? review.target_class_ids : [];
     const config = resolvePracticeConfig(review, undefined);
@@ -1945,7 +2036,11 @@ useEffect(() => {
       || (practiceStatusFilter === 'draft' && String(review.trang_thai || '') !== 'active');
     return matchesSearch && matchesYear && matchesSemester && matchesGrade && matchesClass && matchesSubject && matchesStatus;
   }), [visibleReviewPractices, subjects, practiceSearch, practiceYearFilter, practiceSemesterFilter, practiceGradeFilter, practiceClassFilter, practiceSubjectFilter, practiceStatusFilter]);
-  const standardReviewPractices = useMemo(() => visibleReviewPractices.filter((review) => review.source_type !== 'interactive_html' && review.loai_on_tap !== 'interactive_file'), [visibleReviewPractices]);
+  const standardReviewPractices = useMemo(() => visibleReviewPractices.filter((review) => {
+    const isInteractiveFile = review.source_type === 'interactive_html' || review.loai_on_tap === 'interactive_file';
+    const isHtmlGame = review.source_type === 'html_game' || review.loai_on_tap === 'html_game';
+    return !isInteractiveFile && !isHtmlGame;
+  }), [visibleReviewPractices]);
 
 
   useEffect(() => {
@@ -1987,7 +2082,7 @@ useEffect(() => {
   const currentStudentProgressByLesson = useMemo(() => {
     if (!user || user.vai_tro !== 'student') return {} as Record<string, LessonProgressRecord>;
     return progressRecords
-      .filter((item) => item.user_id === user.user_id)
+      .filter((item) => item.user_id === user.user_id || Boolean(user.firebase_uid && item.ownerUid === user.firebase_uid))
       .reduce((acc, item) => {
         acc[item.lesson_id] = item;
         return acc;
@@ -2063,7 +2158,7 @@ useEffect(() => {
       })
       .filter((item) => {
         if (user?.vai_tro === 'teacher') {
-          return lessonSourcePool.some((lesson) => lesson.lesson_id === item.lesson_id);
+          return lessonSourcePool.some((lesson) => lesson.lesson_id === item.lesson_id && lessonTeacherHasPermission(lesson, user, 'results'));
         }
         return true;
       });
@@ -2646,6 +2741,28 @@ useEffect(() => {
 
   const persistActiveRetake = useCallback(async (attempt: LessonRetakeAttempt, silent = false) => {
     if (!user || user.vai_tro !== 'student') return false;
+    const isLocalReference = attempt.retake_mode === 'reference' && attempt.storage_mode === 'local_first';
+    if (isLocalReference) {
+      const userKey = user.firebase_uid || user.user_id;
+      const localAttempt: LessonRetakeAttempt = { ...attempt, storage_mode: 'local_first', sync_state: attempt.sync_state === 'synced' ? 'synced' : 'local' };
+      saveLocalReferenceRetake(userKey, localAttempt);
+      setActiveRetakeAttempt(localAttempt);
+      activeRetakeAttemptRef.current = localAttempt;
+      // V6.98.3: reference retake is local-first. Firestore synchronization is
+      // best-effort and must never block opening, learning, submitting or closing.
+      void saveReferenceLessonRetakeShadowApi(user.token, localAttempt).then((res) => {
+        const syncedAttempt: LessonRetakeAttempt = {
+          ...localAttempt,
+          sync_state: res.ok ? 'synced' : 'sync_failed',
+        };
+        saveLocalReferenceRetake(userKey, syncedAttempt);
+        if (activeRetakeAttemptRef.current?.attempt_id === syncedAttempt.attempt_id) {
+          setActiveRetakeAttempt(syncedAttempt);
+          activeRetakeAttemptRef.current = syncedAttempt;
+        }
+      }).catch(() => undefined);
+      return true;
+    }
     const res = await saveLessonRetakeApi(user.token, attempt);
     if (!res.ok || !res.data) {
       if (!silent && !handleSessionError(res.message)) showToast(res.message || 'Không lưu được phiên học lại.', 'error');
@@ -2819,7 +2936,7 @@ useEffect(() => {
     }
   }, [selectedLesson, user, updateQuizMetrics]);
 
-  const handleLessonViewerFinalExamSubmit = useCallback(async (snapshot: LessonCloseSnapshot) => {
+  const handleLessonViewerFinalExamSubmit = useCallback(async (snapshot: LessonCloseSnapshot, options: { silent?: boolean } = {}) => {
     if (!user || user.vai_tro !== 'student' || !selectedLesson) return false;
     if (lessonViewerMode === 'review') return true;
 
@@ -2866,21 +2983,21 @@ useEffect(() => {
       };
       setActiveRetakeAttempt(finalAttempt);
       activeRetakeAttemptRef.current = finalAttempt;
-      const saved = await persistActiveRetake(finalAttempt, false);
+      const saved = await persistActiveRetake(finalAttempt, options.silent === true);
       if (!saved) return false;
       const officialUpdate = finalAttempt.is_official === true || finalAttempt.retake_mode === 'official_update';
       if (officialUpdate) {
         const promoted = await finalizeOfficialLessonRetakeApi(user.token, finalAttempt);
         if (!promoted.ok || !promoted.data) {
-          if (!handleSessionError(promoted.message)) showToast(promoted.message || 'Đã lưu lượt học lại nhưng chưa cập nhật được điểm chính thức.', 'error');
+          if (!options.silent && !handleSessionError(promoted.message)) showToast(promoted.message || 'Đã chấm bài nhưng chưa cập nhật được điểm chính thức. Kết quả sẽ được giữ tạm và gửi lại.', 'error');
           return false;
         }
         const official = sanitizeProgressRecord(promoted.data);
         if (official) setProgressRecordsSync((current) => mergeProgressCollections(current.filter((item) => item.progress_id !== official.progress_id), [official]));
-        showToast(`Đã cập nhật điểm chính thức thành ${Number(promoted.data.assessment_score || 0).toFixed(1)}/10. Điểm cũ được giữ trong lịch sử.`, 'success');
+        if (!options.silent) showToast(`Đã cập nhật điểm chính thức thành ${Number(promoted.data.assessment_score || 0).toFixed(1)}/10. Điểm cũ được giữ trong lịch sử.`, 'success');
         return true;
       }
-      showToast(`Đã lưu điểm học lại tham khảo ${Number(finalAttempt.reference_score || 0).toFixed(1)}/10. Điểm chính thức không thay đổi.`, 'success');
+      if (!options.silent) showToast(`Đã lưu điểm học lại tham khảo ${Number(finalAttempt.reference_score || 0).toFixed(1)}/10. Điểm chính thức không thay đổi.`, 'success');
       return true;
     }
 
@@ -2904,7 +3021,11 @@ useEffect(() => {
     const replacingDeadlineZero = hasFinalizedOfficialScore
       && String(existing.score_reason || '') === 'deadline_missed'
       && (lessonAllowsLateSubmission(selectedLesson) || attemptStartedBeforeDeadline);
-    if (hasFinalizedOfficialScore && !replacingDeadlineZero) return true;
+    // V6.90.1: một điểm đã chấm cục bộ nhưng save_state=save_failed/saving chưa
+    // phải là kết quả server-confirmed. Retry phải tiếp tục ghi Firestore thay vì
+    // trả true sớm rồi xóa Pending Submission trên thiết bị.
+    const existingStillPendingSync = ['saving', 'save_failed'].includes(String(existing.save_state || ''));
+    if (hasFinalizedOfficialScore && !replacingDeadlineZero && !existingStillPendingSync) return true;
 
     const record: LessonProgressRecord = { ...existing, step_details: JSON.parse(JSON.stringify(existing.step_details || {})) };
     const detail = record.step_details.luyen_tap || createEmptyStepDetail();
@@ -2952,8 +3073,8 @@ useEffect(() => {
     progressPendingRecordsRef.current[progressId] = finalRecord;
     setProgressRecordsSync((current) => mergeProgressCollections(current.filter((item) => item.progress_id !== progressId), [finalRecord]));
     queuePendingLearningProgress(user.user_id, finalRecord);
-    const saved = await persistProgressRecord(finalRecord, false);
-    if (saved) {
+    const saved = await persistProgressRecord(finalRecord, options.silent === true);
+    if (saved && !options.silent) {
       const officialScore = Number(finalRecord.assessment_score);
       showToast(Number.isFinite(officialScore)
         ? `Đã nộp bài. Điểm chính thức ${officialScore.toFixed(1)}/10 đã cập nhật vào bảng theo dõi của giáo viên.`
@@ -3085,7 +3206,7 @@ useEffect(() => {
     setActiveRetakeAttempt(null);
     activeRetakeAttemptRef.current = null;
     if (!saved) {
-      showToast('Đã đóng bài. Kết quả đã được giữ an toàn trên thiết bị và hệ thống sẽ tự đồng bộ lại.', 'info');
+      showToast('Đã đóng bài. Kết quả của em vẫn được giữ và có thể gửi lại khi kết nối ổn định.', 'info');
       return;
     }
     showToast(wasCoLearning ? 'Đã lưu kết quả chung của nhóm; trạng thái chuẩn bị được ghi nhận riêng từng học sinh và không tính điểm.' : 'Đã lưu kết quả và tiến độ bài học.', 'success');
@@ -3118,7 +3239,7 @@ useEffect(() => {
 
   const openLessonDirect = async (lesson: Lesson, coSession: CoLearningSession | null = null, mode: 'official' | 'retake' | 'review' = 'official', retakeAttempt: LessonRetakeAttempt | null = null) => {
     if (!user) return;
-    if (user.vai_tro === 'student') {
+    if (user.vai_tro === 'student' && mode === 'official') {
       if (lesson.is_locked === true) {
         showToast(`Bài “${lesson.tieu_de}” đang được giáo viên khóa. Em hãy chờ giáo viên mở bài.`, 'error');
         return;
@@ -3129,7 +3250,12 @@ useEffect(() => {
         return;
       }
     }
-    const res = await withLoading('Đang mở bài học...', () => getLessonContentApi(user.token, lesson.lesson_id));
+    const contentOpenMode: 'official' | 'retake' | 'review' = mode === 'retake'
+      && retakeAttempt?.retake_mode === 'reference'
+      && retakeAttempt?.storage_mode === 'local_first'
+      ? 'review'
+      : mode;
+    const res = await withLoading('Đang mở bài học...', () => getLessonContentApi(user.token, lesson.lesson_id, contentOpenMode));
     if (!res.ok) {
       if (!handleSessionError(res.message)) showToast(res.message, 'error');
       return;
@@ -3163,7 +3289,7 @@ useEffect(() => {
     setIsCoLearningLoading(false);
     if (!res.ok) {
       if (handleSessionError(res.message)) return;
-      setCoLearningError(`${res.message || 'Không tải được danh sách bạn cùng lớp.'} Em vẫn có thể chọn “Học một mình” để mở bài ngay.`);
+      setCoLearningError('Chưa tải được danh sách bạn cùng lớp. Em có thể thử lại hoặc chọn “Học một mình”.');
       return;
     }
     const items = res.data?.items || [];
@@ -3212,19 +3338,33 @@ useEffect(() => {
         && currentProgress.official_retake_grant_id
         && (currentProgress.score_status === 'retake_pending' || officialFinalized));
 
-      // V6.84.1: quyền học lại cập nhật điểm do giáo viên cấp là ngoại lệ có kiểm soát.
-      // Mở lựa chọn trước guard lịch/khóa để học sinh có thể làm bù sau deadline.
-      if (officialRetakeGranted) {
+      if (currentProgress?.result_state === 'invalid_cheating' && currentProgress.retake_allowed === false) {
+        showToast(`Kết quả bài “${lesson.tieu_de}” đã bị hủy và giáo viên chưa cho phép làm lại.`, 'error');
+        return;
+      }
+
+      // V6.97.3 - Unified Lesson Access V2: review/retake là mode độc lập sau
+      // khi đã có kết quả chính thức, không bị khóa lại bởi lịch/khóa của lượt học
+      // chính. Quyền retake vẫn được Rules xác thực theo kết quả + cấu hình GV.
+      if (officialRetakeGranted || (officialFinalized && lesson.allow_retake_after_completion === true)) {
         setRetakeChoiceLesson(lesson);
-        void listLessonRetakesApi(user.token, lesson.lesson_id).then((history) => setRetakeHistory(history.ok ? history.data || [] : []));
+        const localReferenceHistory = listLocalReferenceRetakes(user.firebase_uid || user.user_id, lesson.lesson_id);
+        setRetakeHistory(localReferenceHistory);
+        void listLessonRetakesApi(user.token, lesson.lesson_id, currentProgress?.progress_id || '')
+          .then((history) => {
+            const merged = new Map<string, LessonRetakeAttempt>();
+            [...localReferenceHistory, ...(history.ok ? history.data || [] : [])].forEach((item) => merged.set(item.attempt_id, item));
+            setRetakeHistory(Array.from(merged.values()).sort((a, b) => String(b.updated_at || b.started_at).localeCompare(String(a.updated_at || a.started_at))));
+          });
+        return;
+      }
+      if (officialFinalized) {
+        await openLessonDirect(lesson, null, 'review', null);
         return;
       }
 
       const scheduleAccess = getLessonScheduleAccess(lesson);
       const preLessonAccess = getPreLessonVideoAccess(lesson, scheduleAccess);
-      // V6.88.10: video chuẩn bị chỉ thay thế nút vào bài khi bài chính đang
-      // khóa/chưa đến giờ. Khi bài đã mở, học sinh vào bài bình thường và dùng
-      // nút Video chuẩn bị riêng trên thẻ để xem/xem lại.
       if (preLessonAccess.canWatchNow && (lesson.is_locked === true || scheduleAccess.reason === 'before_start')) {
         openPreLessonVideo(lesson);
         return;
@@ -3235,19 +3375,6 @@ useEffect(() => {
       }
       if (scheduleAccess.blocked) {
         showToast(`${scheduleAccess.message} Em chưa thể vào học lúc này.`, 'error');
-        return;
-      }
-      if (currentProgress?.result_state === 'invalid_cheating' && currentProgress.retake_allowed === false) {
-        showToast(`Kết quả bài “${lesson.tieu_de}” đã bị hủy do gian lận và giáo viên không cho phép làm lại.`, 'error');
-        return;
-      }
-      if (officialFinalized && lesson.allow_retake_after_completion === true) {
-        setRetakeChoiceLesson(lesson);
-        void listLessonRetakesApi(user.token, lesson.lesson_id).then((history) => setRetakeHistory(history.ok ? history.data || [] : []));
-        return;
-      }
-      if (officialFinalized) {
-        await openLessonDirect(lesson, null, 'review', null);
         return;
       }
       await openCoLearningChoice(lesson);
@@ -3267,12 +3394,51 @@ useEffect(() => {
     const lesson = retakeChoiceLesson;
     if (!lesson || !user) return;
     const official = currentStudentProgressByLesson[lesson.lesson_id];
-    if (!official) { showToast('Không tìm thấy kết quả chính thức để học lại.', 'error'); return; }
-    const res = await withLoading('Đang chuẩn bị phiên học lại...', () => startLessonRetakeApi(user.token, lesson.lesson_id, official));
-    if (!res.ok || !res.data) { if (!handleSessionError(res.message)) showToast(res.message || 'Không bắt đầu được phiên học lại.', 'error'); return; }
+    const officialFinalized = official && (official.score_status === 'finalized' || (official.status === 'completed' && Number.isFinite(Number(official.assessment_score))));
+    if (!official || !officialFinalized) { showToast('Không tìm thấy kết quả chính thức để học lại.', 'error'); return; }
+    if (lesson.allow_retake_after_completion !== true) { showToast('Giáo viên chưa bật chức năng học lại luyện tập cho bài này.', 'error'); return; }
+
+    const userKey = user.firebase_uid || user.user_id;
+    let attempt = getReusableLocalReferenceRetake(userKey, lesson.lesson_id);
+    if (!attempt) {
+      const now = new Date().toISOString();
+      const attemptId = `REF_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const progress = createEmptyProgressRecord(user.user_id, lesson);
+      progress.progress_id = `${user.user_id}_${lesson.lesson_id}__${attemptId}`;
+      progress.result_group_id = attemptId;
+      progress.study_mode = 'single';
+      progress.preparation_score = 0;
+      progress.preparation_weight = 0;
+      attempt = {
+        attempt_id: attemptId,
+        attempt_number: getNextLocalReferenceRetakeNumber(userKey, lesson.lesson_id),
+        lesson_id: lesson.lesson_id,
+        official_progress_id: official.progress_id || `${user.user_id}_${lesson.lesson_id}`,
+        user_id: user.user_id,
+        ownerUid: user.firebase_uid,
+        status: 'in_progress',
+        is_official: false,
+        retake_mode: 'reference',
+        official_score_snapshot: Number.isFinite(Number(official.assessment_score)) ? Number(official.assessment_score) : undefined,
+        completion_percent: 0,
+        score_status: 'in_progress',
+        score_model_version: 4,
+        progress,
+        started_at: now,
+        updated_at: now,
+        schoolId: 'hthtv1',
+        schemaVersion: 2,
+        storage_mode: 'local_first',
+        sync_state: 'local',
+      };
+      saveLocalReferenceRetake(userKey, attempt);
+    }
+
     setRetakeChoiceLesson(null);
-    await openLessonDirect(lesson, null, 'retake', res.data);
-    showToast(`Phiên học lại #${res.data.attempt_number}. Điểm lần này chỉ mang tính tham khảo và không thay đổi điểm chính thức.`, 'info');
+    await openLessonDirect(lesson, null, 'retake', attempt);
+    showToast('Đã mở lượt học lại luyện tập. Tiến độ được lưu trên thiết bị và không thay đổi điểm chính thức.', 'info');
+    // Đồng bộ nền ngay sau khi bài đã mở; lỗi đồng bộ không được chặn học sinh.
+    void persistActiveRetake(attempt, true);
   };
 
   const handleStartOfficialRetake = async () => {
@@ -3287,7 +3453,7 @@ useEffect(() => {
     if (!res.ok || !res.data) { if (!handleSessionError(res.message)) showToast(res.message || 'Không bắt đầu được lượt học lại cập nhật điểm.', 'error'); return; }
     setRetakeChoiceLesson(null);
     await openLessonDirect(lesson, null, 'retake', res.data);
-    showToast(`Lượt học lại chính thức #${res.data.attempt_number}. Bài đang ở trạng thái chờ học lại; điểm mới sẽ được ghi khi em nộp bài.`, 'info');
+    showToast('Đã mở lượt học lại cập nhật điểm. Điểm mới chỉ được ghi sau khi em nộp bài thành công.', 'info');
   };
 
   const openLessonTeacherMode = async (lesson: Lesson) => {
@@ -3304,7 +3470,7 @@ useEffect(() => {
       const flushed = await flushProgressBeforeStudyModeChange(lesson.lesson_id);
       setIsCoLearningSubmitting(false);
       if (!flushed) {
-        setCoLearningError('Chưa thể chuyển sang học một mình vì tiến độ nhóm hiện tại chưa được lưu. Hãy kiểm tra kết nối và thử lại.');
+        setCoLearningError('Chưa thể chuyển sang học một mình lúc này. Em hãy kiểm tra kết nối và thử lại.');
         return;
       }
       closeCoLearningModal();
@@ -3313,8 +3479,8 @@ useEffect(() => {
       return;
     }
     closeCoLearningModal();
-    if (coLearningPurpose === 'practice' && pendingInteractivePractice?.practice_manifest) {
-      launchInteractivePractice(pendingInteractivePractice, null);
+    if (coLearningPurpose === 'practice' && (pendingInteractivePractice?.practice_manifest || pendingInteractivePractice?.game_html)) {
+      launchPracticeContent(pendingInteractivePractice, null);
       return;
     }
     await openLessonDirect(lesson, null);
@@ -3392,13 +3558,13 @@ useEffect(() => {
     const lesson = coLearningLesson;
     const session = res.data;
     closeCoLearningModal();
-    if (coLearningPurpose === 'practice' && pendingInteractivePractice?.practice_manifest) {
-      launchInteractivePractice(pendingInteractivePractice, session);
+    if (coLearningPurpose === 'practice' && (pendingInteractivePractice?.practice_manifest || pendingInteractivePractice?.game_html)) {
+      launchPracticeContent(pendingInteractivePractice, session);
       showToast(`Đã xác nhận nhóm ${getCoLearningSessionUserIds(session).length} học sinh để luyện tập cùng.`, 'success');
       return;
     }
     setActiveCoLearningSession(session);
-    showToast(reusableCoLearningSession ? `Đã cập nhật nhóm ${getCoLearningSessionUserIds(session).length} học sinh. Từ lần lưu tiếp theo, tiến độ và điểm dùng nhóm mới.` : `Đã xác nhận nhóm ${getCoLearningSessionUserIds(session).length} học sinh. Tiến độ và điểm sẽ được đồng bộ cho cả nhóm.`, 'success');
+    showToast(reusableCoLearningSession ? `Đã cập nhật nhóm ${getCoLearningSessionUserIds(session).length} học sinh. Từ lần lưu tiếp theo, tiến độ và điểm dùng nhóm mới.` : `Đã xác nhận nhóm ${getCoLearningSessionUserIds(session).length} học sinh. Tiến độ và điểm sẽ được lưu cho cả nhóm.`, 'success');
     if (!editingActiveSession) await openLessonDirect(lesson, session);
   };
 
@@ -3408,8 +3574,8 @@ useEffect(() => {
     const session = reusableCoLearningSession;
     const editingActiveSession = Boolean(isLessonViewerOpen && selectedLesson?.lesson_id === lesson.lesson_id);
     closeCoLearningModal();
-    if (coLearningPurpose === 'practice' && pendingInteractivePractice?.practice_manifest) {
-      launchInteractivePractice(pendingInteractivePractice, session);
+    if (coLearningPurpose === 'practice' && (pendingInteractivePractice?.practice_manifest || pendingInteractivePractice?.game_html)) {
+      launchPracticeContent(pendingInteractivePractice, session);
       showToast(`Đang luyện tập cùng nhóm ${getCoLearningSessionUserIds(session).length} học sinh đã xác nhận.`, 'success');
       return;
     }
@@ -3460,6 +3626,10 @@ useEffect(() => {
 
   const openComposerForEdit = async (lesson: Lesson) => {
     if (!user) return;
+    if (!lessonTeacherHasPermission(lesson, user, 'edit')) {
+      showToast('Bạn không được cấp quyền sửa bài học này.', 'error');
+      return;
+    }
     const res = await withLoading('Đang tải dữ liệu bài học để chỉnh sửa...', () => getLessonContentApi(user.token, lesson.lesson_id));
     if (!res.ok) {
       if (!handleSessionError(res.message)) showToast(res.message, 'error');
@@ -3474,6 +3644,11 @@ useEffect(() => {
 
   const handleOfflineLessonExport = async (options: OfflineLessonExportOptions) => {
     if (!user || !offlineExportLesson) return;
+    if (!lessonTeacherHasPermission(offlineExportLesson, user, 'offline_export')) {
+      showToast('Bạn không được cấp quyền xuất bài học Offline.', 'error');
+      setOfflineExportLesson(null);
+      return;
+    }
     setIsOfflineExporting(true);
     try {
       const res = await getLessonContentApi(user.token, offlineExportLesson.lesson_id);
@@ -3624,7 +3799,8 @@ useEffect(() => {
     }
     setIsInteractivePracticeImportOpen(false);
     await loadDataDomain('reviews', true);
-    showToast('Đã nhập và phát hành bài luyện tập tương tác.', 'success');
+    const publishedGame = payload.source_type === 'html_game' || payload.loai_on_tap === 'html_game' || (typeof payload.game_html === 'string' && payload.game_html.trim().length > 0);
+    showToast(publishedGame ? 'Đã phát hành trò chơi và cập nhật danh sách Luyện tập.' : 'Đã nhập và phát hành bài luyện tập tương tác.', 'success');
   };
 
 
@@ -3663,6 +3839,26 @@ useEffect(() => {
     setIsInteractivePracticeViewerOpen(true);
   };
 
+  const launchHtmlGamePractice = (payload: ReviewPracticeContentResponse, session: CoLearningSession | null = null) => {
+    if (!payload.game_html) { showToast('Trò chơi chưa có mã HTML hợp lệ.', 'error'); return; }
+    const ownAttempts = user?.vai_tro === 'student' ? myReviewAttempts.filter((item) => item.review_id === payload.review.review_id) : [];
+    const resolved = resolvePracticeConfig(payload.review, payload.config);
+    setSelectedHtmlGamePractice(payload.review);
+    setSelectedHtmlGame(payload.game_html);
+    setSelectedHtmlGameConfig(resolved);
+    setSelectedHtmlGameAttemptCount(ownAttempts.length);
+    setActivePracticeCoLearningSession(session);
+    setIsHtmlGamePracticeViewerOpen(true);
+  };
+
+  const launchPracticeContent = (payload: ReviewPracticeContentResponse, session: CoLearningSession | null = null) => {
+    if (payload.game_html || payload.review.source_type === 'html_game' || payload.review.loai_on_tap === 'html_game') {
+      launchHtmlGamePractice(payload, session);
+      return;
+    }
+    launchInteractivePractice(payload, session);
+  };
+
   const openInteractivePractice = async (review: ReviewPracticeRow) => {
     if (!user) return;
     const ownAttempts = user.vai_tro === 'student' ? myReviewAttempts.filter((item) => item.review_id === review.review_id) : [];
@@ -3676,18 +3872,18 @@ useEffect(() => {
       return;
     }
     const payload = res.data as ReviewPracticeContentResponse;
-    if (!payload.practice_manifest) { showToast('Bài luyện tập chưa có dữ liệu tương tác chuẩn hóa.', 'error'); return; }
-    if (user.vai_tro !== 'student') { launchInteractivePractice(payload, null); return; }
+    if (!payload.practice_manifest && !payload.game_html) { showToast('Bài luyện tập chưa có dữ liệu tương tác hoặc trò chơi hợp lệ.', 'error'); return; }
+    if (user.vai_tro !== 'student') { launchPracticeContent(payload, null); return; }
     const resolved = resolvePracticeConfig(payload.review, payload.config);
     const access = getPracticeAccessState(payload.review, resolved, user.lop_id || '', ownAttempts.length);
     if (!access.canStart) { showToast(access.reason || access.label, 'info'); return; }
-    const linkedLessonId = payload.review.lesson_id || payload.practice_manifest.lessonId || String(payload.review.lesson_ids || '').split(',')[0];
+    const linkedLessonId = payload.review.lesson_id || payload.practice_manifest?.lessonId || String(payload.review.lesson_ids || '').split(',')[0];
     const linkedLesson = lessonsById.get(linkedLessonId);
-    if (!resolved.allow_co_learning && resolved.allow_solo) { launchInteractivePractice(payload, null); return; }
+    if (!resolved.allow_co_learning && resolved.allow_solo) { launchPracticeContent(payload, null); return; }
     if (!linkedLesson) {
       if (!resolved.allow_solo) { showToast('Không tìm thấy bài học liên kết để mở chế độ luyện cùng.', 'error'); return; }
       showToast('Không tìm thấy bài học liên kết. Hệ thống sẽ mở luyện một mình.', 'info');
-      launchInteractivePractice(payload, null);
+      launchPracticeContent(payload, null);
       return;
     }
     setPendingInteractivePractice(payload);
@@ -4736,7 +4932,12 @@ useEffect(() => {
   };
 
   const renderLessonTileActions = (lesson: Lesson) => {
-    const canModify = currentUserIsAdmin || (user.vai_tro === 'teacher' && lesson.nguoi_tao_id === user.user_id);
+    const canEdit = lessonTeacherHasPermission(lesson, user, 'edit');
+    const canResults = lessonTeacherHasPermission(lesson, user, 'results');
+    const canLock = lessonTeacherHasPermission(lesson, user, 'lock');
+    const canSelfStudy = lessonTeacherHasPermission(lesson, user, 'self_study');
+    const canOfflineExport = lessonTeacherHasPermission(lesson, user, 'offline_export');
+    const canArchive = lessonTeacherHasPermission(lesson, user, 'archive');
     const canSubmitReview = user.vai_tro === 'teacher' && !currentUserIsAdmin && lesson.nguoi_tao_id === user.user_id && ['ready_private', 'rejected'].includes(lesson.trang_thai);
     const stopTileAction = (event: MouseEvent<HTMLElement>) => {
       event.preventDefault();
@@ -4774,7 +4975,7 @@ useEffect(() => {
           <Eye className="h-3.5 w-3.5" /> Mở
         </button>
 
-        {(canModify || canSubmitReview || currentUserIsAdmin || user.vai_tro === 'teacher') ? (
+        {(canEdit || canResults || canLock || canSelfStudy || canOfflineExport || canArchive || canSubmitReview) ? (
           <details className="lesson-library-menu relative">
             <summary
               onClick={(event) => event.stopPropagation()}
@@ -4785,23 +4986,23 @@ useEffect(() => {
               <MoreHorizontal className="h-4 w-4" />
             </summary>
             <div className="absolute bottom-full right-0 z-50 mb-2 w-48 overflow-hidden rounded-2xl border border-slate-200 bg-white p-1.5 text-left shadow-[0_18px_40px_rgba(15,23,42,0.16)]">
-              {canModify ? (
+              {canEdit ? (
                 <button onClick={(event) => { stopTileAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); void openComposerForEdit(lesson); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold text-indigo-700 hover:bg-indigo-50">
                   <Pencil className="h-3.5 w-3.5" /> Sửa bài học
                 </button>
               ) : null}
-              {(currentUserIsAdmin || user.vai_tro === 'teacher') ? (
+              {canResults ? (
                 <button onClick={(event) => { event.currentTarget.closest('details')?.removeAttribute('open'); openTileAnalytics(event); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-50">
                   <Trophy className="h-3.5 w-3.5" /> Theo dõi kết quả
                 </button>
               ) : null}
-              {canModify ? (
+              {canLock ? (
                 <button onClick={(event) => { stopTileAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); void handleToggleLessonLock(lesson); }} disabled={Boolean(lessonLockUpdatingId)} className={`flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold disabled:cursor-wait disabled:opacity-60 ${lesson.is_locked ? 'text-emerald-700 hover:bg-emerald-50' : 'text-amber-700 hover:bg-amber-50'}`}>
                   {lessonLockUpdatingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : lesson.is_locked ? <Unlock className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5" />}
                   {lesson.is_locked ? 'Mở khóa bài học' : 'Khóa bài học'}
                 </button>
               ) : null}
-              {canModify ? (
+              {canSelfStudy ? (
                 <button onClick={(event) => { stopTileAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); void handleToggleLessonAccessMode(lesson); }} disabled={Boolean(lessonAccessModeUpdatingId)} className={`flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold disabled:cursor-wait disabled:opacity-60 ${lesson.access_mode === 'self_study' ? 'text-violet-700 hover:bg-violet-50' : 'text-indigo-700 hover:bg-indigo-50'}`}>
                   {lessonAccessModeUpdatingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <BookOpenCheck className="h-3.5 w-3.5" />}
                   Quản lý tự học theo lớp
@@ -4812,7 +5013,7 @@ useEffect(() => {
                   <UploadCloud className="h-3.5 w-3.5" /> Gửi admin duyệt
                 </button>
               ) : null}
-              {canModify && lesson.trang_thai !== 'archived' ? (
+              {canOfflineExport && lesson.trang_thai !== 'archived' ? (
                 <button
                   onClick={(event) => {
                     stopTileAction(event);
@@ -4825,8 +5026,8 @@ useEffect(() => {
                   <Download className="h-3.5 w-3.5" /> Xuất bài học Offline
                 </button>
               ) : null}
-              {canModify ? <div className="my-1 border-t border-slate-100" /> : null}
-              {canModify && lesson.trang_thai !== 'archived' ? (
+              {(canArchive || currentUserIsAdmin) ? <div className="my-1 border-t border-slate-100" /> : null}
+              {canArchive && lesson.trang_thai !== 'archived' ? (
                 <button disabled={Boolean(lessonDeletingId)} onClick={(event) => { stopTileAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); askDeleteLesson(lesson); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold text-rose-700 hover:bg-rose-50 disabled:cursor-wait disabled:opacity-60">
                   {lessonDeletingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />} {lessonDeletingId === lesson.lesson_id ? 'Đang lưu trữ...' : 'Lưu trữ bài học'}
                 </button>
@@ -4849,7 +5050,12 @@ useEffect(() => {
   };
 
   const renderLessonActionBar = (lesson: Lesson, compact = false) => {
-    const canModify = currentUserIsAdmin || (user.vai_tro === 'teacher' && lesson.nguoi_tao_id === user.user_id);
+    const canEdit = lessonTeacherHasPermission(lesson, user, 'edit');
+    const canResults = lessonTeacherHasPermission(lesson, user, 'results');
+    const canLock = lessonTeacherHasPermission(lesson, user, 'lock');
+    const canSelfStudy = lessonTeacherHasPermission(lesson, user, 'self_study');
+    const canOfflineExport = lessonTeacherHasPermission(lesson, user, 'offline_export');
+    const canArchive = lessonTeacherHasPermission(lesson, user, 'archive');
     const stopCardAction = (event: MouseEvent<HTMLElement>) => {
       event.preventDefault();
       event.stopPropagation();
@@ -4877,7 +5083,7 @@ useEffect(() => {
           >
             {currentUserIsAdmin || user.vai_tro === 'teacher' ? <MonitorPlay className="h-3.5 w-3.5 shrink-0" /> : <Eye className="h-3.5 w-3.5 shrink-0" />}<span className="lesson-action-label">{currentUserIsAdmin || user.vai_tro === 'teacher' ? 'Giảng dạy' : 'Mở'}</span>
           </button>
-          {canModify && (
+          {canEdit && (
             <button
               onClick={(event) => { stopCardAction(event); void openComposerForEdit(lesson); }}
               className="lesson-action-button bg-indigo-50 text-indigo-700 hover:bg-indigo-100"
@@ -4887,7 +5093,7 @@ useEffect(() => {
               <Pencil className="h-3.5 w-3.5 shrink-0" /><span className="lesson-action-label">Sửa</span>
             </button>
           )}
-          {(currentUserIsAdmin || user.vai_tro === 'teacher') && (
+          {canResults && (
             <button
               onClick={openLessonAnalytics}
               className="lesson-action-button bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
@@ -4897,7 +5103,7 @@ useEffect(() => {
               <Trophy className="h-3.5 w-3.5 shrink-0" /><span className="lesson-action-label">Theo dõi</span>
             </button>
           )}
-          {canModify && (
+          {canLock && (
             <button
               onClick={(event) => { stopCardAction(event); void handleToggleLessonLock(lesson); }}
               disabled={Boolean(lessonLockUpdatingId)}
@@ -4909,7 +5115,7 @@ useEffect(() => {
               <span className="lesson-action-label">{lesson.is_locked ? 'Mở khóa' : 'Khóa'}</span>
             </button>
           )}
-          {canModify && (
+          {canSelfStudy && (
             <button
               onClick={(event) => { stopCardAction(event); void handleToggleLessonAccessMode(lesson); }}
               disabled={Boolean(lessonAccessModeUpdatingId)}
@@ -4921,7 +5127,7 @@ useEffect(() => {
               <span className="lesson-action-label">Tự học theo lớp</span>
             </button>
           )}
-          {(canModify || canSubmitReview) && (
+          {(canOfflineExport || canArchive || canSubmitReview) && (
             <details className="lesson-action-menu group/menu relative">
               <summary
                 onClick={(event) => {
@@ -4939,12 +5145,12 @@ useEffect(() => {
                 {canSubmitReview && (
                   <button onClick={(event) => { stopCardAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); void handleSubmitReview(lesson); }} className="flex w-full items-center rounded-lg px-3 py-2 text-left text-xs font-semibold text-amber-700 transition hover:bg-amber-50">Gửi admin duyệt</button>
                 )}
-                {canModify && lesson.trang_thai !== 'archived' && (
+                {canOfflineExport && lesson.trang_thai !== 'archived' && (
                   <button onClick={(event) => { stopCardAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); setOfflineExportLesson(lesson); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-semibold text-indigo-700 transition hover:bg-indigo-50">
                     <Download className="h-3.5 w-3.5" /> Xuất bài học Offline
                   </button>
                 )}
-                {canModify && lesson.trang_thai !== 'archived' && (
+                {canArchive && lesson.trang_thai !== 'archived' && (
                   <button disabled={Boolean(lessonDeletingId)} onClick={(event) => { stopCardAction(event); event.currentTarget.closest('details')?.removeAttribute('open'); askDeleteLesson(lesson); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-semibold text-rose-700 transition hover:bg-rose-50 disabled:cursor-wait disabled:opacity-60">
                     {lessonDeletingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />} {lessonDeletingId === lesson.lesson_id ? 'Đang lưu trữ...' : 'Lưu trữ bài học'}
                   </button>
@@ -4971,7 +5177,7 @@ useEffect(() => {
         <button onClick={(event) => { stopCardAction(event); currentUserIsAdmin || user.vai_tro === 'teacher' ? void openLessonTeacherMode(lesson) : void openLesson(lesson); }} className="rounded-full bg-white px-3 py-2 text-xs font-semibold text-slate-700 ring-1 ring-slate-200 hover:bg-slate-50">
           {currentUserIsAdmin || user.vai_tro === 'teacher' ? <span className="inline-flex items-center gap-1"><MonitorPlay className="h-3.5 w-3.5" /> Giảng dạy</span> : 'Xem bài'}
         </button>
-        {canModify && (
+        {canEdit && (
           <button onClick={(event) => { stopCardAction(event); void openComposerForEdit(lesson); }} className="rounded-full bg-indigo-50 px-3 py-2 text-xs font-semibold text-indigo-700 hover:bg-indigo-100">
             <span className="inline-flex items-center gap-1"><Pencil className="h-3.5 w-3.5" /> Chỉnh sửa</span>
           </button>
@@ -4981,12 +5187,12 @@ useEffect(() => {
             Gửi admin duyệt
           </button>
         )}
-        {(currentUserIsAdmin || user.vai_tro === 'teacher') && (
+        {canResults && (
           <button onClick={openLessonAnalytics} className="rounded-full bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-700 hover:bg-emerald-100">
             Theo dõi
           </button>
         )}
-        {canModify && (
+        {canLock && (
           <button
             onClick={(event) => { stopCardAction(event); void handleToggleLessonLock(lesson); }}
             disabled={Boolean(lessonLockUpdatingId)}
@@ -4998,12 +5204,17 @@ useEffect(() => {
             </span>
           </button>
         )}
-        {canModify && (
+        {canSelfStudy && (
+          <button onClick={(event) => { stopCardAction(event); void handleToggleLessonAccessMode(lesson); }} disabled={Boolean(lessonAccessModeUpdatingId)} className="rounded-full bg-violet-50 px-3 py-2 text-xs font-semibold text-violet-700 hover:bg-violet-100 disabled:opacity-60">
+            <span className="inline-flex items-center gap-1"><BookOpenCheck className="h-3.5 w-3.5" /> Tự học theo lớp</span>
+          </button>
+        )}
+        {canOfflineExport && (
           <button onClick={(event) => { stopCardAction(event); setOfflineExportLesson(lesson); }} className="rounded-full bg-indigo-50 px-3 py-2 text-xs font-semibold text-indigo-700 hover:bg-indigo-100">
             <span className="inline-flex items-center gap-1"><Download className="h-3.5 w-3.5" /> Xuất Offline</span>
           </button>
         )}
-        {canModify && (
+        {canArchive && (
           <button disabled={Boolean(lessonDeletingId)} onClick={(event) => { stopCardAction(event); askDeleteLesson(lesson); }} className="rounded-full bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700 hover:bg-rose-100 disabled:cursor-wait disabled:opacity-60">
             <span className="inline-flex items-center gap-1">{lessonDeletingId === lesson.lesson_id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />} {lessonDeletingId === lesson.lesson_id ? 'Đang xóa...' : 'Xóa'}</span>
           </button>
@@ -5067,11 +5278,11 @@ useEffect(() => {
         <section className="rounded-[30px] bg-gradient-to-br from-indigo-600 via-violet-600 to-fuchsia-600 p-6 text-white shadow-xl shadow-indigo-100 sm:p-7">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div className="max-w-2xl">
-              <p className="inline-flex items-center gap-2 rounded-full bg-white/15 px-3 py-1 text-xs font-black uppercase tracking-[0.14em]"><BookOpenCheck className="h-4 w-4" /> Luyện tập tương tác</p>
+              <p className="inline-flex items-center gap-2 rounded-full bg-white/15 px-3 py-1 text-xs font-black uppercase tracking-[0.14em]"><BookOpenCheck className="h-4 w-4" /> Luyện tập & trò chơi</p>
               <h2 className="mt-3 text-2xl font-black sm:text-3xl">Quản lý luyện tập theo từng bài học</h2>
-              <p className="mt-2 text-sm leading-6 text-white/85">Cấu hình thời gian, số lượt, điểm đạt và quyền truy cập theo lớp. Học sinh xem điểm tốt nhất ngay trên thư viện luyện tập.</p>
+              <p className="mt-2 text-sm leading-6 text-white/85">Cấu hình bài luyện tập tương tác và trò chơi HTML do Gemini tạo; quản lý thời gian, số lượt, điểm đạt và quyền truy cập theo lớp.</p>
             </div>
-            {canCreate ? <button type="button" onClick={openInteractivePracticeCreator} className="inline-flex items-center gap-2 rounded-2xl bg-white px-4 py-3 text-sm font-black text-indigo-700 shadow-lg shadow-indigo-950/10"><UploadCloud className="h-4 w-4" /> Tải file bài tập</button> : null}
+            {canCreate ? <button type="button" onClick={openInteractivePracticeCreator} className="inline-flex items-center gap-2 rounded-2xl bg-white px-4 py-3 text-sm font-black text-indigo-700 shadow-lg shadow-indigo-950/10"><UploadCloud className="h-4 w-4" /> Tải bài tập / trò chơi</button> : null}
           </div>
         </section>
 
@@ -5119,7 +5330,7 @@ useEffect(() => {
                   <p className="mt-2 text-sm font-semibold text-slate-500">{subjectName} • {practice.hoc_ky || 'HK1'} • {practice.nam_hoc || '-'}</p>
                   <p className="mt-2 line-clamp-2 text-xs leading-5 text-slate-500">Gắn với: {linkedLesson?.tieu_de || practice.source_lesson_titles || 'Bài học liên kết'}</p>
                   <div className="mt-4 flex flex-wrap gap-2 text-xs font-bold">
-                    <span className="rounded-full bg-slate-50 px-3 py-1.5 text-slate-600">{Number(practice.so_cau || 0)} mục</span>
+                    <span className="rounded-full bg-slate-50 px-3 py-1.5 text-slate-600">{practice.source_type === 'html_game' || practice.loai_on_tap === 'html_game' ? '🎮 Trò chơi' : `${Number(practice.so_cau || 0)} mục`}</span>
                     <span className="rounded-full bg-slate-50 px-3 py-1.5 text-slate-600">⏱ {config.time_limit_minutes ? `${config.time_limit_minutes} phút` : 'Không giới hạn'}</span>
                     <span className="rounded-full bg-slate-50 px-3 py-1.5 text-slate-600">🔁 {config.max_attempts || '∞'} lượt</span>
                     <span className="rounded-full bg-slate-50 px-3 py-1.5 text-slate-600">🎯 Đạt {config.pass_score}/10</span>
@@ -5129,7 +5340,7 @@ useEffect(() => {
                     {studentAccess && !studentAccess.canStart ? <p className="mt-2 text-xs font-bold text-rose-600">{studentAccess.reason}</p> : null}
                   </div> : <div className="mt-4 rounded-2xl bg-slate-50 p-3 text-xs font-semibold text-slate-600"><p>{config.target_class_ids.length || classes.filter(c=>String(c.khoi||'')===String(practice.khoi||'')).length} lớp áp dụng • {lockedCount} lớp đang khóa</p>{config.available_from?<p className="mt-1">Mở: {formatPracticeDateTime(config.available_from)}</p>:null}{config.available_until?<p>Đóng: {formatPracticeDateTime(config.available_until)}</p>:null}</div>}
                   <div className="mt-4 flex flex-wrap gap-2 border-t border-slate-100 pt-4">
-                    <button type="button" disabled={user?.vai_tro === 'student' && studentAccess?.canStart === false} onClick={() => void openInteractivePractice(practice)} className="rounded-full bg-indigo-600 px-4 py-2 text-xs font-black text-white shadow-md shadow-indigo-100 hover:bg-indigo-700 disabled:bg-slate-300 disabled:shadow-none">{user?.vai_tro === 'student' ? 'Luyện tập' : 'Xem thử'}</button>
+                    <button type="button" disabled={user?.vai_tro === 'student' && studentAccess?.canStart === false} onClick={() => void openInteractivePractice(practice)} className="rounded-full bg-indigo-600 px-4 py-2 text-xs font-black text-white shadow-md shadow-indigo-100 hover:bg-indigo-700 disabled:bg-slate-300 disabled:shadow-none">{user?.vai_tro === 'student' ? (practice.source_type === 'html_game' || practice.loai_on_tap === 'html_game' ? 'Chơi ngay' : 'Luyện tập') : 'Xem thử'}</button>
                     {user?.vai_tro !== 'student' ? <button type="button" onClick={() => void openReviewPracticeResults(practice)} className="rounded-full bg-emerald-50 px-3 py-2 text-xs font-bold text-emerald-700 hover:bg-emerald-100">Kết quả</button> : null}
                     {canModify ? <button type="button" onClick={() => void openPracticeSettings(practice)} className="rounded-full bg-indigo-50 px-3 py-2 text-xs font-bold text-indigo-700 hover:bg-indigo-100"><Settings className="mr-1 inline h-3.5 w-3.5" />Cấu hình</button> : null}
                     {canModify ? <button type="button" onClick={() => askDeleteReviewPractice(practice)} className="rounded-full bg-rose-50 px-3 py-2 text-xs font-bold text-rose-700 hover:bg-rose-100">Xóa</button> : null}
@@ -5139,7 +5350,7 @@ useEffect(() => {
             })}
           </div>
         ) : (
-          <div className="rounded-[28px] border border-dashed border-slate-200 bg-white px-6 py-14 text-center shadow-sm"><BookOpenCheck className="mx-auto h-10 w-10 text-slate-300" /><h3 className="mt-3 font-black text-slate-800">Chưa có bài luyện tập phù hợp</h3><p className="mt-2 text-sm text-slate-500">{canCreate ? 'Thay đổi bộ lọc hoặc tải file HTML bài tập tương tác để bắt đầu.' : 'Giáo viên chưa phát hành bài luyện tập phù hợp cho lớp của em.'}</p></div>
+          <div className="rounded-[28px] border border-dashed border-slate-200 bg-white px-6 py-14 text-center shadow-sm"><BookOpenCheck className="mx-auto h-10 w-10 text-slate-300" /><h3 className="mt-3 font-black text-slate-800">Chưa có bài luyện tập phù hợp</h3><p className="mt-2 text-sm text-slate-500">{canCreate ? 'Thay đổi bộ lọc hoặc tải file HTML bài tập / trò chơi Gemini để bắt đầu.' : 'Giáo viên chưa phát hành bài luyện tập phù hợp cho lớp của em.'}</p></div>
         )}
       </div>
     );
@@ -5579,7 +5790,7 @@ useEffect(() => {
           analyticsRows={analyticsRows}
           students={accounts.filter((item) => item.vai_tro === 'student')}
           canViewStats={canManageArena}
-          canManageLesson={(lesson) => Boolean(currentUserIsAdmin || (user?.vai_tro === 'teacher' && lesson.nguoi_tao_id === user.user_id))}
+          canManageLesson={(lesson) => Boolean(user && (lessonTeacherHasPermission(lesson, user, 'edit') || lessonTeacherHasPermission(lesson, user, 'lock') || lessonTeacherHasPermission(lesson, user, 'self_study')))}
           lockUpdatingId={lessonLockUpdatingId}
           onToggleLessonLock={(lesson) => void handleToggleLessonLock(lesson)}
           onEditLesson={(lesson) => void openComposerForEdit(lesson)}
@@ -6535,6 +6746,28 @@ useEffect(() => {
         onSubmit={handleSubmitInteractivePractice}
       />}
 
+      {isHtmlGamePracticeViewerOpen && selectedHtmlGamePractice && selectedHtmlGame && user && <HtmlGamePracticeViewer
+        isOpen={isHtmlGamePracticeViewerOpen}
+        review={selectedHtmlGamePractice}
+        html={selectedHtmlGame}
+        currentUser={user}
+        config={selectedHtmlGameConfig}
+        initialAttemptCount={selectedHtmlGameAttemptCount}
+        previewOnly={user.vai_tro !== 'student'}
+        coLearningSession={activePracticeCoLearningSession}
+        onClose={() => {
+          setIsHtmlGamePracticeViewerOpen(false);
+          setSelectedHtmlGamePractice(null);
+          setSelectedHtmlGame('');
+          setSelectedHtmlGameConfig(undefined);
+          setSelectedHtmlGameAttemptCount(0);
+          setActivePracticeCoLearningSession(null);
+          setPendingInteractivePractice(null);
+          setCoLearningPurpose('lesson');
+        }}
+        onSubmit={handleSubmitInteractivePractice}
+      />}
+
       {isReviewResultsOpen && <ReviewPracticeResultsModal
         isOpen={isReviewResultsOpen}
         review={reviewResultsPractice}
@@ -6591,11 +6824,12 @@ useEffect(() => {
         aiConfig={aiConfig}
         subjects={subjects}
         classes={classes}
+        accounts={accounts}
         existingLessons={lessons}
         currentSchoolYear={schoolYears.find((item) => item.la_hien_hanh === true || String(item.la_hien_hanh).toLowerCase() === 'true')?.ten_nam_hoc || analyticsSchoolYearFilter || getComputedSchoolYear()}
         initialLesson={editingLesson}
         initialContent={editingContent}
-        onClose={() => setIsComposerOpen(false)}
+        onClose={() => { setIsComposerOpen(false); setEditingLesson(null); setEditingContent(null); }}
         onSave={handleComposerSave}
         onOpenConfig={openAIConfigModal}
       />
@@ -6765,7 +6999,7 @@ useEffect(() => {
               {Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.official_retake_remaining || 0) > 0 ? (
                 <div className="mt-5 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm leading-6 text-emerald-900"><b>Giáo viên đã cấp 1 lượt học lại cập nhật điểm.</b> Điểm cũ đã được chuyển vào lịch sử và tạm ẩn khỏi bảng điểm. Khi em nộp lượt mới, điểm mới sẽ trở thành điểm chính thức.</div>
               ) : (
-                <div className="mt-5 rounded-2xl border border-violet-100 bg-violet-50 p-4 text-sm leading-6 text-violet-900"><b>Học lại để luyện tập.</b> Điểm học lại được lưu riêng và không thay thế điểm chính thức{Number.isFinite(Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.assessment_score)) ? ` ${Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.assessment_score).toFixed(1)}/10` : ''}.</div>
+                <div className="mt-5 rounded-2xl border border-violet-100 bg-violet-50 p-4 text-sm leading-6 text-violet-900"><b>Học lại để luyện tập.</b> Bài được mở ngay, tiến độ được lưu riêng và tự đồng bộ khi có kết nối. Điểm học lại không thay thế điểm chính thức{Number.isFinite(Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.assessment_score)) ? ` ${Number(currentStudentProgressByLesson[retakeChoiceLesson.lesson_id]?.assessment_score).toFixed(1)}/10` : ''}.</div>
               )}
               {retakeHistory.length ? <p className="mt-3 text-xs font-semibold text-slate-500">Đã có {retakeHistory.length} phiên học lại{retakeHistory[0]?.reference_score !== undefined ? ` • gần nhất ${Number(retakeHistory[0].reference_score).toFixed(1)}/10` : ''}.</p> : null}
               <div className="mt-6 grid gap-3 sm:grid-cols-2">
@@ -6799,7 +7033,7 @@ useEffect(() => {
             className="fixed right-5 top-5 z-[120] inline-flex items-center gap-2 rounded-full border border-indigo-100 bg-white/95 px-3.5 py-2 text-xs font-bold text-indigo-700 shadow-lg backdrop-blur"
             aria-live="polite"
           >
-            <RefreshCw className="h-4 w-4 animate-spin" /> Đang đồng bộ dữ liệu
+            <RefreshCw className="h-4 w-4 animate-spin" /> Đang cập nhật dữ liệu
           </motion.div>
         )}
       </AnimatePresence>

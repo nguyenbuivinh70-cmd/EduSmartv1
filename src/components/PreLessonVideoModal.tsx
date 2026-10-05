@@ -16,6 +16,7 @@ import {
 import { Lesson, PreLessonProgress, PreLessonSubmission, User } from '../types';
 import { getPreLessonSubmissionApi, submitPreLessonPreparationApi } from '../services/api';
 import { professionalUserMessage } from '../utils/userMessages';
+import { markPreLessonOutboxAttempt, queuePreLessonOutboxItem, readPreLessonOutboxItem, removePreLessonOutboxItem } from '../utils/preLessonOutbox';
 
 type SecondSet = Set<number>;
 type SubmissionState = 'idle' | 'loading' | 'ready' | 'submitting' | 'submitted' | 'failed';
@@ -32,6 +33,7 @@ interface LocalPreLessonBuffer {
   watched_ranges: string[];
   updated_at: string;
 }
+
 
 interface PreLessonVideoModalProps {
   isOpen: boolean;
@@ -60,6 +62,12 @@ function formatSeconds(value?: number) {
   const minutes = Math.floor(safe / 60);
   const seconds = safe % 60;
   return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+function formatPercent(value?: number) {
+  const safe = Math.max(0, Math.min(100, Number(value || 0)));
+  const rounded = Math.round(safe * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
 }
 
 function formatDateTime(value?: string) {
@@ -202,6 +210,7 @@ function clearLocalBuffer(userId: string, lessonId: string, revision: number) {
   } catch { /* no-op */ }
 }
 
+
 function diagnosticCode(error: unknown, fallback: string) {
   const explicit = String((error as any)?.diagnosticCode || '').trim();
   if (explicit) return explicit;
@@ -266,6 +275,7 @@ export default function PreLessonVideoModal({ isOpen, lesson, user, onClose, onP
   const [progress, setProgress] = useState<PreLessonProgress | null>(null);
   const [submission, setSubmission] = useState<PreLessonSubmission | null>(null);
   const [submissionState, setSubmissionState] = useState<SubmissionState>('idle');
+  const [pendingSync, setPendingSync] = useState(false);
   const [error, setError] = useState('');
   const [browserFullscreen, setBrowserFullscreen] = useState(false);
   const [videoFullscreen, setVideoFullscreen] = useState(false);
@@ -285,6 +295,7 @@ export default function PreLessonVideoModal({ isOpen, lesson, user, onClose, onP
   const resumePositionRef = useRef(0);
   const resumeAppliedRef = useRef(false);
   const submittedRef = useRef(false);
+  const autoRetryRef = useRef(false);
   const onProgressChangeRef = useRef(onProgressChange);
 
   useEffect(() => { onProgressChangeRef.current = onProgressChange; }, [onProgressChange]);
@@ -320,6 +331,8 @@ export default function PreLessonVideoModal({ isOpen, lesson, user, onClose, onP
     if (!isOpen || !lesson || !user) return;
     let cancelled = false;
     const buffer = trackingEnabled ? readLocalBuffer(user.user_id, lesson.lesson_id, videoRevision) : null;
+    const pendingStored = trackingEnabled ? readPreLessonOutboxItem(user.firebase_uid || user.user_id, lesson.lesson_id, videoRevision, user.user_id) : null;
+    const pending = pendingStored?.terminal_reason ? null : pendingStored;
     const initial = progressFromLocal(lesson, user, buffer);
     watchedSecondsSetRef.current = parseRanges(initial.watched_ranges, initial.watched_seconds);
     localDurationRef.current = Number(initial.duration_seconds || 0);
@@ -328,6 +341,8 @@ export default function PreLessonVideoModal({ isOpen, lesson, user, onClose, onP
     resumePositionRef.current = lastPositionRef.current;
     resumeAppliedRef.current = false;
     submittedRef.current = false;
+    autoRetryRef.current = false;
+    setPendingSync(Boolean(pending));
     setProgress(initial);
     setSubmission(null);
     setError('');
@@ -349,10 +364,18 @@ export default function PreLessonVideoModal({ isOpen, lesson, user, onClose, onP
           const official = progressFromSubmission(lesson, user, current);
           setProgress(official);
           clearLocalBuffer(user.user_id, lesson.lesson_id, videoRevision);
+          removePreLessonOutboxItem(user.firebase_uid || user.user_id, lesson.lesson_id, videoRevision, user.user_id);
+          setPendingSync(false);
           setSubmissionState('submitted');
           onProgressChangeRef.current?.(official);
         } else {
-          setSubmissionState('ready');
+          if (pending) {
+            setSubmissionState('failed');
+            setPendingSync(true);
+            setError('Kết quả của em đang chờ gửi. Em hãy thử lại khi kết nối ổn định.');
+          } else {
+            setSubmissionState('ready');
+          }
         }
       } else {
         const diag = diagnosticCode(res.error, 'PRELESSON_SUBMISSION_LOAD_DENIED');
@@ -514,10 +537,33 @@ export default function PreLessonVideoModal({ isOpen, lesson, user, onClose, onP
     }
     setError('');
     setSubmissionState('submitting');
+    // V6.98.4: % gửi phải được suy ra từ đúng hai số sẽ lưu trên Firestore.
+    // Trước đây UI tính % từ duration dạng float nhưng payload lại làm tròn
+    // duration, nên có thể lệch 0,1-0,2% giữa học sinh và báo cáo giáo viên.
+    const canonicalDuration = Math.max(1, Math.round(snapshot.duration));
+    const canonicalWatched = Math.max(0, Math.min(canonicalDuration, Math.round(snapshot.watched)));
+    const canonicalPercent = Math.max(0, Math.min(100, Math.round((canonicalWatched / canonicalDuration) * 1000) / 10));
+    const pendingPayload = queuePreLessonOutboxItem({
+      owner_uid: user.firebase_uid || user.user_id,
+      user_id: user.user_id,
+      lesson_id: lesson.lesson_id,
+      video_revision: videoRevision,
+      video_id: videoId || undefined,
+      watch_percent: canonicalPercent,
+      watched_seconds: canonicalWatched,
+      duration_seconds: canonicalDuration,
+      attempted_at: new Date().toISOString(),
+    });
+    if (!pendingPayload) {
+      setError('Chưa thể lưu kết quả tạm thời. Em hãy giữ trang này mở và thử gửi lại.');
+    }
+    setPendingSync(true);
     const res = await submitPreLessonPreparationApi(user.token, lesson.lesson_id, {
-      watch_percent: snapshot.percent,
-      watched_seconds: snapshot.watched,
-      duration_seconds: Math.round(snapshot.duration),
+      watch_percent: pendingPayload?.watch_percent ?? snapshot.percent,
+      watched_seconds: pendingPayload?.watched_seconds ?? snapshot.watched,
+      duration_seconds: pendingPayload?.duration_seconds ?? Math.round(snapshot.duration),
+      video_revision: videoRevision,
+      video_id: videoId || undefined,
     });
     if (res.ok && res.data) {
       submittedRef.current = true;
@@ -525,19 +571,50 @@ export default function PreLessonVideoModal({ isOpen, lesson, user, onClose, onP
       const official = progressFromSubmission(lesson, user, res.data);
       setProgress(official);
       clearLocalBuffer(user.user_id, lesson.lesson_id, videoRevision);
+      removePreLessonOutboxItem(user.firebase_uid || user.user_id, lesson.lesson_id, videoRevision, user.user_id);
+      setPendingSync(false);
       setSubmissionState('submitted');
       setError('');
       onProgressChangeRef.current?.(official);
       return;
     }
     const diag = diagnosticCode(res.error, 'PRELESSON_SUBMIT_RULES_DENIED');
-    setError(diag === 'PRELESSON_SUBMIT_VERIFY_DENIED' || diag === 'PRELESSON_SUBMIT_VERIFY_FAILED'
-      ? 'Kết quả chuẩn bị bài đang được đồng bộ. Tiến độ xem của em vẫn được giữ an toàn; hãy tải lại và kiểm tra sau ít phút.'
-      : diag === 'PRELESSON_NETWORK'
-        ? 'Kết nối đang gián đoạn. Tiến độ xem của em vẫn được giữ; hãy thử gửi lại khi kết nối ổn định.'
-        : 'Chưa gửi được kết quả chuẩn bị bài. Tiến độ xem của em vẫn được giữ an toàn; hãy thử gửi lại.');
+    const terminalReason = diag === 'PRELESSON_VIDEO_REVISION_CHANGED'
+      ? 'video_revision_changed'
+      : diag === 'PRELESSON_VIDEO_CHANGED'
+        ? 'video_changed'
+        : undefined;
+    if (pendingPayload) markPreLessonOutboxAttempt(pendingPayload, String((res as any).message || diag), terminalReason);
+    setPendingSync(!terminalReason);
+    setError(diag === 'PRELESSON_NETWORK'
+      ? 'Chưa có kết nối ổn định. Kết quả của em đã được giữ và sẽ gửi lại khi có mạng.'
+      : diag === 'PRELESSON_VIDEO_REVISION_CHANGED' || diag === 'PRELESSON_VIDEO_CHANGED'
+        ? 'Video chuẩn bị đã được giáo viên cập nhật. Em hãy mở lại video hiện tại trước khi gửi kết quả.'
+        : 'Hệ thống chưa ghi nhận kết quả. Em hãy bấm “Thử gửi lại”.');
     setSubmissionState('failed');
-  }, [lesson, user, trackingEnabled, threshold, videoRevision, samplePlayerCoverage, snapshotLocalBuffer, currentCoverageSnapshot]);
+  }, [lesson, user, trackingEnabled, threshold, videoRevision, videoId, samplePlayerCoverage, snapshotLocalBuffer, currentCoverageSnapshot]);
+
+  // V6.96.0: modal vẫn retry tức thời; hàng đợi cấp App sẽ tiếp tục retry sau khi đóng modal.
+  // modal, khi mạng trở lại hoặc khi người dùng quay lại tab. Mỗi sự kiện chỉ
+  // kích hoạt khi không có request đang chạy để tránh gửi trùng.
+  useEffect(() => {
+    if (!isOpen || !lesson || !user || !pendingSync || submission || submissionState === 'loading' || submissionState === 'submitting') return;
+    const retry = () => {
+      if (document.visibilityState !== 'visible' || !navigator.onLine || autoRetryRef.current) return;
+      autoRetryRef.current = true;
+      window.setTimeout(() => {
+        autoRetryRef.current = false;
+        void handleSubmitPreparation();
+      }, 900);
+    };
+    retry();
+    window.addEventListener('online', retry);
+    document.addEventListener('visibilitychange', retry);
+    return () => {
+      window.removeEventListener('online', retry);
+      document.removeEventListener('visibilitychange', retry);
+    };
+  }, [isOpen, lesson?.lesson_id, user?.user_id, pendingSync, submission, submissionState, handleSubmitPreparation]);
 
   const toggleBrowserFullscreen = useCallback(async () => {
     try {
@@ -579,10 +656,12 @@ export default function PreLessonVideoModal({ isOpen, lesson, user, onClose, onP
 
   const readinessLabel = submission
     ? (submittedOnTime ? 'Đã chuẩn bị bài' : 'Đã gửi • Hoàn thành muộn')
+    : pendingSync
+      ? 'Đã xem đủ • Chờ gửi'
     : eligibleToSubmit
       ? 'Đã xem đủ • Chưa gửi kết quả'
       : percent > 0
-        ? `Đang xem • ${Math.round(percent)}%`
+        ? `Đang xem • ${formatPercent(percent)}%`
         : 'Chưa xem video';
 
   const handleClose = () => {
@@ -615,18 +694,18 @@ export default function PreLessonVideoModal({ isOpen, lesson, user, onClose, onP
                 {videoId ? (
                   <div ref={videoFrameRef} className="relative aspect-video w-full overflow-hidden bg-black shadow-2xl lg:h-full lg:max-h-full lg:aspect-auto lg:rounded-2xl lg:ring-1 lg:ring-white/10">
                     <div ref={playerHostRef} className="h-full w-full" />
-                    {trackingEnabled ? <div className="pointer-events-none absolute left-2 top-2 rounded-full bg-black/65 px-2.5 py-1 text-[11px] font-bold text-white backdrop-blur sm:left-3 sm:top-3 sm:text-xs">Độ phủ {Math.round(percent)}% • {formatSeconds(progress?.watched_seconds)} nội dung</div> : null}
+                    {trackingEnabled ? <div className="pointer-events-none absolute left-2 top-2 rounded-full bg-black/65 px-2.5 py-1 text-[11px] font-bold text-white backdrop-blur sm:left-3 sm:top-3 sm:text-xs">Độ phủ {formatPercent(percent)}% • {formatSeconds(progress?.watched_seconds)} nội dung</div> : null}
                     <button type="button" onClick={() => void toggleVideoFullscreen()} className="absolute bottom-3 right-3 z-20 inline-flex h-9 items-center gap-1.5 rounded-lg bg-black/60 px-2.5 text-[11px] font-bold text-white backdrop-blur hover:bg-black/80" title="Phóng to riêng video">{videoFullscreen ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />} <span className="hidden sm:inline">{videoFullscreen ? 'Thu nhỏ' : 'Phóng to video'}</span></button>
                   </div>
                 ) : <div className="m-4 flex aspect-video w-full max-w-5xl items-center justify-center rounded-2xl bg-slate-900 p-8 text-center text-sm font-semibold text-slate-300 ring-1 ring-white/10">Liên kết video hiện tại không phải URL YouTube hợp lệ. Giáo viên cần cập nhật lại video chuẩn bị.</div>}
               </div>
-              <div className="hidden shrink-0 items-center justify-between gap-3 border-t border-white/10 bg-slate-950 px-5 py-3 text-xs text-slate-300 lg:flex"><span>Tiến độ chỉ lưu trên thiết bị cho tới khi em bấm Gửi kết quả. Tua qua không tính; xem lại đoạn cũ không cộng trùng.</span><span className="inline-flex items-center gap-2 text-slate-400"><LockKeyhole className="h-4 w-4" /> Nội dung bài học vẫn được khóa</span></div>
+              <div className="hidden shrink-0 items-center justify-between gap-3 border-t border-white/10 bg-slate-950 px-5 py-3 text-xs text-slate-300 lg:flex"><span>Xem ít nhất mức yêu cầu, sau đó bấm “Gửi kết quả”. Tua qua không được tính.</span><span className="inline-flex items-center gap-2 text-slate-400"><LockKeyhole className="h-4 w-4" /> Nội dung bài học vẫn được khóa</span></div>
             </main>
 
             <aside className="bg-white text-slate-700 lg:min-h-0 lg:overflow-y-auto lg:border-l lg:border-slate-200">
               <div className="space-y-3 p-3 sm:p-4 lg:p-4">
                 {trackingEnabled ? <section className={`rounded-2xl p-4 ring-1 ${submission ? (submittedOnTime ? 'bg-emerald-50 text-emerald-800 ring-emerald-100' : 'bg-amber-50 text-amber-800 ring-amber-100') : eligibleToSubmit ? 'bg-cyan-50 text-cyan-800 ring-cyan-100' : 'bg-indigo-50 text-indigo-800 ring-indigo-100'}`}>
-                  <div className="flex items-center justify-between gap-3"><div className="flex items-center gap-2 font-black">{submission ? <CheckCircle2 className="h-5 w-5" /> : eligibleToSubmit ? <ShieldCheck className="h-5 w-5" /> : <TimerReset className="h-5 w-5" />} {submission ? 'Đã gửi kết quả' : eligibleToSubmit ? 'Đã đủ điều kiện' : 'Tiến độ xem'}</div><strong className="text-2xl font-black tabular-nums">{Math.round(percent)}%</strong></div>
+                  <div className="flex items-center justify-between gap-3"><div className="flex items-center gap-2 font-black">{submission ? <CheckCircle2 className="h-5 w-5" /> : eligibleToSubmit ? <ShieldCheck className="h-5 w-5" /> : <TimerReset className="h-5 w-5" />} {submission ? 'Đã gửi kết quả' : pendingSync ? 'Chờ gửi' : eligibleToSubmit ? 'Đã đủ điều kiện' : 'Tiến độ xem'}</div><strong className="text-2xl font-black tabular-nums">{formatPercent(percent)}%</strong></div>
                   <div className="mt-3 h-2.5 overflow-hidden rounded-full bg-white/90"><div className={`h-full rounded-full transition-all ${submission ? (submittedOnTime ? 'bg-emerald-500' : 'bg-amber-500') : eligibleToSubmit ? 'bg-cyan-500' : 'bg-indigo-600'}`} style={{ width: `${percent}%` }} /></div>
                   <div className="mt-2 grid grid-cols-2 gap-2 text-xs font-semibold"><span>{formatSeconds(progress?.watched_seconds)} / {progress?.duration_seconds ? formatSeconds(progress.duration_seconds) : '...'} nội dung</span><span className="text-right">Cần {threshold}%</span></div>
                   <div className="mt-2 border-t border-current/10 pt-2 text-[11px] opacity-80">Vị trí hiện tại: <strong>{formatSeconds(playerPosition)}</strong>. Xem lại đoạn đã xem không làm tăng %.</div>
@@ -644,18 +723,18 @@ export default function PreLessonVideoModal({ isOpen, lesson, user, onClose, onP
                   className={`flex w-full items-center justify-center gap-2 rounded-2xl px-4 py-3.5 text-sm font-black transition ${submission ? 'cursor-default bg-emerald-600 text-white' : eligibleToSubmit ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-500/20 hover:bg-indigo-700 disabled:cursor-wait disabled:opacity-70' : 'cursor-not-allowed bg-slate-100 text-slate-400 ring-1 ring-slate-200'}`}
                 >
                   {submission ? <CheckCircle2 className="h-5 w-5" /> : <Send className="h-5 w-5" />}
-                  {submission ? 'Đã gửi kết quả chuẩn bị bài' : submissionState === 'submitting' ? 'Đang gửi và xác minh...' : 'Gửi kết quả chuẩn bị bài'}
+                  {submission ? 'Đã gửi kết quả chuẩn bị bài' : submissionState === 'submitting' ? 'Đang gửi...' : pendingSync ? 'Gửi lại kết quả chuẩn bị bài' : 'Gửi kết quả chuẩn bị bài'}
                 </button> : null}
 
-                {trackingEnabled && !submission ? <section className="rounded-2xl bg-slate-50 p-3 text-xs leading-5 text-slate-600 ring-1 ring-slate-100"><p className="font-black text-slate-800">Cách ghi nhận</p><p className="mt-1">Trong khi xem, tiến độ chỉ lưu trên thiết bị. Khi đạt đủ {threshold}%, nút gửi mới được mở. Sau khi hệ thống ghi nhận lần gửi thành công, giáo viên sẽ thấy trạng thái “Đã chuẩn bị”.</p></section> : null}
+                {trackingEnabled && !submission ? <section className="rounded-2xl bg-slate-50 p-3 text-xs leading-5 text-slate-600 ring-1 ring-slate-100"><p className="font-black text-slate-800">Hướng dẫn</p><p className="mt-1">Xem ít nhất {threshold}% nội dung video, sau đó bấm “Gửi kết quả”. Tua qua không được tính.</p></section> : null}
 
-                {submission ? <section className={`rounded-2xl p-3 text-xs leading-5 ring-1 ${submittedOnTime ? 'bg-emerald-50 text-emerald-800 ring-emerald-100' : 'bg-amber-50 text-amber-800 ring-amber-100'}`}><p className="font-black">{submittedOnTime ? '✓ Kết quả đã được ghi nhận' : '✓ Kết quả đã được ghi nhận muộn'}</p><p className="mt-1">Thời gian gửi: {formatDateTime(submission.submitted_at)} • Độ phủ khi gửi: {Math.round(submission.watch_percent)}%.</p></section> : null}
+                {submission ? <section className={`rounded-2xl p-3 text-xs leading-5 ring-1 ${submittedOnTime ? 'bg-emerald-50 text-emerald-800 ring-emerald-100' : 'bg-amber-50 text-amber-800 ring-amber-100'}`}><p className="font-black">{submittedOnTime ? '✓ Kết quả đã được ghi nhận' : '✓ Kết quả đã được ghi nhận muộn'}</p><p className="mt-1">Thời gian gửi: {formatDateTime(submission.submitted_at)} • Độ phủ khi gửi: {formatPercent(submission.watch_percent)}%.</p></section> : null}
 
-                {error ? <section className="rounded-2xl bg-rose-50 p-3 text-xs leading-5 text-rose-700 ring-1 ring-rose-100"><p className="flex items-center gap-2 font-black"><WifiOff className="h-4 w-4" /> Chưa thể hoàn tất thao tác</p><p className="mt-1">{error}</p>{eligibleToSubmit && !submission ? <button type="button" disabled={submissionState === 'submitting'} onClick={() => void handleSubmitPreparation()} className="mt-2 rounded-lg bg-white px-3 py-2 font-bold text-rose-700 ring-1 ring-rose-200 hover:bg-rose-100">Thử gửi lại</button> : null}</section> : null}
+                {error ? <section className="rounded-2xl bg-rose-50 p-3 text-xs leading-5 text-rose-700 ring-1 ring-rose-100"><p className="flex items-center gap-2 font-black"><WifiOff className="h-4 w-4" /> Chưa gửi được kết quả</p><p className="mt-1">{error}</p>{eligibleToSubmit && !submission ? <button type="button" disabled={submissionState === 'submitting'} onClick={() => void handleSubmitPreparation()} className="mt-2 rounded-lg bg-white px-3 py-2 font-bold text-rose-700 ring-1 ring-rose-200 hover:bg-rose-100">Thử gửi lại</button> : null}</section> : null}
 
                 <section className="rounded-2xl bg-amber-50 p-3 text-xs leading-5 text-amber-900 ring-1 ring-amber-100"><p className="flex items-center gap-2 font-black"><LockKeyhole className="h-4 w-4" /> Chuẩn bị bài là nhiệm vụ cá nhân</p><p className="mt-1">Kết quả chuẩn bị chỉ được ghi cho tài khoản đang đăng nhập. Học cùng chỉ áp dụng khi vào bài học chính.</p></section>
 
-                <details className="rounded-2xl bg-slate-50 p-3 text-xs leading-5 text-slate-600 ring-1 ring-slate-100 lg:hidden"><summary className="cursor-pointer font-black text-slate-800">Cách tính tiến độ</summary><p className="mt-2">Tiến độ dựa trên độ phủ nội dung video. Tua qua không tính; xem lại cùng một đoạn không cộng thêm. Tiến độ chưa gửi được giữ trên thiết bị này.</p></details>
+                <details className="rounded-2xl bg-slate-50 p-3 text-xs leading-5 text-slate-600 ring-1 ring-slate-100 lg:hidden"><summary className="cursor-pointer font-black text-slate-800">Cách tính tiến độ</summary><p className="mt-2">Tiến độ dựa trên độ phủ nội dung video. Tua qua không tính; xem lại cùng một đoạn không cộng thêm. Em có thể thử gửi lại khi kết nối ổn định.</p></details>
               </div>
             </aside>
           </div>

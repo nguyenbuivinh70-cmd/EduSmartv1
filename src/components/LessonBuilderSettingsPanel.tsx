@@ -20,6 +20,8 @@ export const DEFAULT_LESSON_BUILDER_SETTINGS: LessonBuilderSettings = {
   final_quiz_count: 10,
   question_mix: 'mixed',
   final_quiz_question_types: ['single_choice', 'true_false', 'fill_in_blank'],
+  final_quiz_source_mode: 'fixed',
+  question_bank_size: 30,
   difficulty: 'medium',
   include_examples: true,
   include_summary: true,
@@ -35,6 +37,7 @@ export const DEFAULT_LESSON_BUILDER_SETTINGS: LessonBuilderSettings = {
   shuffle_final_questions: true,
   shuffle_final_options: true,
   show_final_answers_after_submit: true,
+  show_final_explanations_after_submit: true,
   allow_exam_retry: true,
   max_exam_attempts: 2,
   exam_score_policy: 'best',
@@ -50,7 +53,7 @@ export const DEFAULT_LESSON_BUILDER_SETTINGS: LessonBuilderSettings = {
 
 export default function LessonBuilderSettingsPanel({ value, onChange, onSaveDefault, onResetDefault, isSavingDefault = false, isResettingDefault = false, defaultUpdatedAt, defaultStatusMessage }: Props) {
   const update = <K extends keyof LessonBuilderSettings>(key: K, next: LessonBuilderSettings[K]) => onChange({ ...value, [key]: next });
-  const updatePositiveInt = (key: keyof Pick<LessonBuilderSettings, 'interactive_questions_per_section' | 'final_quiz_count' | 'lesson_time_minutes' | 'final_exam_time_minutes' | 'max_exam_attempts' | 'review_question_count' | 'review_time_minutes'>, rawValue: string, min: number, max: number) => {
+  const updatePositiveInt = (key: keyof Pick<LessonBuilderSettings, 'interactive_questions_per_section' | 'final_quiz_count' | 'question_bank_size' | 'lesson_time_minutes' | 'final_exam_time_minutes' | 'max_exam_attempts' | 'review_question_count' | 'review_time_minutes'>, rawValue: string, min: number, max: number) => {
     const parsed = Math.floor(Number(rawValue));
     const safeValue = Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : min;
     update(key as any, safeValue as any);
@@ -179,6 +182,22 @@ export default function LessonBuilderSettingsPanel({ value, onChange, onSaveDefa
             ))}
           </div>
         </div>
+        <div className="mb-4 grid gap-3 md:grid-cols-2">
+          <label className="space-y-2">
+            <span className="text-sm font-semibold text-slate-700">Nguồn câu hỏi kiểm tra</span>
+            <select value={value.final_quiz_source_mode || 'fixed'} onChange={(e) => update('final_quiz_source_mode', e.target.value as 'fixed' | 'random_bank')} className={fieldClass}>
+              <option value="fixed">Bộ câu hỏi cố định của bài</option>
+              <option value="random_bank">Lấy ngẫu nhiên từ ngân hàng câu hỏi</option>
+            </select>
+          </label>
+          <label className="space-y-2">
+            <span className="text-sm font-semibold text-slate-700">Quy mô ngân hàng AI đề xuất</span>
+            <input type="number" min={5} max={200} step={1} value={value.question_bank_size || 30} onChange={(e) => updatePositiveInt('question_bank_size', e.target.value, 5, 200)} className={fieldClass} />
+          </label>
+          <div className="rounded-2xl bg-rose-100/70 px-4 py-3 text-xs font-semibold leading-5 text-rose-800 md:col-span-2">
+            Khi chọn ngân hàng, mỗi lượt làm sẽ rút <b>{value.final_quiz_count}</b> câu từ ngân hàng. Bộ câu đã rút được giữ ổn định cho đúng lượt làm, kể cả khi tải lại trang.
+          </div>
+        </div>
         <div className="grid gap-3 md:grid-cols-2">
           <label className="flex items-center gap-2 rounded-2xl bg-white px-4 py-3 text-sm font-semibold text-slate-700 ring-1 ring-rose-100">
             <input type="checkbox" checked={value.shuffle_final_questions !== false} onChange={(e) => update('shuffle_final_questions', e.target.checked)} /> Đảo thứ tự câu hỏi
@@ -190,20 +209,11 @@ export default function LessonBuilderSettingsPanel({ value, onChange, onSaveDefa
             <input type="checkbox" checked={value.show_final_answers_after_submit !== false} onChange={(e) => update('show_final_answers_after_submit', e.target.checked)} /> Cho xem đáp án sau khi nộp
           </label>
           <label className="flex items-center gap-2 rounded-2xl bg-white px-4 py-3 text-sm font-semibold text-slate-700 ring-1 ring-rose-100">
-            <input type="checkbox" checked={value.allow_exam_retry !== false} onChange={(e) => update('allow_exam_retry', e.target.checked)} /> Cho phép làm lại kiểm tra
+            <input type="checkbox" checked={value.show_final_explanations_after_submit !== false} onChange={(e) => update('show_final_explanations_after_submit', e.target.checked)} /> Cho xem giải thích sau khi nộp
           </label>
-          <label className="space-y-2">
-            <span className="text-sm font-semibold text-slate-700">Số lần làm lại tối đa</span>
-            <input type="number" min={1} max={10} step={1} value={value.max_exam_attempts || 2} onChange={(e) => updatePositiveInt('max_exam_attempts', e.target.value, 1, 10)} className={fieldClass} />
-          </label>
-          <label className="space-y-2">
-            <span className="text-sm font-semibold text-slate-700">Cách lấy điểm</span>
-            <select value={value.exam_score_policy || 'best'} onChange={(e) => update('exam_score_policy', e.target.value as ExamScorePolicy)} className={fieldClass}>
-              <option value="best">Lấy điểm cao nhất</option>
-              <option value="last">Lấy điểm lần cuối</option>
-              <option value="average">Lấy điểm trung bình</option>
-            </select>
-          </label>
+          <div className="rounded-2xl bg-slate-50 px-4 py-3 text-xs font-semibold leading-5 text-slate-600 md:col-span-2">
+            Kiểm tra cuối bài của bài học chính thức được thiết kế theo một lượt làm chính. Nếu cần học sinh cập nhật điểm sau này, giáo viên sẽ cấp lượt <b>học lại cập nhật điểm</b> trong mục Theo dõi học tập.
+          </div>
         </div>
       </section>
 

@@ -24,7 +24,7 @@ interface LessonViewerProps {
   onStepOpened?: (stage: LessonStageKey) => void;
   onStepViewedComplete?: (stage: LessonStageKey) => void;
   onQuizMetricsChange?: (stage: LessonStageKey, metrics: { answered: number; correct: number; total: number; answers?: Record<string, LessonQuestionAnswerState>; sectionProgress?: Record<string, SectionLearningProgress>; finalExam?: any }) => void;
-  onFinalExamSubmit?: (snapshot: LessonCloseSnapshot) => Promise<boolean> | boolean;
+  onFinalExamSubmit?: (snapshot: LessonCloseSnapshot, options?: { silent?: boolean }) => Promise<boolean> | boolean;
   coLearningGroupSize?: number;
   onManageCoLearning?: () => void;
   onOpenPreLessonVideo?: () => void;
@@ -51,6 +51,41 @@ const HTML_ENTITY_MAP: Record<string, string> = {
 };
 
 const MIN_SECTION_SECONDS = 30;
+
+type FinalSubmissionSyncState = 'idle' | 'syncing' | 'pending' | 'synced';
+
+interface PendingFinalSubmissionEnvelope {
+  version: 1;
+  saved_at: string;
+  lesson_id: string;
+  user_id: string;
+  attempt_mode: 'official' | 'retake' | 'review';
+  retake_attempt_number?: number;
+  snapshot: LessonCloseSnapshot;
+}
+
+function readPendingFinalSubmission(storageKey: string): PendingFinalSubmissionEnvelope | null {
+  if (!storageKey || typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as PendingFinalSubmissionEnvelope;
+    if (parsed?.version !== 1 || !parsed?.snapshot?.finalExam) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writePendingFinalSubmission(storageKey: string, envelope: PendingFinalSubmissionEnvelope) {
+  if (!storageKey || typeof window === 'undefined') return;
+  try { window.localStorage.setItem(storageKey, JSON.stringify(envelope)); } catch { /* best effort */ }
+}
+
+function clearPendingFinalSubmission(storageKey: string) {
+  if (!storageKey || typeof window === 'undefined') return;
+  try { window.localStorage.removeItem(storageKey); } catch { /* best effort */ }
+}
 
 function cleanText(value?: string) {
   return String(value || '')
@@ -561,6 +596,33 @@ function formatSeconds(totalSeconds: number) {
   return `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
+function stableHash(value: string) {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function seededShuffle<T>(items: T[], seedText: string): T[] {
+  const next = [...items];
+  let seed = stableHash(seedText) || 1;
+  const random = () => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed / 4294967296;
+  };
+  for (let i = next.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(random() * (i + 1));
+    [next[i], next[j]] = [next[j], next[i]];
+  }
+  return next;
+}
+
+function questionIdentity(question: QuizQuestion, index: number) {
+  return String(question.id || `Q_${index + 1}_${stableHash(String(question.question || question.sentence || ''))}`);
+}
+
 export default function LessonViewer({
   isOpen,
   lesson,
@@ -593,6 +655,7 @@ export default function LessonViewer({
   const effectiveContent = liveContent || content;
   const sections = useMemo(() => toV2Sections(effectiveContent), [effectiveContent]);
   const finalQuiz = useMemo(() => toFinalQuiz(effectiveContent), [effectiveContent]);
+  const questionBank = useMemo(() => (effectiveContent?.question_bank || []).map((question, index) => normalizeQuestion(question, `QB${index + 1}`)).filter((question) => isQuizQuestionQualityAcceptable(question)), [effectiveContent]);
   const [activeStep, setActiveStep] = useState<string>('intro');
   const lessonMainRef = useRef<HTMLElement | null>(null);
   const [teachingClassId, setTeachingClassId] = useState('');
@@ -611,6 +674,8 @@ export default function LessonViewer({
   const [examSubmitted, setExamSubmitted] = useState(false);
   const [finalExamSaving, setFinalExamSaving] = useState(false);
   const [finalExamSaveError, setFinalExamSaveError] = useState('');
+  const [finalSubmissionSyncState, setFinalSubmissionSyncState] = useState<FinalSubmissionSyncState>('idle');
+  const [pendingFinalSubmission, setPendingFinalSubmission] = useState<LessonCloseSnapshot | null>(null);
   const finalSubmitPersistedRef = useRef('');
   const [examAutoSubmitted, setExamAutoSubmitted] = useState(false);
   const [examElapsedSeconds, setExamElapsedSeconds] = useState(0);
@@ -627,6 +692,12 @@ export default function LessonViewer({
   const [closingLesson, setClosingLesson] = useState(false);
 
   const isStudentView = currentUserRole === 'student';
+  const pendingFinalSubmissionStorageKey = useMemo(() => {
+    const userId = String(currentUser?.user_id || progress?.user_id || '').trim();
+    const lessonId = String(lesson?.lesson_id || '').trim();
+    if (!userId || !lessonId || attemptMode === 'review') return '';
+    return `edusmart:v6901:pending-final:${userId}:${lessonId}:${attemptMode}:${retakeAttemptNumber || 0}`;
+  }, [currentUser?.user_id, progress?.user_id, lesson?.lesson_id, attemptMode, retakeAttemptNumber]);
   const selfStudyMode = lesson?.access_mode === 'self_study';
   const releasedActivityIds = useMemo<Set<string>>(() => new Set((teachingSession?.released_activity_ids || []).map((item) => String(item).trim()).filter(Boolean)), [teachingSession?.released_activity_ids]);
   const releasedActivitySignature = useMemo(() => Array.from(releasedActivityIds).sort().join('|'), [releasedActivityIds]);
@@ -697,14 +768,14 @@ export default function LessonViewer({
 
         if (releasedSignatureRef.current !== nextReleased) {
           releasedSignatureRef.current = nextReleased;
-          void getLessonContentApi(currentUser.token, lesson.lesson_id).then(async (res) => {
+          void getLessonContentApi(currentUser.token, lesson.lesson_id, attemptMode).then(async (res) => {
             if (!res.ok || !res.data?.content) {
               setTeachingSessionError(res.message || 'Mục đã được giáo viên mở nhưng chưa tải lại được nội dung. Hãy thử lại sau vài giây.');
               return;
             }
             const { normalizeLessonContent } = await import('../services/gemini');
             setLiveContent(normalizeLessonContent(res.data.content));
-          }).catch(() => setTeachingSessionError('Mục đã được giáo viên mở nhưng chưa tải lại được nội dung. Hệ thống sẽ tự đồng bộ lại.'));
+          }).catch(() => setTeachingSessionError('Mục đã được giáo viên mở nhưng chưa tải được nội dung. Em hãy thử lại.'));
         }
         const currentActivity = String(session?.current_activity_id || '');
         if (currentActivity && (session?.released_activity_ids || []).map(String).includes(currentActivity)) {
@@ -712,7 +783,7 @@ export default function LessonViewer({
           // đang được trình bày. Các hoạt động cũ vẫn có thể mở lại thủ công sau đó.
           setActiveStep(currentActivity);
         }
-      }, () => setTeachingSessionError('Mất kết nối trạng thái tiết học. Hệ thống sẽ tự đồng bộ lại khi có kết nối.'));
+      }, () => setTeachingSessionError('Kết nối đang gián đoạn. Em hãy thử lại khi có mạng.'));
       return unsubscribe;
     }
     setTeachingSessionBusy(true);
@@ -722,7 +793,7 @@ export default function LessonViewer({
       if (res.ok) setTeachingSession(res.data || null);
       else setTeachingSessionError(res.message || 'Không tải được trạng thái tiết học.');
     });
-  }, [isOpen, lesson?.lesson_id, teachingClassId, currentUserRole, currentUser?.user_id]);
+  }, [isOpen, lesson?.lesson_id, teachingClassId, currentUserRole, currentUser?.user_id, attemptMode]);
 
   useEffect(() => {
     if (isOpen) {
@@ -742,13 +813,20 @@ export default function LessonViewer({
       setCommentInput('');
       setReplyInputs({});
       setSubmittingCommentId(null);
-      setExamStarted(false);
-      setExamSubmitted(false);
-      setExamAutoSubmitted(false);
-      setExamElapsedSeconds(0);
-      setExamAttemptNumber(1);
-      setExamSecurityEvents({ copy_attempts: 0, right_click_attempts: 0, tab_leave_count: 0, select_attempts: 0, reload_attempts: 0 });
-      setExamQuestions([]);
+      const storedFinalExam = progress?.step_details?.luyen_tap?.finalExam;
+      const storedExamStatus = String(storedFinalExam?.status || 'not_started');
+      const storedSnapshot = Array.isArray(storedFinalExam?.question_snapshot) ? storedFinalExam?.question_snapshot || [] : [];
+      const storedExamSubmitted = ['submitted', 'auto_submitted', 'expired'].includes(storedExamStatus);
+      setExamStarted(['in_progress', 'submitted', 'auto_submitted', 'expired'].includes(storedExamStatus));
+      setExamSubmitted(storedExamSubmitted);
+      setExamAutoSubmitted(storedExamStatus === 'auto_submitted' || storedExamStatus === 'expired');
+      setFinalSubmissionSyncState(storedExamSubmitted && attemptMode === 'official' ? 'synced' : 'idle');
+      setPendingFinalSubmission(null);
+      setFinalExamSaveError('');
+      setExamElapsedSeconds(Math.max(0, Number(storedFinalExam?.time_spent_seconds || 0)));
+      setExamAttemptNumber(Math.max(1, Number(storedFinalExam?.attempt_number || 1)));
+      setExamSecurityEvents(storedFinalExam?.security_events || { copy_attempts: 0, right_click_attempts: 0, tab_leave_count: 0, select_attempts: 0, reload_attempts: 0 });
+      setExamQuestions(storedSnapshot.length ? storedSnapshot.map((question, index) => normalizeQuestion(question, `SNAP${index + 1}`)) : []);
       setFocusedExamIndex(0);
       setExamReviewMarks({});
       setSubmitConfirmState(null);
@@ -757,7 +835,53 @@ export default function LessonViewer({
     }
   }, [isOpen, lesson?.lesson_id, sections, progress?.progress_id]);
 
+  // V6.90.1: nếu học sinh đã bấm Nộp nhưng Firestore chưa xác nhận, giữ nguyên
+  // snapshot đã chấm trên thiết bị. F5/mở lại bài vẫn xem được điểm, đáp án và
+  // giải thích; bài làm bị khóa và có thể gửi lại mà không phải làm lại từ đầu.
+  useEffect(() => {
+    if (!isOpen || !isStudentView || !pendingFinalSubmissionStorageKey) return;
+    const envelope = readPendingFinalSubmission(pendingFinalSubmissionStorageKey);
+    if (!envelope) return;
+    const snapshot = envelope.snapshot;
+    const serverFinal = progress?.step_details?.luyen_tap?.finalExam;
+    const serverStatus = String(serverFinal?.status || '');
+    const serverSubmittedAt = Date.parse(String(serverFinal?.submitted_at || ''));
+    const pendingSubmittedAt = Date.parse(String(snapshot.finalExam?.submitted_at || envelope.saved_at || ''));
+    const serverConfirmedOfficial = attemptMode === 'official'
+      && ['submitted', 'auto_submitted', 'expired'].includes(serverStatus)
+      && String(progress?.score_status || '') === 'finalized'
+      && (!Number.isFinite(pendingSubmittedAt) || (Number.isFinite(serverSubmittedAt) && serverSubmittedAt >= pendingSubmittedAt));
+    if (serverConfirmedOfficial) {
+      clearPendingFinalSubmission(pendingFinalSubmissionStorageKey);
+      setFinalSubmissionSyncState('synced');
+      setPendingFinalSubmission(null);
+      return;
+    }
+    setPendingFinalSubmission(snapshot);
+    setFinalSubmissionSyncState('pending');
+    setFinalExamSaveError('Kết quả đã được chấm nhưng chưa gửi được. Em vẫn xem được đầy đủ kết quả và có thể thử gửi lại.');
+    setExamStarted(true);
+    setExamSubmitted(true);
+    setExamAutoSubmitted(snapshot.finalExam?.status === 'auto_submitted' || snapshot.finalExam?.status === 'expired');
+    setExamElapsedSeconds(Math.max(0, Number(snapshot.finalExam?.time_spent_seconds || 0)));
+    setExamAttemptNumber(Math.max(1, Number(snapshot.finalExam?.attempt_number || 1)));
+    setExamSecurityEvents(snapshot.finalExam?.security_events || { copy_attempts: 0, right_click_attempts: 0, tab_leave_count: 0, select_attempts: 0, reload_attempts: 0 });
+    setExamQuestions(Array.isArray(snapshot.finalExam?.question_snapshot) ? snapshot.finalExam?.question_snapshot || [] : []);
+    setAnswerStates(snapshot.answers || {});
+    setSectionProgress(snapshot.sectionProgress || {});
+  }, [isOpen, isStudentView, pendingFinalSubmissionStorageKey, attemptMode, progress?.score_status, progress?.step_details?.luyen_tap?.finalExam?.submitted_at, progress?.step_details?.luyen_tap?.finalExam?.status]);
+
   const settings = effectiveContent?.settings || {} as any;
+  const finalQuizSourceMode = settings.final_quiz_source_mode === 'random_bank' ? 'random_bank' : 'fixed';
+  const requestedFinalQuizCount = Math.max(1, Number(settings.final_quiz_count || finalQuiz.length || 10));
+  const studentDisplayNames = useMemo(() => {
+    const names = [String(currentUser?.ho_ten || '').trim(), ...(progress?.co_learner_names || []).map((item) => String(item || '').trim())].filter(Boolean);
+    return Array.from(new Set(names)).slice(0, Math.max(1, coLearningGroupSize || 1));
+  }, [currentUser?.ho_ten, progress?.co_learner_names, coLearningGroupSize]);
+  const currentClassName = useMemo(() => {
+    const classId = String(currentUser?.lop_id || progress?.lop_id || lesson?.lop_id || '').trim();
+    return classes.find((item) => item.lop_id === classId)?.ten_lop || classId || 'Chưa xác định lớp';
+  }, [classes, currentUser?.lop_id, progress?.lop_id, lesson?.lop_id]);
   const finalExamTimeMinutes = Math.max(1, Number(settings.final_exam_time_minutes || 15));
   const lessonTimeMinutes = Math.max(1, Number(settings.lesson_time_minutes || 45));
   const lessonTimeLimitSeconds = lessonTimeMinutes * 60;
@@ -934,6 +1058,7 @@ export default function LessonViewer({
       : progress?.pre_lesson_status === 'completed' ? 'late_completed'
         : Number(progress?.pre_lesson_watch_percent || 0) > 0 ? 'in_progress' : 'not_started');
   const allRequiredSectionsCompleted = sections.every((section) => computedSectionProgress[section.section_id]?.status === 'completed');
+  const availableFinalQuizCount = finalQuizSourceMode === 'random_bank' ? questionBank.length : finalQuiz.length;
   const weightedAssessment = useMemo(() => calculateFairAssessmentScore({
     finalQuizScore: finalExamScore,
     finalQuizExists: metrics.finalTotal > 0,
@@ -941,7 +1066,7 @@ export default function LessonViewer({
     allRequiredSectionsCompleted,
   }), [finalExamScore, metrics.finalTotal, examSubmitted, allRequiredSectionsCompleted]);
   const score = weightedAssessment.finalScore ?? 0;
-  const finalQuizLockedForStudent = isStudentView && attemptMode !== 'review' && metrics.finalTotal > 0 && !allRequiredSectionsCompleted;
+  const finalQuizLockedForStudent = isStudentView && attemptMode !== 'review' && availableFinalQuizCount > 0 && !allRequiredSectionsCompleted;
 
   useEffect(() => {
     if (!allQuestions.length && !sections.length) return;
@@ -964,6 +1089,9 @@ export default function LessonViewer({
         unanswered_count: activeFinalQuiz.filter((question, index) => !answerStates[getQuestionKey(question, index + allInteractiveQuestions.length)]?.submitted).length,
         attempt_number: examAttemptNumber,
         security_events: examSecurityEvents,
+        generated_question_ids: activeFinalQuiz.map((question, index) => questionIdentity(question, index)),
+        question_snapshot: activeFinalQuiz,
+        question_bank_mode: finalQuizSourceMode,
       },
     });
   }, [metrics.answered, metrics.correct, metrics.total, metrics.finalCorrect, metrics.finalTotal, answerStates, allQuestions.length, onQuizMetricsChange, computedSectionProgress, sections.length, examStarted, examSubmitted, examAutoSubmitted, examElapsedSeconds, finalExamTimeMinutes, score, finalExamScore, activeFinalQuiz, allInteractiveQuestions.length, examAttemptNumber, examSecurityEvents]);
@@ -1139,7 +1267,12 @@ export default function LessonViewer({
       goToFirstIncompleteSection();
       return;
     }
-    const prepared = prepareExamQuestions(finalQuiz, settings.shuffle_final_questions !== false, settings.shuffle_final_options !== false);
+    const basePool = finalQuizSourceMode === 'random_bank' && questionBank.length ? questionBank : finalQuiz;
+    const seed = `${lesson?.lesson_id || ''}|${currentUser?.user_id || progress?.user_id || ''}|${examAttemptNumber}|${progress?.progress_id || ''}`;
+    const selected = finalQuizSourceMode === 'random_bank'
+      ? seededShuffle(basePool, seed).slice(0, Math.min(requestedFinalQuizCount, basePool.length))
+      : basePool.slice(0, Math.min(requestedFinalQuizCount, basePool.length));
+    const prepared = prepareExamQuestions(selected, settings.shuffle_final_questions !== false, settings.shuffle_final_options !== false);
     setExamQuestions(prepared);
     setExamStarted(true);
     setFocusedExamIndex(0);
@@ -1147,6 +1280,9 @@ export default function LessonViewer({
     setExamSubmitted(false);
     setExamAutoSubmitted(false);
     setFinalExamSaveError('');
+    setFinalSubmissionSyncState('idle');
+    setPendingFinalSubmission(null);
+    clearPendingFinalSubmission(pendingFinalSubmissionStorageKey);
     finalSubmitPersistedRef.current = '';
     setExamElapsedSeconds(0);
     setLessonChatOpen(false);
@@ -1192,27 +1328,59 @@ export default function LessonViewer({
         unanswered_count: activeFinalQuiz.filter((question, index) => !answerStates[getQuestionKey(question, index + allInteractiveQuestions.length)]?.submitted).length,
         attempt_number: examAttemptNumber,
         security_events: examSecurityEvents,
+        generated_question_ids: activeFinalQuiz.map((question, index) => questionIdentity(question, index)),
+        question_snapshot: activeFinalQuiz,
+        question_bank_mode: finalQuizSourceMode,
       },
     };
   };
 
-  const persistSubmittedExam = async (autoSubmitted = false) => {
-    const snapshot = buildSubmittedExamSnapshot(autoSubmitted);
+  const persistSubmittedExam = async (autoSubmitted = false, snapshotOverride?: LessonCloseSnapshot, silent = false) => {
+    const snapshot = snapshotOverride || buildSubmittedExamSnapshot(autoSubmitted);
     const submitKey = `${examAttemptNumber}:${snapshot.finalExam?.submitted_at || ''}:${autoSubmitted ? 'auto' : 'manual'}`;
-    if (finalSubmitPersistedRef.current && !autoSubmitted) return true;
+    if (finalSubmitPersistedRef.current && !autoSubmitted && !pendingFinalSubmission) return true;
+    const envelope: PendingFinalSubmissionEnvelope = {
+      version: 1,
+      saved_at: new Date().toISOString(),
+      lesson_id: String(lesson?.lesson_id || ''),
+      user_id: String(currentUser?.user_id || progress?.user_id || ''),
+      attempt_mode: attemptMode,
+      retake_attempt_number: retakeAttemptNumber,
+      snapshot,
+    };
+    setPendingFinalSubmission(snapshot);
+    writePendingFinalSubmission(pendingFinalSubmissionStorageKey, envelope);
+    setFinalSubmissionSyncState('syncing');
     setFinalExamSaving(true);
     setFinalExamSaveError('');
     try {
-      const ok = onFinalExamSubmit ? await onFinalExamSubmit(snapshot) : true;
-      if (ok) finalSubmitPersistedRef.current = submitKey;
-      else setFinalExamSaveError('Điểm đã được tính nhưng chưa được ghi nhận chính thức. Bài làm của em vẫn được giữ an toàn; hãy thử nộp lại.');
+      const ok = onFinalExamSubmit ? await onFinalExamSubmit(snapshot, { silent }) : true;
+      if (ok) {
+        finalSubmitPersistedRef.current = submitKey;
+        setFinalSubmissionSyncState('synced');
+        setPendingFinalSubmission(null);
+        clearPendingFinalSubmission(pendingFinalSubmissionStorageKey);
+        setFinalExamSaveError('');
+      } else {
+        setFinalSubmissionSyncState('pending');
+        setFinalExamSaveError('Điểm đã được chấm và bài làm đã khóa. Kết quả chưa được ghi nhận chính thức; em vẫn có thể xem chi tiết và thử gửi lại.');
+      }
       return Boolean(ok);
     } catch (error) {
-      setFinalExamSaveError(professionalErrorMessage(error, 'Kết quả học tập chưa được đồng bộ. Bài làm của em vẫn được giữ an toàn; hãy thử lại.'));
+      setFinalSubmissionSyncState('pending');
+      setFinalExamSaveError(professionalErrorMessage(error, 'Điểm đã được chấm nhưng chưa gửi được. Em vẫn có thể xem kết quả chi tiết và thử gửi lại.'));
       return false;
     } finally {
       setFinalExamSaving(false);
     }
+  };
+
+  const retryPendingFinalSubmission = async (silent = false) => {
+    if (finalExamSaving || finalSubmissionSyncState === 'syncing') return false;
+    const snapshot = pendingFinalSubmission || readPendingFinalSubmission(pendingFinalSubmissionStorageKey)?.snapshot;
+    if (!snapshot) return false;
+    const autoSubmitted = snapshot.finalExam?.status === 'auto_submitted' || snapshot.finalExam?.status === 'expired';
+    return persistSubmittedExam(autoSubmitted, snapshot, silent);
   };
 
   const submitFinalExam = async (force = false) => {
@@ -1227,12 +1395,36 @@ export default function LessonViewer({
     }
     if (finalExamSaving) return;
     setSubmitConfirmState(null);
-    // V6.88.12: chỉ chuyển giao diện sang trạng thái Đã nộp sau khi
-    // Firestore đã ghi và read-after-write xác minh kết quả chính thức.
     setExamAutoSubmitted(false);
-    const persisted = await persistSubmittedExam(false);
-    if (persisted) setExamSubmitted(true);
+    // V6.90.1: Nộp bài là một hành động chốt bài trên thiết bị. Học sinh được
+    // xem điểm/kết quả ngay cả khi mạng hoặc Rules làm bước đồng bộ thất bại.
+    const snapshot = buildSubmittedExamSnapshot(false);
+    setExamSubmitted(true);
+    setPendingFinalSubmission(snapshot);
+    const persisted = await persistSubmittedExam(false, snapshot, false);
+    if (!persisted) setActiveStep('final_quiz');
   };
+
+  // Retry nền ở tần suất thấp. Retry dùng silent để không tạo toast lỗi lặp lại.
+  useEffect(() => {
+    if (!isOpen || finalSubmissionSyncState !== 'pending' || !pendingFinalSubmission) return;
+    let busy = false;
+    const retry = async () => {
+      if (busy || (typeof navigator !== 'undefined' && navigator.onLine === false)) return;
+      busy = true;
+      try { await retryPendingFinalSubmission(true); } finally { busy = false; }
+    };
+    const onOnline = () => { void retry(); };
+    const onVisibility = () => { if (document.visibilityState === 'visible') void retry(); };
+    window.addEventListener('online', onOnline);
+    document.addEventListener('visibilitychange', onVisibility);
+    const timer = window.setInterval(() => { void retry(); }, 30000);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('online', onOnline);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [isOpen, finalSubmissionSyncState, pendingFinalSubmission, pendingFinalSubmissionStorageKey]);
 
   const retryFinalExam = () => {
     if (settings.allow_exam_retry === false) return;
@@ -1249,6 +1441,9 @@ export default function LessonViewer({
     setExamSubmitted(false);
     setExamAutoSubmitted(false);
     setFinalExamSaveError('');
+    setFinalSubmissionSyncState('idle');
+    setPendingFinalSubmission(null);
+    clearPendingFinalSubmission(pendingFinalSubmissionStorageKey);
     finalSubmitPersistedRef.current = '';
     setExamElapsedSeconds(0);
     setFocusedExamIndex(0);
@@ -1557,7 +1752,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
     const finalUnansweredCount = Math.max(0, activeFinalQuiz.length - finalAnsweredCount);
     const securityTotal = Object.values(examSecurityEvents).reduce<number>((sum, value) => sum + Number(value || 0), 0);
     const maxAttempts = Math.max(1, Number(settings.max_exam_attempts || 2));
-    const canRetryExam = settings.allow_exam_retry !== false && examSubmitted && examAttemptNumber < maxAttempts;
+    const canRetryExam = settings.allow_exam_retry !== false && examSubmitted && examAttemptNumber < maxAttempts && !['pending', 'syncing'].includes(finalSubmissionSyncState);
 
     const scrollToExamQuestion = (questionIndex: number) => {
       setFocusedExamIndex(questionIndex);
@@ -1596,7 +1791,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
               <p className="mt-2 max-w-3xl text-sm leading-7 text-slate-600">Đây là phần kiểm tra cuối cùng để đánh giá kết quả học tập. Khi bắt đầu, trợ lý AI sẽ tắt, hệ thống chặn sao chép và ghi nhận các cảnh báo rời màn hình.</p>
             </div>
             <div className="rounded-3xl bg-slate-50 px-5 py-4 text-sm text-slate-700 ring-1 ring-slate-100">
-              <p><span className="font-bold">Số câu:</span> {activeFinalQuiz.length}</p>
+              <p><span className="font-bold">Số câu:</span> {examStarted ? activeFinalQuiz.length : Math.min(requestedFinalQuizCount, availableFinalQuizCount)}</p>
               <p><span className="font-bold">Thời gian:</span> {finalExamTimeMinutes} phút</p>
               <p><span className="font-bold">Lần làm:</span> {examAttemptNumber}/{maxAttempts}</p>
             </div>
@@ -1714,11 +1909,16 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                 <p className="mt-1 text-4xl font-black">{(finalExamScore ?? 0).toFixed(1)}<span className="text-xl text-slate-500">/10</span></p>
               </div>
               <p className="mt-3 text-sm font-bold text-slate-600">Đúng {metrics.finalCorrect}/{metrics.finalTotal} câu • Thời gian {formatSeconds(examElapsedSeconds)}</p>
-              {finalExamSaveError ? (
-                <div className="mt-4 space-y-2 rounded-2xl bg-rose-50 p-3 text-left ring-1 ring-rose-100">
-                  <p className="text-xs font-bold text-rose-700">{finalExamSaveError}</p>
-                  <button type="button" disabled={finalExamSaving} onClick={() => void persistSubmittedExam(false)} className="w-full rounded-xl bg-rose-600 px-3 py-2 text-xs font-black text-white hover:bg-rose-700 disabled:cursor-wait disabled:opacity-70">{finalExamSaving ? 'Đang đồng bộ...' : 'Thử cập nhật điểm lại'}</button>
+              {finalSubmissionSyncState === 'pending' ? (
+                <div className="mt-4 space-y-2 rounded-2xl bg-amber-50 p-3 text-left ring-1 ring-amber-200">
+                  <p className="text-xs font-black text-amber-800">Đã chấm bài • Chờ gửi</p>
+                  <p className="text-xs font-semibold leading-5 text-amber-700">{finalExamSaveError || 'Chưa gửi được kết quả. Em hãy thử lại khi kết nối ổn định.'}</p>
+                  <button type="button" disabled={finalExamSaving} onClick={() => void retryPendingFinalSubmission(false)} className="w-full rounded-xl bg-amber-600 px-3 py-2 text-xs font-black text-white hover:bg-amber-700 disabled:cursor-wait disabled:opacity-70">{finalExamSaving ? 'Đang gửi...' : 'Gửi lại kết quả'}</button>
                 </div>
+              ) : finalSubmissionSyncState === 'syncing' ? (
+                <div className="mt-4 rounded-2xl bg-sky-50 p-3 text-left text-xs font-bold text-sky-700 ring-1 ring-sky-100">Đã chấm bài. Đang gửi kết quả…</div>
+              ) : finalExamSaveError ? (
+                <div className="mt-4 rounded-2xl bg-rose-50 p-3 text-left text-xs font-bold text-rose-700 ring-1 ring-rose-100">{finalExamSaveError}</div>
               ) : null}
             </div>
 
@@ -1771,13 +1971,30 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
               </div>
             ) : null}
 
+            {examSubmitted ? (
+              <div className={`mb-5 rounded-2xl border px-4 py-3 text-sm leading-6 ${finalSubmissionSyncState === 'pending' ? 'border-amber-200 bg-amber-50 text-amber-900' : finalSubmissionSyncState === 'syncing' ? 'border-sky-200 bg-sky-50 text-sky-900' : 'border-emerald-200 bg-emerald-50 text-emerald-800'}`}>
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <b>{finalSubmissionSyncState === 'pending' ? 'Đã chấm bài – chờ gửi.' : finalSubmissionSyncState === 'syncing' ? 'Đã chấm bài – đang gửi.' : 'Đã nộp bài.'}</b>{' '}
+                    Em có thể xem lại từng câu bên dưới. {settings.show_final_answers_after_submit === false ? 'Giáo viên đang ẩn đáp án đúng.' : 'Đáp án đúng được hiển thị để đối chiếu.'} {settings.show_final_explanations_after_submit === false ? 'Phần giải thích đang được giáo viên ẩn.' : 'Các câu có giải thích sẽ hiển thị ngay dưới đáp án.'}
+                    {finalSubmissionSyncState === 'pending' ? (
+                      <p className="mt-2 font-semibold">
+                        Điểm lần làm này: <span className="font-black">{Number(pendingFinalSubmission?.finalExam?.score ?? finalExamScore ?? 0).toFixed(1)}/10</span>.
+                        {attemptMode === 'retake' && retakeIsOfficial && Number.isFinite(Number(officialScore)) ? ` Điểm chính thức hiện tại vẫn là ${Number(officialScore).toFixed(1)}/10 cho đến khi kết quả mới được ghi nhận thành công.` : ' Kết quả đã được giữ; em không cần làm lại bài.'}
+                      </p>
+                    ) : null}
+                  </div>
+                  {finalSubmissionSyncState === 'pending' ? <button type="button" disabled={finalExamSaving} onClick={() => void retryPendingFinalSubmission(false)} className="shrink-0 rounded-xl border border-amber-300 bg-white px-3 py-2 text-xs font-black text-amber-800 shadow-sm hover:bg-amber-100 disabled:opacity-60"><RotateCcw className="mr-1 inline h-3.5 w-3.5" /> Gửi lại kết quả</button> : null}
+                </div>
+              </div>
+            ) : null}
             <div className="space-y-4 pb-8">
               {activeFinalQuiz.length ? activeFinalQuiz.map((question, index) => {
                 const questionKey = getQuestionKey(question, index + allInteractiveQuestions.length);
                 return (
                   <div key={questionKey} id={`final-exam-q-${index + 1}`} onFocusCapture={() => setFocusedExamIndex(index)} onMouseEnter={() => setFocusedExamIndex(index)} className="scroll-mt-36 rounded-[30px]">
                     <InteractiveQuestionCard
-                      question={question}
+                      question={examSubmitted && settings.show_final_explanations_after_submit === false ? { ...question, explanation: '' } : question}
                       index={index}
                       initialAnswer={answerStates[questionKey] || null}
                       onAnswerStateChange={handleAnswerStateChange}
@@ -1798,7 +2015,22 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
   };
 
 
-  const renderResult = () => <LessonResultSummary score={score} scoreStatus={weightedAssessment.scoreStatus} passScore={passScore} finalCorrect={metrics.finalCorrect} finalTotal={metrics.finalTotal} finalExamSubmitted={examSubmitted} completedSections={completedSectionsCount} totalSections={sections.length} incompleteSections={incompleteSectionTitles} finalExamScore={finalExamScore} preparationStatus={preparationStatus} preparationWatchPercent={Number(progress?.pre_lesson_watch_percent || 0)} onReviewIncomplete={goToFirstIncompleteSection} onRetry={content?.settings?.allow_retry !== false ? () => setAnswerStates({}) : undefined} />;
+  const renderResult = () => (
+    <div className="space-y-4">
+      {examSubmitted && finalSubmissionSyncState === 'pending' ? (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-900">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <b>Điểm lần làm này: {Number(pendingFinalSubmission?.finalExam?.score ?? finalExamScore ?? 0).toFixed(1)}/10.</b> Em vẫn xem được kết quả chi tiết và có thể thử gửi lại.
+              {attemptMode === 'retake' && retakeIsOfficial && Number.isFinite(Number(officialScore)) ? <span className="ml-1">Điểm chính thức hiện tại: {Number(officialScore).toFixed(1)}/10.</span> : null}
+            </div>
+            <button type="button" disabled={finalExamSaving} onClick={() => void retryPendingFinalSubmission(false)} className="rounded-xl bg-amber-600 px-3 py-2 text-xs font-black text-white shadow-sm hover:bg-amber-700 disabled:opacity-60">{finalExamSaving ? 'Đang gửi...' : 'Gửi lại kết quả'}</button>
+          </div>
+        </div>
+      ) : null}
+      <LessonResultSummary score={score} scoreStatus={weightedAssessment.scoreStatus} passScore={passScore} finalCorrect={metrics.finalCorrect} finalTotal={metrics.finalTotal} finalExamSubmitted={examSubmitted} completedSections={completedSectionsCount} totalSections={sections.length} incompleteSections={incompleteSectionTitles} finalExamScore={finalExamScore} preparationStatus={preparationStatus} preparationWatchPercent={Number(progress?.pre_lesson_watch_percent || 0)} onReviewIncomplete={goToFirstIncompleteSection} onRetry={content?.settings?.allow_retry !== false ? () => setAnswerStates({}) : undefined} />
+    </div>
+  );
 
 
   const renderSubmitConfirmDialog = () => {
@@ -1992,6 +2224,9 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
           unanswered_count: activeFinalQuiz.filter((question, index) => !answerStates[getQuestionKey(question, index + allInteractiveQuestions.length)]?.submitted).length,
           attempt_number: examAttemptNumber,
           security_events: examSecurityEvents,
+          generated_question_ids: activeFinalQuiz.map((question, index) => questionIdentity(question, index)),
+          question_snapshot: activeFinalQuiz,
+          question_bank_mode: finalQuizSourceMode,
         },
       };
       await onClose(snapshot);
@@ -2046,6 +2281,23 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
           ) : attemptMode === 'review' ? (
             <div className="border-b border-sky-200 bg-sky-50 px-4 py-2.5 text-center text-sm font-bold text-sky-800 lg:px-6">Đang xem lại kết quả chính thức • thao tác trong màn hình này không ghi đè kết quả đã chốt.</div>
           ) : null}
+          {currentUserRole === 'student' ? (
+            <div className="border-b border-slate-200 bg-white px-4 py-3 lg:px-6">
+              <div className="flex flex-wrap items-center gap-2 text-sm">
+                <span className="font-black text-slate-900">Học sinh:</span>
+                {studentDisplayNames.map((name, index) => (
+                  <span key={`${name}-${index}`} className="inline-flex items-center gap-2 rounded-full bg-indigo-50 px-3 py-1.5 font-bold text-indigo-700 ring-1 ring-indigo-100">
+                    <Users className="h-3.5 w-3.5" /> {name}
+                  </span>
+                ))}
+                <span className="rounded-full bg-slate-100 px-3 py-1.5 font-semibold text-slate-600">Lớp {currentClassName}</span>
+                <span className={`rounded-full px-3 py-1.5 font-bold ${coLearningGroupSize > 1 ? 'bg-fuchsia-50 text-fuchsia-700 ring-1 ring-fuchsia-100' : 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-100'}`}>
+                  {coLearningGroupSize > 1 ? `Học cùng • ${studentDisplayNames.length || coLearningGroupSize} học sinh` : 'Học một mình'}
+                </span>
+                {activeStep === 'final_quiz' ? <span className="ml-auto rounded-full bg-amber-50 px-3 py-1.5 font-bold text-amber-700 ring-1 ring-amber-100">Lượt kiểm tra {examAttemptNumber}</span> : null}
+              </div>
+            </div>
+          ) : null}
           <div className="grid flex-1 grid-cols-1 overflow-hidden xl:grid-cols-[300px_minmax(0,1fr)]">
             <aside className="hidden overflow-y-auto border-r border-slate-100 bg-slate-50/70 p-4 xl:block">
               <div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-slate-100">
@@ -2064,7 +2316,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                       </button>
                     );
                   })}
-                  <button disabled={finalQuizLockedForStudent} onClick={() => selectStep('final_quiz')} className={`flex w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold transition ${finalQuizLockedForStudent ? 'cursor-not-allowed bg-slate-100 text-slate-400' : activeStep === 'final_quiz' ? 'bg-emerald-600 text-white' : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'}`}>{finalQuizLockedForStudent ? <LockKeyhole className="h-4 w-4" /> : null}Kiểm tra cuối bài<span className="ml-auto text-xs opacity-70">{finalQuizLockedForStudent ? `còn ${incompleteSectionTitles.length} mục` : `${finalQuiz.length} câu`}</span></button>
+                  <button disabled={finalQuizLockedForStudent} onClick={() => selectStep('final_quiz')} className={`flex w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold transition ${finalQuizLockedForStudent ? 'cursor-not-allowed bg-slate-100 text-slate-400' : activeStep === 'final_quiz' ? 'bg-emerald-600 text-white' : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'}`}>{finalQuizLockedForStudent ? <LockKeyhole className="h-4 w-4" /> : null}Kiểm tra cuối bài<span className="ml-auto text-xs opacity-70">{finalQuizLockedForStudent ? `còn ${incompleteSectionTitles.length} mục` : `${finalQuizSourceMode === 'random_bank' ? Math.min(requestedFinalQuizCount, questionBank.length) : finalQuiz.length} câu`}</span></button>
                   <button onClick={() => selectStep('comments')} className={`flex w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold transition ${activeStep === 'comments' ? 'bg-fuchsia-600 text-white' : 'bg-fuchsia-50 text-fuchsia-700 hover:bg-fuchsia-100'}`}><MessageSquareText className="h-4 w-4" /> Bình luận/Câu hỏi<span className="ml-auto text-xs opacity-80">{topLevelComments.length}</span></button>
                   <button onClick={() => selectStep('result')} className={`flex w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold transition ${activeStep === 'result' ? 'bg-amber-500 text-white' : 'bg-amber-50 text-amber-700 hover:bg-amber-100'}`}>Kết quả<span className="ml-auto text-xs opacity-70">{weightedAssessment.scoreStatus === 'finalized' ? `${score.toFixed(1)}/10` : '--/10'}</span></button>
                 </div>
@@ -2110,7 +2362,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                           </button>
                         );
                       })}
-                      <button disabled={finalQuizLockedForStudent} onClick={() => selectStep('final_quiz')} className={`flex min-h-12 w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold ${finalQuizLockedForStudent ? 'cursor-not-allowed bg-slate-100 text-slate-400' : activeStep === 'final_quiz' ? 'bg-emerald-600 text-white' : 'bg-emerald-50 text-emerald-700'}`}>{finalQuizLockedForStudent ? <LockKeyhole className="h-4 w-4" /> : null}Kiểm tra cuối bài<span className="ml-auto text-xs opacity-70">{finalQuizLockedForStudent ? `còn ${incompleteSectionTitles.length} mục` : `${finalQuiz.length} câu`}</span></button>
+                      <button disabled={finalQuizLockedForStudent} onClick={() => selectStep('final_quiz')} className={`flex min-h-12 w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold ${finalQuizLockedForStudent ? 'cursor-not-allowed bg-slate-100 text-slate-400' : activeStep === 'final_quiz' ? 'bg-emerald-600 text-white' : 'bg-emerald-50 text-emerald-700'}`}>{finalQuizLockedForStudent ? <LockKeyhole className="h-4 w-4" /> : null}Kiểm tra cuối bài<span className="ml-auto text-xs opacity-70">{finalQuizLockedForStudent ? `còn ${incompleteSectionTitles.length} mục` : `${finalQuizSourceMode === 'random_bank' ? Math.min(requestedFinalQuizCount, questionBank.length) : finalQuiz.length} câu`}</span></button>
                       <button onClick={() => selectStep('comments')} className={`flex min-h-12 w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold ${activeStep === 'comments' ? 'bg-fuchsia-600 text-white' : 'bg-fuchsia-50 text-fuchsia-700'}`}><MessageSquareText className="h-4 w-4" /> Bình luận/Câu hỏi<span className="ml-auto text-xs opacity-80">{topLevelComments.length}</span></button>
                       <button onClick={() => selectStep('result')} className={`flex min-h-12 w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold ${activeStep === 'result' ? 'bg-amber-500 text-white' : 'bg-amber-50 text-amber-700'}`}>Kết quả<span className="ml-auto text-xs opacity-70">{weightedAssessment.scoreStatus === 'finalized' ? `${score.toFixed(1)}/10` : '--/10'}</span></button>
                     </div>

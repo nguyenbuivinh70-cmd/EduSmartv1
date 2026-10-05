@@ -40,12 +40,12 @@ export function professionalUserMessage(
       return 'Chưa thể cập nhật trạng thái chuẩn bị bài. Vui lòng làm mới dữ liệu và thử lại.';
     }
     if (/network|offline|mạng|ket noi|kết nối/.test(lower)) {
-      return 'Kết nối đang gián đoạn. Tiến độ xem của em vẫn được giữ; hãy thử gửi kết quả chuẩn bị bài khi kết nối ổn định.';
+      return 'Chưa có kết nối ổn định. Kết quả của em đã được giữ; hãy thử gửi lại khi có mạng.';
     }
     if (/đã gửi|da gui|verify|xác minh/.test(lower)) {
-      return 'Kết quả chuẩn bị bài đang được đồng bộ. Tiến độ xem của em vẫn được giữ an toàn; hãy tải lại và kiểm tra sau ít phút.';
+      return 'Kết quả đã được gửi. Em hãy tải lại sau ít phút nếu trạng thái chưa cập nhật.';
     }
-    return 'Chưa gửi được kết quả chuẩn bị bài. Tiến độ xem của em vẫn được giữ an toàn; hãy thử gửi lại.';
+    return 'Chưa gửi được kết quả chuẩn bị bài. Em hãy thử lại.';
   }
 
   if (/self[_ -]?study|tự học|tu hoc|activities|activity/.test(lower) || /SELF_STUDY_/i.test(raw)) {
@@ -59,7 +59,7 @@ export function professionalUserMessage(
       if (/đã có quyền|da co quyen/.test(lower)) return 'Học sinh đã được cấp quyền học lại. Vui lòng làm mới bảng theo dõi để xem trạng thái mới nhất.';
       return 'Chưa thể cập nhật quyền học lại. Hệ thống chưa thay đổi kết quả của học sinh; vui lòng làm mới bảng theo dõi và thử lại.';
     }
-    return 'Lượt học lại chưa được cập nhật. Em hãy tải lại bài học và thử lại.';
+    return 'Chưa mở được lượt học lại. Em hãy thử lại.';
   }
 
   if (/learningprogress|điểm|diem|nộp bài|nop bai|assessment|final_quiz|kết quả học tập|ket qua hoc tap/.test(lower)) {
@@ -68,7 +68,7 @@ export function professionalUserMessage(
     }
     return staff
       ? 'Chưa thể cập nhật kết quả học tập. Hệ thống chưa thay đổi dữ liệu hiện có; vui lòng làm mới bảng theo dõi và thử lại.'
-      : 'Kết quả học tập chưa được đồng bộ. Bài làm của em vẫn được giữ an toàn; hãy thử lại.';
+      : 'Chưa gửi được kết quả học tập. Bài làm của em vẫn được giữ; hãy thử lại.';
   }
 
   if (/phiên đăng nhập|het han|hết hạn|đăng nhập lại|dang nhap lai/.test(lower)) {
@@ -80,7 +80,7 @@ export function professionalUserMessage(
   if (/network|offline|unavailable|mạng|kết nối/.test(lower)) {
     return staff
       ? 'Kết nối đang gián đoạn. Dữ liệu hiện tại chưa bị thay đổi; vui lòng thử lại khi kết nối ổn định.'
-      : 'Kết nối đang gián đoạn. Dữ liệu trên màn hình vẫn được giữ; em hãy thử lại khi kết nối ổn định.';
+      : 'Chưa có kết nối ổn định. Em hãy thử lại khi có mạng.';
   }
 
   if (TECHNICAL_TOKEN.test(raw)) return safeFallback;

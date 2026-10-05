@@ -113,7 +113,7 @@ export default function CoLearningModal({
                 <div className="min-w-0">
                   <p className="flex items-center gap-2 font-black text-emerald-900"><UserRoundCheck className="h-5 w-5" /> Nhóm học gần nhất đã được xác nhận</p>
                   <div className="mt-3 flex flex-wrap gap-2">{reusableNames.map((name, index) => <span key={`${name}-${index}`} className="rounded-full bg-white px-3 py-1.5 text-xs font-bold text-emerald-700 ring-1 ring-emerald-200">{name}</span>)}</div>
-                  <p className="mt-3 text-xs leading-5 text-emerald-700">Bạn đã xác nhận trước đây không cần nhập lại mật khẩu. Chỉ thành viên mới thêm cần xác nhận một lần.</p>
+                  <p className="mt-3 text-xs leading-5 text-emerald-700">Các bạn đã xác nhận trước đây không cần xác nhận lại. Chỉ bạn mới thêm cần nhập mật khẩu.</p>
                 </div>
                 <button type="button" onClick={onResumeCoLearning} disabled={isSubmitting} className="shrink-0 rounded-2xl bg-emerald-600 px-5 py-3 text-sm font-black text-white shadow-lg shadow-emerald-600/20 hover:bg-emerald-700 disabled:bg-slate-300">Tiếp tục nhóm cũ</button>
               </div>
@@ -210,7 +210,7 @@ export default function CoLearningModal({
 
                 {newlyAddedClassmates.length > 0 && (
                   <div className="mt-4 space-y-3 border-t border-indigo-100 pt-4">
-                    <div className="flex items-start gap-3 rounded-2xl bg-sky-50 px-3 py-3 text-sm text-sky-800"><ShieldCheck className="mt-0.5 h-5 w-5 shrink-0" /><p><b>Chỉ bạn mới thêm cần xác nhận.</b> Mật khẩu chỉ dùng trong bộ nhớ để xác thực một lần và không được lưu.</p></div>
+                    <div className="flex items-start gap-3 rounded-2xl bg-sky-50 px-3 py-3 text-sm text-sky-800"><ShieldCheck className="mt-0.5 h-5 w-5 shrink-0" /><p><b>Chỉ bạn mới thêm cần xác nhận.</b> Nhập mật khẩu hiện tại của bạn đó để xác nhận tham gia nhóm.</p></div>
                     <div className="max-h-[34dvh] space-y-3 overflow-y-auto pr-1">
                       {newlyAddedClassmates.map((student) => (
                         <label key={student.user_id} className="block rounded-2xl border border-slate-200 bg-white p-3">

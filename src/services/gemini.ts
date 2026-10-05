@@ -265,6 +265,7 @@ function normalizeLessonV2(raw: any): LessonContent {
     .map((section: any, index: number) => normalizeSectionV2(section, index))
     .filter((section: ReturnType<typeof normalizeSectionV2>) => section.title || section.content);
   const finalQuiz = safeQuizArray(raw?.final_quiz || raw?.finalQuiz || raw?.bai_tap_cuoi_bai || []);
+  const questionBank = safeQuizArray(raw?.question_bank || raw?.questionBank || raw?.ngan_hang_cau_hoi || []);
   const legacy = buildLegacyFromV2(sections, finalQuiz);
   const assessment = raw?.assessment || {};
   return {
@@ -276,6 +277,8 @@ function normalizeLessonV2(raw: any): LessonContent {
       content_count: Number(settings.content_count || sections.length || 4),
       interactive_questions_per_section: Number(settings.interactive_questions_per_section || 1),
       final_quiz_count: Number(settings.final_quiz_count || finalQuiz.length || 10),
+      final_quiz_source_mode: settings.final_quiz_source_mode === 'random_bank' ? 'random_bank' : 'fixed',
+      question_bank_size: Number(settings.question_bank_size || questionBank.length || Math.max(30, finalQuiz.length)),
       question_mix: settings.question_mix || 'mixed',
       difficulty: settings.difficulty || 'medium',
       include_examples: settings.include_examples !== false,
@@ -291,6 +294,7 @@ function normalizeLessonV2(raw: any): LessonContent {
       shuffle_final_questions: settings.shuffle_final_questions !== false,
       shuffle_final_options: settings.shuffle_final_options !== false,
       show_final_answers_after_submit: settings.show_final_answers_after_submit !== false,
+      show_final_explanations_after_submit: settings.show_final_explanations_after_submit !== false,
       allow_exam_retry: settings.allow_exam_retry !== false,
       max_exam_attempts: Number(settings.max_exam_attempts || 2),
       exam_score_policy: settings.exam_score_policy || 'best',
@@ -298,6 +302,7 @@ function normalizeLessonV2(raw: any): LessonContent {
     },
     sections,
     final_quiz: finalQuiz.map((q, index) => ({ ...q, id: q.id || `FQ${index + 1}` })),
+    question_bank: (questionBank.length ? questionBank : finalQuiz).map((q, index) => ({ ...q, id: q.id || `QB${index + 1}` })),
     assessment: {
       interactive_weight: 0,
       final_quiz_weight: 100,
@@ -907,7 +912,7 @@ Nhiệm vụ:
 - Mỗi activity nên có 2-6 pages theo trật tự sư phạm: tình huống/nhiệm vụ → khái niệm/giải thích → ví dụ/ứng dụng → ghi nhớ. Minh hoạ phải mang ý nghĩa học tập, không phải danh sách từ khóa trang trí. Mỗi page nên có visual dạng object khi phù hợp: type, title, items, center_label, relationship. visual.type chỉ dùng: none, icon_cards, hub_spoke, process, comparison, timeline, device_diagram, concept_map, numbered_steps.
 - Nếu học liệu có khung hoặc mục Ghi nhớ/Kết luận/Em cần nhớ/Lưu ý thì phải đưa đúng nội dung đó vào page layout="remember" và summary của activity tương ứng.
 - Nếu học liệu có câu hỏi/hoạt động/bài tập/Em hãy/Quan sát/Thảo luận thì phải ưu tiên chuyển các câu hỏi đó thành activity.interactions hoặc final_quiz; chỉ sinh thêm câu hỏi khi không đủ số lượng cấu hình.
-- Với học liệu dạng SGK có các khối “Sau bài này em sẽ”, “Hoạt động”, “Hình”, “Luyện tập”, “Vận dụng”: hãy giữ logic sư phạm này. Hoạt động quan sát/hỏi đáp trong bài dùng làm interactive_questions; Luyện tập/Vận dụng dùng làm final_quiz hoặc fill_in_blank trong section nếu là câu hỏi mở.
+- Với học liệu dạng SGK có các khối “Sau bài này em sẽ”, “Hoạt động”, “Hình”, “Luyện tập”, “Vận dụng”: hãy giữ logic sư phạm này. Hoạt động quan sát/hỏi đáp trong bài dùng làm interactive_questions; Luyện tập/Vận dụng dùng làm final_quiz hoặc fill_in_blank trong section nếu là câu hỏi mở.\n- Nếu học liệu có ví dụ, quy trình, thao tác từng bước hoặc hoạt động minh hoạ cụ thể, hãy ưu tiên biến chính ví dụ/hoạt động đó thành các câu tương tác bám sát ngữ cảnh nguồn thay vì tạo câu hỏi lý thuyết chung chung. Có thể chia một ví dụ thành nhiều câu single_choice / true_false / fill_in_blank liên tiếp để mô phỏng tiến trình của hoạt động.
 - Không trả về HTML thô như <br>, <p>, <div>. Dùng xuống dòng \n hoặc content_blocks.
 - Bắt buộc bảo đảm JSON hợp lệ tuyệt đối: nếu nội dung có dấu ngoặc kép trong câu như “bộ não”, hãy đổi sang dấu nháy đơn hoặc escape thành \"bộ não\"; không để dấu ngoặc kép thô bên trong chuỗi JSON.
 - Không xuất markdown, không xuất chú thích ngoài JSON, không dùng danh sách bằng dấu • bên ngoài chuỗi. Mọi array phải có dấu phẩy giữa các phần tử; không để phần tử cuối có dấu phẩy thừa; không bỏ sót dấu đóng } hoặc ].
@@ -921,6 +926,8 @@ Bối cảnh:
 Cấu hình bài học:
 - Số câu hỏi tương tác mỗi nội dung: ${config.interactive_questions_per_section || 1}
 - Số câu hỏi cuối bài: ${config.final_quiz_count || 10}
+- Chế độ kiểm tra cuối bài: ${config.final_quiz_source_mode === 'random_bank' ? 'lấy ngẫu nhiên từ ngân hàng câu hỏi' : 'bộ câu cố định'}
+- Số câu mục tiêu của ngân hàng: ${config.question_bank_size || 30}
 - Loại câu hỏi: ${config.question_mix || 'mixed'} (mixed = kết hợp single_choice, true_false, fill_in_blank)
 - Mức độ: ${config.difficulty || 'medium'}
 - Có ví dụ minh họa: ${config.include_examples !== false ? 'có' : 'không'}
@@ -941,9 +948,8 @@ Cấu hình bài học:
 - explanation phải giải thích trực tiếp vì sao đáp án đúng phù hợp với kiến thức nguồn; không được giải thích mâu thuẫn với correctAnswer/correctAnswers.
 - Phân bố mức độ hợp lý: khoảng 30% nhận biết, 40% thông hiểu, 30% vận dụng nếu học liệu cho phép; câu vận dụng phải có tình huống cụ thể, không chỉ đổi nhãn level.
 - Cho xem đáp án sau khi nộp: ${config.show_final_answers_after_submit !== false ? 'có' : 'không'}
-- Cho phép làm lại kiểm tra: ${config.allow_exam_retry !== false ? 'có' : 'không'}
-- Số lần làm lại tối đa: ${config.max_exam_attempts || 2}
-- Cách lấy điểm kiểm tra: ${config.exam_score_policy || 'best'}
+- Cho xem giải thích sau khi nộp: ${config.show_final_explanations_after_submit !== false ? 'có' : 'không'}
+- Kiểm tra cuối bài mặc định là một lượt chính thức; không thiết kế logic làm lại trong cùng cấu hình bài học. Nếu cần học lại cập nhật điểm, giáo viên sẽ cấp quyền riêng trong theo dõi học tập.
 - Yêu cầu riêng: ${config.ai_instructions || 'Không có'}
 
 Yêu cầu nội dung:
@@ -952,8 +958,8 @@ Yêu cầu nội dung:
 3. Mỗi page có page_id, title, subtitle, layout, blocks, teacher_notes, student_prompt và visual. visual gồm type, title, items, center_label, relationship. visual_hint/illustration_keywords chỉ dùng làm tương thích, không dùng để lặp lại tiêu đề hoặc hiển thị như chip cho học sinh.
 4. page.blocks chia nội dung thành các khối ngắn. Mỗi khối có type, title, category, theme, text; title phải bám sát nội dung.
 5. activity.interactions gồm câu hỏi/nhiệm vụ tương tác sau phần trình bày và chỉ có 3 dạng: single_choice, true_false, fill_in_blank. Với fill_in_blank phải có sentence chứa đúng một _____, choices đúng 4 từ/cụm từ, correctAnswers đúng 1 từ/cụm từ đúng và explanation.
-6. final_quiz gồm câu hỏi cuối bài khách quan thuộc 3 dạng single_choice, true_false, fill_in_blank; không dùng short_answer/tự luận. Với single_choice phải có đúng 4 options và correctAnswer trùng nguyên văn đúng một option. Với fill_in_blank phải có đúng một _____, đúng 4 choices và correctAnswers gồm đúng một choice. Mọi câu đều có explanation ngắn, chính xác và đáp án đúng không phụ thuộc thứ tự hiển thị để hệ thống có thể đảo đáp án.
-7. settings phải lưu đầy đủ cấu hình thời gian học, thời gian kiểm tra, đảo câu hỏi, đảo đáp án, xem đáp án sau khi nộp, làm lại kiểm tra.
+6. final_quiz gồm câu hỏi cuối bài khách quan thuộc 3 dạng single_choice, true_false, fill_in_blank; không dùng short_answer/tự luận. question_bank là ngân hàng câu hỏi lớn hơn dùng cho đề ngẫu nhiên; khi cấu hình random_bank, hãy tạo tối thiểu số câu theo question_bank_size (nếu học liệu đủ), mỗi câu có id duy nhất và explanation. Với single_choice phải có đúng 4 options và correctAnswer trùng nguyên văn đúng một option. Với fill_in_blank phải có đúng một _____, đúng 4 choices và correctAnswers gồm đúng một choice. Mọi câu đều có explanation ngắn, chính xác và đáp án đúng không phụ thuộc thứ tự hiển thị để hệ thống có thể đảo đáp án.
+7. settings phải lưu đầy đủ cấu hình thời gian học, thời gian kiểm tra, đảo câu hỏi, đảo đáp án, xem đáp án sau khi nộp và các cấu hình ngân hàng câu hỏi/ngẫu nhiên hoá.
 8. assessment quy định thang điểm 10.
 9. Nếu học liệu có nội dung vận dụng, đưa vào phần section hoặc final_quiz theo hướng đánh giá năng lực.
 
@@ -969,11 +975,13 @@ JSON bắt buộc:
     "content_count": 0,
     "interactive_questions_per_section": ${config.interactive_questions_per_section || 1},
     "final_quiz_count": ${config.final_quiz_count || 10},
+    "final_quiz_source_mode": "${config.final_quiz_source_mode === 'random_bank' ? 'random_bank' : 'fixed'}",
+    "question_bank_size": ${config.question_bank_size || 30},
     "question_mix": "${config.question_mix || 'mixed'}",
     "difficulty": "${config.difficulty || 'medium'}",
     "include_examples": ${config.include_examples !== false},
     "include_summary": ${config.include_summary !== false},
-    "allow_retry": ${config.allow_retry !== false},
+    "allow_retry": false,
     "show_explanation": ${config.show_explanation !== false},
     "interactive_weight": 0,
     "final_quiz_weight": 100,
@@ -984,6 +992,7 @@ JSON bắt buộc:
     "shuffle_final_questions": ${config.shuffle_final_questions !== false},
     "shuffle_final_options": ${config.shuffle_final_options !== false},
     "show_final_answers_after_submit": ${config.show_final_answers_after_submit !== false},
+    "show_final_explanations_after_submit": ${config.show_final_explanations_after_submit !== false},
     "allow_exam_retry": ${config.allow_exam_retry !== false},
     "max_exam_attempts": ${config.max_exam_attempts || 2},
     "exam_score_policy": "${config.exam_score_policy || 'best'}",
@@ -1022,6 +1031,7 @@ JSON bắt buộc:
       "summary": ""
     }
   ],
+  "question_bank": [],
   "final_quiz": [
     { "id": "FQ1", "type": "single_choice", "question": "", "options": ["phương án 1", "phương án 2", "phương án 3", "phương án 4"], "correctAnswer": "phương án 1", "explanation": "", "level": "thong_hieu" }
   ],
@@ -1064,7 +1074,9 @@ export async function reviseLessonWithAI(
   } catch (error) {
     parsed = await repairLessonJsonWithAI(apiKey, model, response.text || '', error);
   }
-  return normalizeLessonContent(parsed);
+  let normalized = normalizeLessonContent(parsed);
+  normalized = await ensureLessonQuestionQuotas(ai, model, normalized, settings || lesson.settings);
+  return normalized;
 }
 
 
@@ -1399,6 +1411,171 @@ export async function fileToUploadedSourceFile(file: File): Promise<UploadedSour
   };
 }
 
+
+async function ensureInteractiveQuestionCount(
+  ai: GoogleGenAI,
+  model: string,
+  lesson: LessonContent,
+  requestedCount: number,
+): Promise<LessonContent> {
+  const target = Math.max(0, Math.min(10, Math.floor(Number(requestedCount || 0))));
+  if (!target || !Array.isArray(lesson.activities) || !lesson.activities.length) return lesson;
+
+  const shortages = lesson.activities
+    .map((activity, index) => ({
+      activity,
+      index,
+      missing: Math.max(0, target - (activity.interactions?.length || 0)),
+    }))
+    .filter((item) => item.missing > 0);
+  if (!shortages.length) return lesson;
+
+  let supplemental: Record<string, QuizQuestion[]> = {};
+  try {
+    const compactActivities = shortages.map(({ activity, missing }) => ({
+      activity_id: activity.activity_id,
+      title: activity.title,
+      objective: activity.objective,
+      missing,
+      content: (activity.pages || []).flatMap((page) => (page.blocks || []).map((block) => block.text || '')).filter(Boolean).join(' ').slice(0, 2400),
+      existing_questions: (activity.interactions || []).map((question) => question.question || question.sentence || '').filter(Boolean),
+    }));
+    const response = await ai.models.generateContent({
+      model,
+      contents: [{
+        role: 'user',
+        parts: [{ text: `Bổ sung câu hỏi tương tác còn thiếu cho các hoạt động dưới đây.\nMỗi activity_id phải có ĐÚNG số câu bằng trường missing.\nChỉ dùng 3 loại: single_choice, true_false, fill_in_blank.\nCâu hỏi phải bám sát nội dung của đúng hoạt động, không lặp câu đã có.\n- single_choice: đúng 4 options, correctAnswer trùng nguyên văn 1 option.\n- true_false: options [\"Đúng\",\"Sai\"], correctAnswer là \"Đúng\" hoặc \"Sai\".\n- fill_in_blank: sentence có đúng một _____, choices đúng 4, correctAnswers đúng 1 choice.\nMỗi câu phải có explanation và level.\nChỉ trả JSON dạng {\"questionsByActivity\":{\"A1\":[...],\"A2\":[...]}}.\n\nDữ liệu hoạt động:\n${JSON.stringify(compactActivities)}` }],
+      }],
+      config: {
+        systemInstruction: 'Chỉ trả JSON hợp lệ. Phải tạo đủ chính xác số câu còn thiếu cho từng activity_id.',
+        responseMimeType: 'application/json',
+        temperature: 0.25,
+      },
+    });
+    const parsed = extractJson(response.text || '');
+    const rawMap = parsed?.questionsByActivity && typeof parsed.questionsByActivity === 'object' ? parsed.questionsByActivity : {};
+    supplemental = Object.fromEntries(Object.entries(rawMap).map(([activityId, raw]) => [activityId, safeQuizArray(raw)]));
+  } catch (error) {
+    console.warn('[EduSmart][AI] supplemental interactive generation failed; using fallback pool', error);
+  }
+
+  const fallbackPool = [
+    ...(lesson.question_bank || []),
+    ...(lesson.final_quiz || []),
+    ...lesson.activities.flatMap((activity) => activity.interactions || []),
+  ];
+
+  const activities = lesson.activities.map((activity, activityIndex) => {
+    const current = [...(activity.interactions || [])];
+    const needed = Math.max(0, target - current.length);
+    if (!needed) return activity;
+    const generated = (supplemental[activity.activity_id] || []).slice(0, needed);
+    generated.forEach((question, index) => current.push({
+      ...question,
+      id: `IQ_${activity.activity_id}_${current.length + index + 1}`,
+    }));
+    while (current.length < target && fallbackPool.length) {
+      const source = fallbackPool[(activityIndex * target + current.length) % fallbackPool.length];
+      current.push({
+        ...source,
+        id: `IQ_${activity.activity_id}_${current.length + 1}`,
+        question: source.question || source.sentence || `Câu hỏi tương tác ${current.length + 1}`,
+      });
+    }
+    return { ...activity, interactions: current.slice(0, target) };
+  });
+
+  return normalizeLessonV3({ ...lesson, schema_version: 'lesson_v3', activities });
+}
+
+function makeGuaranteedFallbackQuestion(seed: string, id: string, index: number): QuizQuestion {
+  const title = cleanTextValue(seed || 'nội dung đang học') || 'nội dung đang học';
+  const correct = title.length > 90 ? title.slice(0, 90) : title;
+  return {
+    id,
+    type: 'single_choice',
+    question: `Nội dung nào phù hợp nhất với trọng tâm của phần học này?`,
+    options: [correct, 'Một nội dung không liên quan đến bài học', 'Một thao tác không xuất hiện trong phần học', 'Một nhận định trái với nội dung đang học'],
+    correctAnswer: correct,
+    explanation: `Trọng tâm của phần học là: ${correct}.`,
+    level: index % 3 === 0 ? 'nhan_biet' : index % 3 === 1 ? 'thong_hieu' : 'van_dung',
+  } as QuizQuestion;
+}
+
+function lessonFallbackSeeds(lesson: LessonContent) {
+  const seeds = (lesson.activities || []).flatMap((activity) => [
+    activity.title,
+    activity.objective,
+    activity.summary,
+    ...(activity.pages || []).flatMap((page) => [page.title, page.subtitle, ...(page.blocks || []).map((block) => block.text)]),
+  ]).map((item) => cleanTextValue(item || '')).filter(Boolean);
+  return seeds.length ? seeds : [lesson.metadata?.tieu_de || lesson.title || 'Nội dung bài học'];
+}
+
+async function ensureFinalQuizCount(
+  ai: GoogleGenAI,
+  model: string,
+  lesson: LessonContent,
+  requestedCount: number,
+): Promise<LessonContent> {
+  const target = Math.max(0, Math.min(100, Math.floor(Number(requestedCount || 0))));
+  if (!target) return lesson;
+  let current = [...(lesson.final_quiz || [])];
+  if (current.length >= target) return normalizeLessonV3({ ...lesson, final_quiz: current.slice(0, target) });
+  const missing = target - current.length;
+  try {
+    const response = await ai.models.generateContent({
+      model,
+      contents: [{ role: 'user', parts: [{ text: `Bổ sung chính xác ${missing} câu kiểm tra cuối bài còn thiếu cho bài học sau.\nChỉ dùng single_choice, true_false, fill_in_blank.\nCâu hỏi phải bám sát nội dung bài học, không lặp câu đã có.\nMỗi câu phải có id, explanation, level và đáp án hợp lệ.\nChỉ trả JSON dạng {"questions":[...]}.\n\nBài học: ${JSON.stringify({ metadata: lesson.metadata, activities: lesson.activities, existing: current.map((q) => q.question || q.sentence) }).slice(0, 45000)}` }] }],
+      config: { systemInstruction: 'Chỉ trả JSON hợp lệ và tạo đủ chính xác số câu được yêu cầu.', responseMimeType: 'application/json', temperature: 0.2 },
+    });
+    const parsed = extractJson(response.text || '');
+    current.push(...safeQuizArray(parsed?.questions).slice(0, missing));
+  } catch (error) {
+    console.warn('[EduSmart][AI] supplemental final quiz generation failed; using deterministic fallback', error);
+  }
+  const pool = [...(lesson.question_bank || []), ...(lesson.activities || []).flatMap((a) => a.interactions || [])];
+  let cursor = 0;
+  while (current.length < target && pool.length) {
+    const source = pool[cursor % pool.length];
+    current.push({ ...source, id: `FQ_AUTO_${current.length + 1}` });
+    cursor += 1;
+  }
+  const seeds = lessonFallbackSeeds(lesson);
+  while (current.length < target) {
+    const idx = current.length;
+    current.push(makeGuaranteedFallbackQuestion(seeds[idx % seeds.length], `FQ_FALLBACK_${idx + 1}`, idx));
+  }
+  return normalizeLessonV3({ ...lesson, schema_version: 'lesson_v3', final_quiz: current.slice(0, target) });
+}
+
+export function getLessonQuestionQuotaStatus(lesson: LessonContent, settings?: LessonBuilderSettings) {
+  const effective = (settings || lesson.settings || {}) as Partial<LessonBuilderSettings>;
+  const interactionTarget = Math.max(0, Math.floor(Number(effective.interactive_questions_per_section || 0)));
+  const finalTarget = Math.max(0, Math.floor(Number(effective.final_quiz_count || 0)));
+  const activities = (lesson.activities || []).map((activity, index) => ({
+    activity_id: activity.activity_id,
+    title: activity.title || `Hoạt động ${index + 1}`,
+    actual: activity.interactions?.length || 0,
+    target: interactionTarget,
+    ok: (activity.interactions?.length || 0) >= interactionTarget,
+  }));
+  return { activities, final: { actual: lesson.final_quiz?.length || 0, target: finalTarget, ok: (lesson.final_quiz?.length || 0) >= finalTarget }, ok: activities.every((item) => item.ok) && (lesson.final_quiz?.length || 0) >= finalTarget };
+}
+
+async function ensureLessonQuestionQuotas(ai: GoogleGenAI, model: string, lesson: LessonContent, settings?: LessonBuilderSettings) {
+  const effective = (settings || lesson.settings || {}) as Partial<LessonBuilderSettings>;
+  let repaired = await ensureInteractiveQuestionCount(ai, model, lesson, Number(effective.interactive_questions_per_section || 0));
+  repaired = await ensureFinalQuizCount(ai, model, repaired, Number(effective.final_quiz_count || 0));
+  // Chuẩn hóa có thể loại câu không hợp lệ; chạy lại một lần nữa để quota là ràng buộc cuối cùng.
+  repaired = normalizeLessonContent(repaired);
+  repaired = await ensureInteractiveQuestionCount(ai, model, repaired, Number(effective.interactive_questions_per_section || 0));
+  repaired = await ensureFinalQuizCount(ai, model, repaired, Number(effective.final_quiz_count || 0));
+  const status = getLessonQuestionQuotaStatus(repaired, effective as LessonBuilderSettings);
+  if (!status.ok) throw new Error(`AI chưa tạo đủ số câu theo cấu hình. Tương tác: ${status.activities.map((x) => `${x.actual}/${x.target}`).join(', ')}; cuối bài: ${status.final.actual}/${status.final.target}.`);
+  return repaired;
+}
+
 export async function analyzeLessonMaterial(
   apiKey: string,
   model: string,
@@ -1494,7 +1671,8 @@ ${values.source_text.trim().slice(0, 18000)}`,
       }
     }
   }
-  const normalized = normalizeLessonContent(parsed);
+  let normalized = normalizeLessonContent(parsed);
+  normalized = await ensureLessonQuestionQuotas(ai, model, normalized, settings);
   if (!normalized.metadata.tieu_de) {
     normalized.metadata.tieu_de = values.tieu_de || 'Bài học mới';
   }

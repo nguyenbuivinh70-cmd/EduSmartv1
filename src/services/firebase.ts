@@ -61,6 +61,7 @@ export interface FirebaseMemberProfile {
   authUid: string;
   userId: string;
   username: string;
+  studentCode: string;
   displayName: string;
   email: string;
   role: 'admin' | 'teacher' | 'student';
@@ -226,8 +227,9 @@ function normalizeMember(raw: Record<string, unknown>, uid: string, email: strin
   const resolvedGrade = canonicalGrade || legacyGrade;
   return {
     authUid: cleanText(raw.authUid),
-    userId: cleanText(raw.userId),
-    username: cleanText(raw.username),
+    userId: cleanText(raw.userId ?? raw.user_id),
+    username: cleanText(raw.username ?? raw.ten_dang_nhap),
+    studentCode: cleanText(raw.studentCode || raw.username),
     displayName: cleanText(raw.displayName),
     email: cleanText(raw.email) || email,
     role: normalizeRole(raw.role ?? raw.vai_tro),
@@ -254,7 +256,7 @@ function internalStudentCode(email: string, raw: Record<string, unknown>) {
   return '';
 }
 
-async function synchronizeStudentMemberFromRoster(
+export async function synchronizeStudentMemberFromRoster(
   memberRef: ReturnType<typeof doc>,
   memberSnapshot: Awaited<ReturnType<typeof getDocFromServer>>,
   uid: string,
@@ -289,6 +291,12 @@ async function synchronizeStudentMemberFromRoster(
   setIfDifferent('classId', roster.classId);
   setIfDifferent('grade', roster.grade, normalizeStudentGrade);
   setIfDifferent('studentCode', roster.studentCode || studentCode);
+  // V6.96.0: chuẩn hóa luôn các field vai trò/trạng thái của member legacy.
+  // Rules V6.96.0 cho phép chính học sinh biến profile vai_tro/trang_thai cũ
+  // thành contract canonical nếu mọi giá trị đều khớp studentRoster.
+  if (cleanText(raw.role).toLowerCase() !== 'student') patch.role = 'student';
+  if (cleanText(raw.status).toLowerCase() !== 'active') patch.status = 'active';
+  if (raw.adminPermission !== false) patch.adminPermission = false;
   if (cleanText(raw.schoolId) !== FIREBASE_SCHOOL_ID) patch.schoolId = FIREBASE_SCHOOL_ID;
   if (cleanText(raw.authUid) !== uid) patch.authUid = uid;
 
@@ -384,6 +392,96 @@ export async function loadValidatedCurrentFirebaseMember() {
   if (member.status !== 'active') throw new Error('Tài khoản thành viên đang bị khóa hoặc chưa kích hoạt.');
   if (!member.userId) throw new Error('Thông tin tài khoản chưa đầy đủ. Vui lòng liên hệ quản trị viên.');
   return { uid, ...member };
+}
+
+
+/**
+ * V6.95.0: làm mới danh tính học sinh trực tiếp từ server trước các thao tác ghi
+ * nhạy cảm (gửi chuẩn bị bài, tạo nhóm học cùng...). Hàm cố tình không dùng
+ * cache của firebaseOperational để tránh trường hợp member vừa được chuyển lớp
+ * hoặc được sửa trong studentRoster nhưng phiên đăng nhập vẫn giữ dữ liệu cũ.
+ */
+export async function ensureCanonicalStudentIdentity() {
+  const current = firebaseAuth.currentUser;
+  if (!current) throw new Error('Bạn cần đăng nhập lại để tiếp tục sử dụng chức năng này.');
+  await current.getIdToken(true);
+  const signedInEmail = cleanText(current.email || '').toLowerCase();
+  const suffix = '@hthtv1.firebaseapp.com';
+  const emailStudentCode = signedInEmail.endsWith(suffix)
+    ? signedInEmail.slice(0, -suffix.length)
+    : '';
+
+  // V6.98.0 - UID-Native Student Identity.
+  // Với tài khoản học sinh nội bộ, Firebase Auth UID + email đã đủ để xác định
+  // duy nhất studentRoster. Không buộc members legacy phải được sửa thành công
+  // trước các thao tác học lại / chuẩn bị bài.
+  if (/^\d{6,}$/.test(emailStudentCode)) {
+    const rosterRef = doc(firestoreDb, 'schools', FIREBASE_SCHOOL_ID, 'studentRoster', emailStudentCode);
+    const rosterSnap = await getDocFromServer(rosterRef);
+    if (!rosterSnap.exists()) throw new Error('Mã học sinh chưa có trong danh sách của nhà trường.');
+    const roster = rosterSnap.data() as Record<string, unknown>;
+    if (cleanText(roster.status).toLowerCase() !== 'active') throw new Error('Tài khoản học sinh đang bị khóa hoặc chưa kích hoạt.');
+
+    const userId = cleanText(roster.userId) || `HS_${emailStudentCode}`;
+    const classId = cleanText(roster.classId);
+    const grade = normalizeStudentGrade(roster.grade);
+    if (!userId || !classId || !grade) {
+      throw new Error('Thông tin lớp học của em chưa đầy đủ. Em hãy báo giáo viên hỗ trợ.');
+    }
+
+    const identityRef = doc(firestoreDb, 'schools', FIREBASE_SCHOOL_ID, 'studentIdentityIndex', current.uid);
+    const identityData = {
+      schemaVersion: 1,
+      schoolId: FIREBASE_SCHOOL_ID,
+      ownerUid: current.uid,
+      authUid: current.uid,
+      authEmail: signedInEmail,
+      studentCode: cleanText(roster.studentCode) || emailStudentCode,
+      userId,
+      classId,
+      grade,
+      status: 'active',
+      updatedAt: serverTimestamp(),
+    };
+    await setDoc(identityRef, identityData, { merge: false });
+
+    // members chỉ còn là profile/cache phục vụ tương thích cũ. Đồng bộ best-effort,
+    // tuyệt đối không dùng kết quả repair này để quyết định quyền học sinh.
+    try {
+      const memberRef = doc(firestoreDb, 'schools', FIREBASE_SCHOOL_ID, 'members', current.uid);
+      const memberSnap = await getDocFromServer(memberRef);
+      if (memberSnap.exists()) await synchronizeStudentMemberFromRoster(memberRef, memberSnap, current.uid, signedInEmail);
+    } catch (error) {
+      console.warn('[EduSmart][UIDIdentityV6980] member compatibility sync deferred', {
+        uid: current.uid,
+        code: error instanceof FirebaseError ? error.code : '',
+      });
+    }
+
+    return {
+      authUid: current.uid,
+      uid: current.uid,
+      userId,
+      username: cleanText(roster.username) || emailStudentCode,
+      studentCode: cleanText(roster.studentCode) || emailStudentCode,
+      displayName: cleanText(roster.displayName),
+      email: cleanText(roster.email).toLowerCase() || signedInEmail,
+      role: 'student' as const,
+      status: 'active',
+      adminPermission: false,
+      schoolId: FIREBASE_SCHOOL_ID,
+      classId,
+      grade,
+      gradeScopes: [],
+      allGrades: false,
+      canonicalSource: 'studentIdentityIndex',
+      identityIndexReady: true,
+    };
+  }
+
+  // Giáo viên/Admin và các tài khoản không dùng email học sinh nội bộ tiếp tục
+  // đi theo member profile hiện hành.
+  return await loadValidatedCurrentFirebaseMember();
 }
 
 export async function signInAndLoadMember(email: string, password: string): Promise<FirebaseLoginIdentity> {
@@ -613,28 +711,127 @@ export async function verifyOrActivateFirebaseClassmateInIsolation(
       if (!memberSnapshot.exists()) throw new Error('Không thể kích hoạt hồ sơ của bạn học cùng.');
     }
 
-    const rawClassmateMember = memberSnapshot.data();
-    const classmateIdentityRepair: Record<string, unknown> = {};
-    if (!cleanText(rawClassmateMember.schoolId)) classmateIdentityRepair.schoolId = FIREBASE_SCHOOL_ID;
-    if (!cleanText(rawClassmateMember.authUid)) classmateIdentityRepair.authUid = uid;
-    if (Object.keys(classmateIdentityRepair).length) {
+    // V6.95.0: kể cả member đã tồn tại, luôn đối chiếu lại studentRoster trước
+    // khi tạo consent. Trước đây nhánh học cùng chỉ sửa schoolId/authUid nên hồ
+    // sơ legacy có userId/classId/grade cũ vẫn hiển thị trong danh sách nhưng bị
+    // Firestore từ chối khi ghi coLearningConsent.
+    let canonicalRoster: Record<string, unknown> | null = activationRoster || null;
+    if (!canonicalRoster) {
       try {
-        await updateDoc(memberRef, { ...classmateIdentityRepair, updatedAt: serverTimestamp() });
-        const repairedSnapshot = await getDoc(memberRef);
-        if (repairedSnapshot.exists()) memberSnapshot = repairedSnapshot;
+        const rosterRef = doc(isolatedDb, 'schools', FIREBASE_SCHOOL_ID, 'studentRoster', studentCode);
+        const rosterSnapshot = await getDoc(rosterRef);
+        if (rosterSnapshot.exists()) canonicalRoster = rosterSnapshot.data() as Record<string, unknown>;
       } catch {
-        // Rules cũ chưa Publish: phần kiểm tra dưới sẽ chặn hồ sơ không đầy đủ.
+        // Nếu không đọc được roster, phần kiểm tra member bên dưới vẫn bảo vệ an toàn.
+      }
+    }
+    if (canonicalRoster && cleanText(canonicalRoster.status).toLowerCase() === 'active') {
+      const rawClassmateMember = memberSnapshot.data() as Record<string, unknown>;
+      const classmateIdentityRepair: Record<string, unknown> = {};
+      const setIfDifferent = (key: string, next: unknown, normalize: (value: unknown) => string = cleanText) => {
+        const normalizedNext = normalize(next);
+        if (normalizedNext && normalize(rawClassmateMember[key]) !== normalizedNext) classmateIdentityRepair[key] = normalizedNext;
+      };
+      setIfDifferent('userId', canonicalRoster.userId);
+      setIfDifferent('username', canonicalRoster.username || studentCode);
+      setIfDifferent('displayName', canonicalRoster.displayName);
+      setIfDifferent('email', canonicalRoster.email || signedInEmail, (value) => cleanText(value).toLowerCase());
+      setIfDifferent('classId', canonicalRoster.classId);
+      setIfDifferent('grade', canonicalRoster.grade, normalizeStudentGrade);
+      setIfDifferent('studentCode', canonicalRoster.studentCode || studentCode);
+      if (cleanText(rawClassmateMember.role).toLowerCase() !== 'student') classmateIdentityRepair.role = 'student';
+      if (cleanText(rawClassmateMember.status).toLowerCase() !== 'active') classmateIdentityRepair.status = 'active';
+      if (rawClassmateMember.adminPermission !== false) classmateIdentityRepair.adminPermission = false;
+      if (cleanText(rawClassmateMember.schoolId) !== FIREBASE_SCHOOL_ID) classmateIdentityRepair.schoolId = FIREBASE_SCHOOL_ID;
+      if (cleanText(rawClassmateMember.authUid) !== uid) classmateIdentityRepair.authUid = uid;
+      if (Object.keys(classmateIdentityRepair).length) {
+        try {
+          await updateDoc(memberRef, { ...classmateIdentityRepair, updatedAt: serverTimestamp() });
+          const repairedSnapshot = await getDoc(memberRef);
+          if (repairedSnapshot.exists()) memberSnapshot = repairedSnapshot;
+        } catch (syncError) {
+          console.warn('[EduSmart][CoLearningIdentitySync] Partner sync deferred', {
+            studentCode,
+            uid,
+            code: syncError instanceof FirebaseError ? syncError.code : '',
+          });
+        }
+      }
+    } else {
+      const rawClassmateMember = memberSnapshot.data() as Record<string, unknown>;
+      const classmateIdentityRepair: Record<string, unknown> = {};
+      if (!cleanText(rawClassmateMember.schoolId)) classmateIdentityRepair.schoolId = FIREBASE_SCHOOL_ID;
+      if (!cleanText(rawClassmateMember.authUid)) classmateIdentityRepair.authUid = uid;
+      if (Object.keys(classmateIdentityRepair).length) {
+        try {
+          await updateDoc(memberRef, { ...classmateIdentityRepair, updatedAt: serverTimestamp() });
+          const repairedSnapshot = await getDoc(memberRef);
+          if (repairedSnapshot.exists()) memberSnapshot = repairedSnapshot;
+        } catch { /* validation below returns a clearer message */ }
       }
     }
 
-    const member = normalizeMember(memberSnapshot.data(), uid, signedInEmail);
-    if (member.authUid !== uid || member.schoolId !== FIREBASE_SCHOOL_ID) {
-      throw new Error('Thông tin bạn học cùng chưa được đồng bộ đầy đủ. Vui lòng tải lại danh sách và thử lại.');
-    }
-    if (member.role !== 'student') throw new Error('Tài khoản được nhập không phải tài khoản học sinh.');
-    if (member.status !== 'active') throw new Error('Tài khoản bạn học cùng đang bị khóa hoặc chưa kích hoạt.');
-    if (member.username !== studentCode || !member.userId) {
-      throw new Error('Hồ sơ bạn học cùng không khớp Mã học sinh đã nhập.');
+    let member = normalizeMember(memberSnapshot.data(), uid, signedInEmail);
+    // V6.98.3: xác thực bạn học lấy studentRoster làm nguồn canonical sau khi
+    // Firebase Auth đã xác nhận đúng mật khẩu. members chỉ còn là profile/cache;
+    // một hồ sơ legacy chưa repair xong không được phép chặn chức năng Học cùng.
+    if (canonicalRoster && cleanText(canonicalRoster.status).toLowerCase() === 'active') {
+      const rosterUserId = cleanText(canonicalRoster.userId) || `HS_${studentCode}`;
+      const rosterClassId = cleanText(canonicalRoster.classId);
+      const rosterGrade = normalizeStudentGrade(canonicalRoster.grade);
+      if (!rosterUserId || !rosterClassId || !rosterGrade) {
+        throw new Error('Thông tin lớp/khối của bạn học cùng chưa đầy đủ trong danh sách nhà trường.');
+      }
+      member = {
+        ...member,
+        authUid: uid,
+        userId: rosterUserId,
+        username: cleanText(canonicalRoster.username) || studentCode,
+        studentCode: cleanText(canonicalRoster.studentCode) || studentCode,
+        displayName: cleanText(canonicalRoster.displayName) || member.displayName,
+        email: cleanText(canonicalRoster.email).toLowerCase() || signedInEmail,
+        role: 'student',
+        status: 'active',
+        adminPermission: false,
+        schoolId: FIREBASE_SCHOOL_ID,
+        classId: rosterClassId,
+        grade: rosterGrade,
+      };
+
+      // Tạo UID-native identity index bằng chính phiên đăng nhập cô lập của bạn
+      // học. Đây là best-effort: xác thực Auth + roster vẫn đủ để tạo nhóm; index
+      // chỉ giúp các thao tác Firestore tiếp theo ổn định hơn.
+      try {
+        const identityRef = doc(isolatedDb, 'schools', FIREBASE_SCHOOL_ID, 'studentIdentityIndex', uid);
+        await setDoc(identityRef, {
+          schemaVersion: 1,
+          schoolId: FIREBASE_SCHOOL_ID,
+          ownerUid: uid,
+          authUid: uid,
+          authEmail: signedInEmail,
+          studentCode: member.studentCode,
+          userId: member.userId,
+          classId: member.classId,
+          grade: member.grade,
+          status: 'active',
+          updatedAt: serverTimestamp(),
+        }, { merge: false });
+      } catch (identityError) {
+        console.warn('[EduSmart][CoLearningV6983] partner identity index deferred', {
+          studentCode,
+          uid,
+          code: identityError instanceof FirebaseError ? identityError.code : '',
+        });
+      }
+    } else {
+      if (member.authUid !== uid || member.schoolId !== FIREBASE_SCHOOL_ID) {
+        throw new Error('Thông tin bạn học cùng chưa được đồng bộ đầy đủ. Vui lòng tải lại danh sách và thử lại.');
+      }
+      if (member.role !== 'student') throw new Error('Tài khoản được nhập không phải tài khoản học sinh.');
+      if (member.status !== 'active') throw new Error('Tài khoản bạn học cùng đang bị khóa hoặc chưa kích hoạt.');
+      if (member.username !== studentCode || !member.userId) {
+        throw new Error('Hồ sơ bạn học cùng không khớp Mã học sinh đã nhập.');
+      }
     }
 
     let preLessonPreparationStatus: FirebaseVerifiedClassmate['preLessonPreparationStatus'] = 'not_started';
@@ -665,7 +862,8 @@ export async function verifyOrActivateFirebaseClassmateInIsolation(
       } catch {
         // Nếu kết quả chưa đọc được, dùng trạng thái chưa gửi thay vì làm gián đoạn xác nhận nhóm.
       }
-      await setDoc(doc(isolatedDb, 'schools', FIREBASE_SCHOOL_ID, 'coLearningConsents', `${consent.sessionId}_${uid}`), {
+      const consentRef = doc(isolatedDb, 'schools', FIREBASE_SCHOOL_ID, 'coLearningConsents', `${consent.sessionId}_${uid}`);
+      const consentData = {
         schoolId: FIREBASE_SCHOOL_ID, schemaVersion: 1, sessionId: consent.sessionId,
         lessonId: consent.lessonId, hostUid: consent.hostUid, ownerUid: uid, userId: member.userId,
         classId: consent.classId, grade: consent.grade, approved: true,
@@ -673,7 +871,25 @@ export async function verifyOrActivateFirebaseClassmateInIsolation(
         preparationScore: preLessonPreparationScore,
         preparationWatchPercent: preLessonWatchPercent,
         createdAt: serverTimestamp(),
-      });
+      };
+      // V6.98.3: Firebase Auth password verification + active roster + same
+      // class/grade are the authoritative partner checks. Consent is an audit
+      // record and is persisted best-effort; a transient/legacy Rules mismatch
+      // must not invalidate a password that Firebase Auth already verified.
+      try {
+        await setDoc(consentRef, consentData, { merge: false });
+      } catch (consentError) {
+        await credential.user.getIdToken(true).catch(() => undefined);
+        try {
+          await setDoc(consentRef, consentData, { merge: false });
+        } catch (retryError) {
+          console.warn('[EduSmart][CoLearningV6983] partner consent audit deferred', {
+            studentCode,
+            uid,
+            code: retryError instanceof FirebaseError ? retryError.code : '',
+          });
+        }
+      }
     }
     return { ...member, uid, createdAuth, createdMember, preLessonPreparationStatus, preLessonPreparationScore, preLessonWatchPercent };
   } finally {
