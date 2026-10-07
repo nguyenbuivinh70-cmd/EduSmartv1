@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import { AIConfig, ChatMessage, LessonContent, LessonStageKey } from '../types';
 import { chatWithGemini, synthesizeTeacherSpeech } from '../services/gemini';
+import { professionalUserMessage } from '../utils/userMessages';
 
 interface LessonAssistantContext {
   lessonId?: string;
@@ -311,11 +312,11 @@ export default function AIAssistant({
     } catch (error) {
       stopAudioPlayback();
       const raw = String((error as any)?.message || error || '');
-      const quotaError = /429|quota|resource_exhausted|rate|limit/i.test(raw);
+      const quotaError = /429|quota|resource_exhausted|rate|limit|hạn mức|han muc/i.test(raw);
       setVoiceNotice(
         quotaError
           ? 'API đọc giọng AI đã hết hạn mức hoặc bị chặn tạm thời. Hãy đổi API Key hoặc thử lại sau.'
-          : 'Đã có lỗi khi tạo giọng đọc AI. Nội dung vẫn hiển thị đầy đủ trong khung chat.',
+          : professionalUserMessage(raw, 'Chưa tạo được giọng đọc lúc này. Nội dung vẫn hiển thị đầy đủ trong khung chat.', 'staff'),
       );
       if (quotaError) onOpenConfig('quota');
     }
@@ -365,10 +366,10 @@ export default function AIAssistant({
       }
     } catch (error) {
       const raw = String((error as any)?.message || error || '');
-      const quotaError = /429|quota|resource_exhausted|rate|limit/i.test(raw);
+      const quotaError = /429|quota|resource_exhausted|rate|limit|hạn mức|han muc/i.test(raw);
       const reply = quotaError
-        ? 'API Key hiện tại đã hết hạn mức hoặc bị chặn tạm thời. Hãy đổi API Key hoặc chuyển model rồi thử lại.'
-        : 'Đã có lỗi khi kết nối tới trợ lý AI. Bạn kiểm tra lại API Key, model hoặc thử lại sau.';
+        ? 'Hạn mức sử dụng AI hiện đã đạt giới hạn. Hãy thử lại sau hoặc chọn API Key khác.'
+        : professionalUserMessage(raw, 'Trợ lý AI đang bận. Vui lòng thử lại sau ít phút.', 'staff');
       appendMessages(contextKey, [...history, { role: 'model', text: reply }]);
       setAssistantState('idle');
       if (quotaError) onOpenConfig('quota');

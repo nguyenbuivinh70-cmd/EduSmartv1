@@ -5,6 +5,7 @@ import { AIConfig, GoogleSlidePromptItem, GoogleSlidesPromptRecord, GoogleSlides
 import { generateGoogleSlidesPrompts } from '../services/gemini';
 import { listGoogleSlidesPromptsApi, saveGoogleSlidesPromptApi } from '../services/api';
 import { createDocxBlob, type DocxParagraph } from '../utils/docxExporter';
+import { professionalUserMessage } from '../utils/userMessages';
 
 interface GoogleSlidesPromptModalProps {
   isOpen: boolean;
@@ -199,8 +200,10 @@ export default function GoogleSlidesPromptModal({ isOpen, content, aiConfig, sub
       setResult(generated);
     } catch (error) {
       const raw = String((error as any)?.message || error || 'Không thể tạo prompt trình chiếu.');
-      const quotaError = /429|quota|resource_exhausted|rate|limit/i.test(raw);
-      setErrorMessage(quotaError ? 'API Key hiện tại đã hết hạn mức sử dụng. Hãy cập nhật API Key khác rồi thử lại.' : raw);
+      const quotaError = /429|quota|resource_exhausted|rate|limit|hạn mức|han muc/i.test(raw);
+      setErrorMessage(quotaError
+        ? 'Hạn mức sử dụng AI của tài khoản hiện đã đạt giới hạn. Hãy thử lại sau hoặc chọn API Key khác.'
+        : professionalUserMessage(raw, 'Chưa thể tạo nội dung trình chiếu lúc này. Vui lòng thử lại sau ít phút.', 'staff'));
       if (quotaError) onOpenConfig('quota');
     } finally {
       setIsGenerating(false);
@@ -306,8 +309,8 @@ export default function GoogleSlidesPromptModal({ isOpen, content, aiConfig, sub
                     <div className="mt-3 flex flex-col gap-3 rounded-2xl bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-700 sm:flex-row sm:items-center sm:justify-between">
                       <span>{errorMessage}</span>
                       {/api key/i.test(errorMessage) ? (
-                        <button type="button" onClick={() => onOpenConfig(/hết hạn|quota|429|resource_exhausted|rate|limit/i.test(errorMessage) ? 'quota' : 'manual')} className="inline-flex shrink-0 items-center justify-center gap-2 rounded-xl bg-rose-600 px-4 py-2 text-xs font-black text-white hover:bg-rose-700">
-                          <KeyRound className="h-4 w-4" /> {/hết hạn|quota|429|resource_exhausted|rate|limit/i.test(errorMessage) ? 'Đổi API Key ngay' : 'Cấu hình API Key ngay'}
+                        <button type="button" onClick={() => onOpenConfig(/hết hạn|hạn mức|han muc|quota|429|resource_exhausted|rate|limit/i.test(errorMessage) ? 'quota' : 'manual')} className="inline-flex shrink-0 items-center justify-center gap-2 rounded-xl bg-rose-600 px-4 py-2 text-xs font-black text-white hover:bg-rose-700">
+                          <KeyRound className="h-4 w-4" /> {/hết hạn|hạn mức|han muc|quota|429|resource_exhausted|rate|limit/i.test(errorMessage) ? 'Đổi API Key ngay' : 'Cấu hình API Key ngay'}
                         </button>
                       ) : null}
                     </div>

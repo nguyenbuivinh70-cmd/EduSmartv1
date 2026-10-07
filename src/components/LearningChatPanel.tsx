@@ -3,6 +3,7 @@ import { motion } from 'motion/react';
 import { AlertCircle, Bot, KeyRound, Lightbulb, Loader2, Send, Sparkles, User, X } from 'lucide-react';
 import { AIConfig, ChatMessage, Lesson, LessonContent, LessonSectionV2, LessonStageKey } from '../types';
 import { chatWithGemini } from '../services/gemini';
+import { professionalUserMessage } from '../utils/userMessages';
 
 interface PendingChatPrompt {
   id: number;
@@ -337,14 +338,14 @@ export default function LearningChatPanel({
       setMessages((prev) => [...prev, { role: 'model', text: reply }]);
     } catch (error) {
       const raw = String((error as any)?.message || error || '');
-      const quotaError = /429|quota|resource_exhausted|rate/i.test(raw);
+      const quotaError = /429|quota|resource_exhausted|rate|hạn mức|han muc/i.test(raw);
       setMessages((prev) => [
         ...prev,
         {
           role: 'model',
           text: quotaError
-            ? 'API Key hiện tại đã hết hạn mức hoặc bị chặn tạm thời. Em hãy đổi API Key hoặc model rồi thử lại.'
-            : 'Mình đang gặp lỗi kết nối trợ lý AI. Em kiểm tra lại API Key hoặc thử lại sau nhé.',
+            ? 'Trợ lý AI đang tạm đạt giới hạn sử dụng. Em hãy thử lại sau ít phút.'
+            : professionalUserMessage(raw, 'Trợ lý AI đang bận. Em hãy thử lại sau ít phút.', 'student'),
         },
       ]);
       if (quotaError) onOpenConfig('quota');

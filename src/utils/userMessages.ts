@@ -34,6 +34,25 @@ export function professionalUserMessage(
   const lower = raw.toLowerCase();
   const staff = audience === 'staff';
 
+  // AI service errors are converted into actionable, non-technical messages.
+  // Keep this before the generic network/API filters so raw SDK payloads such as
+  // {error:{code:503,...}} never reach the UI.
+  if (/gemini|trợ lý ai|tro ly ai|dịch vụ ai|dich vu ai|high demand|model.+demand|decode_preempted|resource[_ -]?exhausted|\b503\b|\b429\b/.test(lower)) {
+    if (/429|quota|resource[_ -]?exhausted|rate limit|hạn mức|han muc/.test(lower)) {
+      return staff
+        ? 'Hạn mức sử dụng AI của tài khoản hiện đã đạt giới hạn. Vui lòng thử lại sau hoặc chọn API Key khác.'
+        : 'Trợ lý AI đang tạm đạt giới hạn sử dụng. Em hãy thử lại sau ít phút.';
+    }
+    if (/401|403|api key|permission|forbidden/.test(lower)) {
+      return staff
+        ? 'Cấu hình AI của tài khoản chưa được chấp nhận. Vui lòng kiểm tra API Key và quyền sử dụng mô hình.'
+        : 'Trợ lý AI chưa sẵn sàng cho tài khoản này. Em hãy báo giáo viên để được hỗ trợ.';
+    }
+    return staff
+      ? 'Dịch vụ AI đang có nhiều yêu cầu. Hệ thống đã tự thử lại; vui lòng thử lại sau ít phút.'
+      : 'Trợ lý AI đang bận. Em hãy thử lại sau ít phút.';
+  }
+
   if (/prelesson|chuẩn bị bài|chuan bi bai/.test(lower) || /PRELESSON_/i.test(raw)) {
     if (staff) {
       if (/network|offline|mạng|ket noi|kết nối/.test(lower)) return 'Kết nối đang gián đoạn. Dữ liệu chuẩn bị bài chưa được làm mới; vui lòng thử lại khi kết nối ổn định.';

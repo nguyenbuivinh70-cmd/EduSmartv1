@@ -24,6 +24,7 @@ import GoogleSlidesPromptModal from './GoogleSlidesPromptModal';
 import LessonContentEditorWindow from './LessonContentEditorWindow';
 import YoutubeEmbedBlock, { getYoutubeEmbedUrl } from './YoutubeEmbedBlock';
 import { LESSON_TEACHER_PERMISSION_KEYS, LESSON_TEACHER_PERMISSION_LABELS, normalizeLessonTeacherPermissionList, normalizeLessonTeacherPermissionMap } from '../utils/lessonPermissions';
+import { professionalUserMessage } from '../utils/userMessages';
 
 function gradeIncluded(subjectGradeList: string | undefined, grade: string) {
   const normalizedGrade = String(grade || '').trim();
@@ -285,7 +286,7 @@ function lessonSaveDisplayError(error: unknown) {
     console.error('[EduSmart][LessonComposer][PUBLISH_RUNTIME]', error);
     return 'Chưa thể xuất bản bài học lúc này. Nội dung đang soạn vẫn được giữ; vui lòng thử lại.';
   }
-  return raw;
+  return professionalUserMessage(raw, 'Chưa thể xuất bản bài học lúc này. Nội dung đang soạn vẫn được giữ; vui lòng thử lại.', 'staff');
 }
 
 function lessonEditSnapshot(values: LessonComposerValues) {
@@ -686,8 +687,10 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
       setActiveStep('content');
     } catch (error) {
       const raw = String((error as any)?.message || error || '');
-      const quotaError = /429|quota|resource_exhausted|rate|limit/i.test(raw);
-      setErrorMessage(quotaError ? 'API Key hiện tại đã hết hạn mức sử dụng. Hãy cập nhật API Key khác rồi thử lại.' : raw || 'Không thể phân tích học liệu.');
+      const quotaError = /429|quota|resource_exhausted|rate|limit|hạn mức|han muc/i.test(raw);
+      setErrorMessage(quotaError
+        ? 'Hạn mức sử dụng AI của tài khoản hiện đã đạt giới hạn. Hãy thử lại sau hoặc chọn API Key khác.'
+        : professionalUserMessage(raw, 'Chưa thể tạo bài học lúc này. Vui lòng thử lại sau ít phút.', 'staff'));
       if (quotaError) onOpenConfig('quota');
     } finally {
       setIsAnalyzing(false);
@@ -707,7 +710,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
       const withVideos = withStructuredIdentity(mergeVideoLinks(revised, values.section_video_links || '', values.intro_video_url || ''));
       setValues((prev) => ({ ...prev, lesson_json: withVideos, ai_revision_request: '', tom_tat: withVideos.metadata.tom_tat || prev.tom_tat, tu_khoa: withVideos.metadata.tu_khoa?.join(', ') || prev.tu_khoa }));
     } catch (error) {
-      setErrorMessage(String((error as any)?.message || error || 'Không thể điều chỉnh bài học.'));
+      setErrorMessage(professionalUserMessage((error as any)?.message || error, 'Chưa thể điều chỉnh bài học lúc này. Vui lòng thử lại sau ít phút.', 'staff'));
     } finally {
       setIsRevising(false);
     }
@@ -957,7 +960,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
   };
 
   const apiKeyErrorVisible = /api key/i.test(errorMessage);
-  const apiKeyQuotaErrorVisible = /hết hạn|quota|429|resource_exhausted|rate|limit/i.test(errorMessage);
+  const apiKeyQuotaErrorVisible = /hết hạn|hạn mức|han muc|quota|429|resource_exhausted|rate|limit/i.test(errorMessage);
   const showInlineAIConfigRequirement = !aiConfig.apiKey && !errorMessage && (activeStep === 'material' || activeStep === 'content');
 
 

@@ -5,8 +5,20 @@
 [build.environment]
   NODE_VERSION = "22.16.0"
   NPM_FLAGS = "--no-audit --no-fund"
+  NODE_OPTIONS = "--max-old-space-size=4096"
 
 [[redirects]]
   from = "/*"
   to = "/index.html"
   status = 200
+
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-store, no-cache, must-revalidate"
+
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+    X-Content-Type-Options = "nosniff"

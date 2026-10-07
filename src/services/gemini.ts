@@ -15,6 +15,173 @@ import {
 import { isQuizQuestionQualityAcceptable, sanitizeQuizQuestion } from '../utils/quizSanitizer';
 import { AI_MODELS, normalizeGeminiModelName } from '../constants';
 
+
+// V6.98.6: Production-safe Gemini request layer.
+// Google documents 429/5xx (especially 503 UNAVAILABLE/high demand) as transient
+// conditions that should be retried with exponential backoff. On a deployed web
+// app we also fail over to another compatible Flash model so a temporary capacity
+// spike on one model does not block lesson creation.
+const GEMINI_RUNTIME_HINT_TTL_MS = 10 * 60 * 1000;
+const geminiRuntimeModelHints = new Map<string, { model: string; expiresAt: number }>();
+
+function waitFor(ms: number) {
+  return new Promise<void>((resolve) => globalThis.setTimeout(resolve, ms));
+}
+
+function geminiErrorText(error: unknown) {
+  const value = error as any;
+  const parts = [
+    value?.error?.message,
+    value?.message,
+    value?.status,
+    value?.code,
+    typeof error === 'string' ? error : '',
+  ].filter(Boolean).map((item) => String(item));
+  const joined = parts.join(' | ').trim();
+  if (!joined) return 'UNKNOWN_GEMINI_ERROR';
+  // SDK errors sometimes put the complete API JSON in message. Extract its
+  // human message only for diagnostics; raw payload is never shown to users.
+  try {
+    const firstBrace = joined.indexOf('{');
+    const lastBrace = joined.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      const parsed = JSON.parse(joined.slice(firstBrace, lastBrace + 1));
+      const nested = parsed?.error?.message || parsed?.message;
+      if (nested) return `${nested} | ${joined}`;
+    }
+  } catch {
+    // Keep original diagnostic text.
+  }
+  return joined;
+}
+
+function geminiHttpStatus(error: unknown) {
+  const value = error as any;
+  const direct = Number(value?.status || value?.statusCode || value?.error?.code || value?.code);
+  if ([400, 401, 403, 404, 408, 409, 429, 500, 502, 503, 504].includes(direct)) return direct;
+  const match = geminiErrorText(error).match(/(?:HTTP\s*)?(400|401|403|404|408|409|429|500|502|503|504)\b/i);
+  return match ? Number(match[1]) : 0;
+}
+
+function isGeminiTransientError(error: unknown) {
+  const status = geminiHttpStatus(error);
+  const text = geminiErrorText(error).toLowerCase();
+  return [408, 429, 500, 502, 503, 504].includes(status)
+    || /unavailable|high demand|overload|overloaded|temporar|decode_preempted|resource[_ -]?exhausted|rate limit|timeout|timed out|network|fetch failed/.test(text);
+}
+
+function isGeminiModelUnavailable(error: unknown) {
+  const status = geminiHttpStatus(error);
+  const text = geminiErrorText(error).toLowerCase();
+  return status === 404 || /model.+(?:not found|unavailable|not supported)|not supported for generatecontent/.test(text);
+}
+
+function safeGeminiUserError(error: unknown) {
+  const status = geminiHttpStatus(error);
+  const text = geminiErrorText(error).toLowerCase();
+  if (status === 503 || /high demand|overload|decode_preempted|service.+unavailable/.test(text)) {
+    return new Error('Dịch vụ AI đang có nhiều yêu cầu. Hệ thống đã tự thử lại và chuyển sang mô hình dự phòng nhưng chưa hoàn tất. Vui lòng thử lại sau ít phút.');
+  }
+  if (status === 429 || /quota|resource[_ -]?exhausted|rate limit/.test(text)) {
+    return new Error('Hạn mức sử dụng AI của tài khoản hiện đã đạt giới hạn. Vui lòng thử lại sau hoặc chọn API Key khác.');
+  }
+  if (status === 401 || status === 403 || /api key|permission denied|forbidden/.test(text)) {
+    return new Error('Cấu hình AI của tài khoản chưa được chấp nhận. Vui lòng kiểm tra API Key và quyền sử dụng mô hình.');
+  }
+  if (isGeminiModelUnavailable(error)) {
+    return new Error('Mô hình AI đang chọn chưa sẵn sàng. Hệ thống đã thử các mô hình dự phòng nhưng chưa thể hoàn tất yêu cầu.');
+  }
+  if (/network|fetch failed|failed to fetch|timeout|timed out/.test(text)) {
+    return new Error('Kết nối tới dịch vụ AI đang gián đoạn. Vui lòng kiểm tra mạng và thử lại.');
+  }
+  return new Error('Chưa thể hoàn tất yêu cầu AI lúc này. Vui lòng thử lại sau ít phút.');
+}
+
+function geminiModelCandidates(requestedModel: string, allowFallback = true) {
+  const requested = normalizeGeminiModelName(requestedModel);
+  const hint = geminiRuntimeModelHints.get(requested);
+  const hinted = hint && hint.expiresAt > Date.now() ? hint.model : '';
+  if (hint && hint.expiresAt <= Date.now()) geminiRuntimeModelHints.delete(requested);
+  if (!allowFallback) return [requested];
+
+  // Favor reliable Flash variants for interactive production workloads. The
+  // user's chosen model is always attempted; fallback is temporary and does not
+  // overwrite the saved account configuration.
+  const productionFallbacks = [
+    'gemini-3.5-flash',
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-flash-lite',
+    'gemini-2.5-flash',
+    'gemini-2.5-flash-lite',
+  ];
+  return Array.from(new Set([hinted, requested, ...productionFallbacks, ...AI_MODELS].filter(Boolean))).slice(0, 6);
+}
+
+async function generateContentReliable(
+  ai: GoogleGenAI,
+  requestedModel: string,
+  request: any,
+  options: { allowFallback?: boolean; label?: string } = {},
+): Promise<any> {
+  const allowFallback = options.allowFallback !== false;
+  const requested = normalizeGeminiModelName(requestedModel);
+  const candidates = geminiModelCandidates(requested, allowFallback);
+  let lastError: unknown = null;
+
+  for (let modelIndex = 0; modelIndex < candidates.length; modelIndex += 1) {
+    const candidate = candidates[modelIndex];
+    const maxAttempts = modelIndex === 0 ? 2 : 1;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      try {
+        const response = await ai.models.generateContent({ ...request, model: candidate });
+        geminiRuntimeModelHints.set(requested, { model: candidate, expiresAt: Date.now() + GEMINI_RUNTIME_HINT_TTL_MS });
+        if (candidate !== requested) {
+          console.info(`[EduSmart][AI] ${options.label || 'generateContent'} recovered with fallback model ${candidate}.`);
+        }
+        return response;
+      } catch (error) {
+        lastError = error;
+        const transient = isGeminiTransientError(error);
+        const modelUnavailable = isGeminiModelUnavailable(error);
+        console.warn(`[EduSmart][AI] ${options.label || 'generateContent'} failed on ${candidate} (attempt ${attempt + 1}/${maxAttempts}).`, error);
+        if (!transient && !modelUnavailable) throw safeGeminiUserError(error);
+        if (transient && attempt + 1 < maxAttempts) {
+          await waitFor(attempt === 0 ? 700 : 1600);
+          continue;
+        }
+        break;
+      }
+    }
+    if (modelIndex + 1 < candidates.length) await waitFor(250);
+  }
+
+  throw safeGeminiUserError(lastError);
+}
+
+async function generateContentStreamReliable(
+  ai: GoogleGenAI,
+  requestedModel: string,
+  request: any,
+): Promise<any> {
+  const requested = normalizeGeminiModelName(requestedModel);
+  const candidates = geminiModelCandidates(requested, true).slice(0, 5);
+  let lastError: unknown = null;
+  for (let modelIndex = 0; modelIndex < candidates.length; modelIndex += 1) {
+    const candidate = candidates[modelIndex];
+    try {
+      const response = await ai.models.generateContentStream({ ...request, model: candidate });
+      geminiRuntimeModelHints.set(requested, { model: candidate, expiresAt: Date.now() + GEMINI_RUNTIME_HINT_TTL_MS });
+      return response;
+    } catch (error) {
+      lastError = error;
+      console.warn(`[EduSmart][AI] stream start failed on ${candidate}.`, error);
+      if (!isGeminiTransientError(error) && !isGeminiModelUnavailable(error)) throw safeGeminiUserError(error);
+      if (modelIndex + 1 < candidates.length) await waitFor(modelIndex === 0 ? 700 : 300);
+    }
+  }
+  throw safeGeminiUserError(lastError);
+}
+
 function cleanTextValue(value: unknown): string {
   return String(value ?? '')
     .replace(/\*\*/g, '')
@@ -862,15 +1029,14 @@ function extractJson(text: string) {
   try {
     return tryParseJsonCandidate(text);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error || 'Không rõ lỗi');
-    throw new Error(`AI trả về JSON chưa hợp lệ và hệ thống không thể tự sửa. Chi tiết: ${message}`);
+    console.warn('[EduSmart][AI] JSON parse failed after local repair attempts.', error);
+    throw new Error('Nội dung AI trả về chưa hoàn chỉnh. Hệ thống sẽ thử tạo lại; nếu vẫn chưa được, vui lòng thử lại sau ít phút.');
   }
 }
 
 async function repairLessonJsonWithAI(apiKey: string, model: string, brokenJsonText: string, originalError: unknown) {
   const ai = new GoogleGenAI({ apiKey });
-  const response = await ai.models.generateContent({
-    model,
+  const response = await generateContentReliable(ai, model, {
     contents: [{
       role: 'user',
       parts: [{ text: `JSON sau bị lỗi cú pháp khi phân tích bài học. Hãy sửa thành JSON hợp lệ theo schema lesson_v3. Không thêm markdown, không giải thích. Lưu ý: nếu trong chuỗi có dấu ngoặc kép tiếng Việt như "bộ não", hãy đổi thành dấu nháy đơn hoặc escape đúng chuẩn JSON.\n\nLỗi: ${originalError instanceof Error ? originalError.message : String(originalError || '')}\n\nJSON cần sửa:\n${sliceLikelyJson(brokenJsonText).slice(0, 65000)}` }],
@@ -1056,8 +1222,7 @@ export async function reviseLessonWithAI(
   settings?: LessonBuilderSettings,
 ): Promise<LessonContent> {
   const ai = new GoogleGenAI({ apiKey });
-  const response = await ai.models.generateContent({
-    model,
+  const response = await generateContentReliable(ai, model, {
     contents: [{
       role: 'user',
       parts: [{ text: `Bạn là chuyên gia thiết kế bài học trực tuyến. Hãy chỉnh sửa JSON bài học theo yêu cầu của giáo viên, giữ nguyên schema_version lesson_v3, bảo toàn cấu trúc activities, pages, interactions, final_quiz, assessment. Không tạo tiêu đề dạng "Nội dung 1" dư thừa, không trả HTML thô như <br>, ưu tiên giữ ghi nhớ và câu hỏi lấy từ học liệu gốc; không ép câu hỏi mở thành đúng/sai; nếu cần câu hỏi mở, hãy chuyển thành fill_in_blank với 1 chỗ trống và 4 từ/cụm từ lựa chọn. Với content_blocks, đặt title ngắn gọn theo đúng ý chính, gán category/theme để giao diện hiển thị màu nền nhẹ phù hợp. Mọi single_choice phải có correctAnswer trùng nguyên văn đúng một option; mọi fill_in_blank phải có đúng 4 choices và correctAnswers trùng nguyên văn đúng một choice. Loại bỏ câu hỏi mơ hồ, cụt ý, sai chính tả hoặc có hơn một đáp án hợp lý; explanation phải thống nhất với đáp án đúng.\n\nYêu cầu chỉnh sửa: ${request}\n\nCấu hình hiện tại: ${JSON.stringify(settings || lesson.settings || {})}\n\nJSON bài học hiện tại:\n${JSON.stringify(lesson).slice(0, 60000)}\n\nChỉ trả về JSON bài học đã chỉnh sửa, không giải thích thêm.` }],
@@ -1327,8 +1492,7 @@ Chỉ trả về JSON hợp lệ.`;
 
 async function repairGoogleSlidesPromptJsonWithAI(apiKey: string, model: string, brokenJsonText: string, originalError: unknown) {
   const ai = new GoogleGenAI({ apiKey });
-  const response = await ai.models.generateContent({
-    model,
+  const response = await generateContentReliable(ai, model, {
     contents: [{
       role: 'user',
       parts: [{ text: `JSON tạo prompt Google Slides sau bị lỗi cú pháp. Hãy sửa thành JSON hợp lệ theo đúng schema, không thêm markdown, không giải thích.\n\nLỗi: ${originalError instanceof Error ? originalError.message : String(originalError || '')}\n\nJSON cần sửa:\n${sliceLikelyJson(brokenJsonText).slice(0, 65000)}` }],
@@ -1351,8 +1515,7 @@ export async function generateGoogleSlidesPrompts(
   extraRequest?: string,
 ): Promise<GoogleSlidesPromptResult> {
   const ai = new GoogleGenAI({ apiKey });
-  const response = await ai.models.generateContent({
-    model,
+  const response = await generateContentReliable(ai, model, {
     contents: [{
       role: 'user',
       parts: [{ text: buildGoogleSlidesPromptGenerationPrompt(lesson, subjectLabel, grade, extraRequest) }],
@@ -1371,8 +1534,7 @@ export async function generateGoogleSlidesPrompts(
     try {
       parsed = await repairGoogleSlidesPromptJsonWithAI(apiKey, model, response.text || '', error);
     } catch (repairError) {
-      const retryResponse = await ai.models.generateContent({
-        model,
+      const retryResponse = await generateContentReliable(ai, model, {
         contents: [{
           role: 'user',
           parts: [{ text: `${buildGoogleSlidesPromptGenerationPrompt(lesson, subjectLabel, grade, extraRequest)}\n\nLần tạo trước bị lỗi JSON: ${repairError instanceof Error ? repairError.message : String(repairError || '')}\nHãy tạo lại JSON ngắn hơn nhưng hợp lệ tuyệt đối. Không dùng markdown.` }],
@@ -1440,8 +1602,7 @@ async function ensureInteractiveQuestionCount(
       content: (activity.pages || []).flatMap((page) => (page.blocks || []).map((block) => block.text || '')).filter(Boolean).join(' ').slice(0, 2400),
       existing_questions: (activity.interactions || []).map((question) => question.question || question.sentence || '').filter(Boolean),
     }));
-    const response = await ai.models.generateContent({
-      model,
+    const response = await generateContentReliable(ai, model, {
       contents: [{
         role: 'user',
         parts: [{ text: `Bổ sung câu hỏi tương tác còn thiếu cho các hoạt động dưới đây.\nMỗi activity_id phải có ĐÚNG số câu bằng trường missing.\nChỉ dùng 3 loại: single_choice, true_false, fill_in_blank.\nCâu hỏi phải bám sát nội dung của đúng hoạt động, không lặp câu đã có.\n- single_choice: đúng 4 options, correctAnswer trùng nguyên văn 1 option.\n- true_false: options [\"Đúng\",\"Sai\"], correctAnswer là \"Đúng\" hoặc \"Sai\".\n- fill_in_blank: sentence có đúng một _____, choices đúng 4, correctAnswers đúng 1 choice.\nMỗi câu phải có explanation và level.\nChỉ trả JSON dạng {\"questionsByActivity\":{\"A1\":[...],\"A2\":[...]}}.\n\nDữ liệu hoạt động:\n${JSON.stringify(compactActivities)}` }],
@@ -1524,8 +1685,7 @@ async function ensureFinalQuizCount(
   if (current.length >= target) return normalizeLessonV3({ ...lesson, final_quiz: current.slice(0, target) });
   const missing = target - current.length;
   try {
-    const response = await ai.models.generateContent({
-      model,
+    const response = await generateContentReliable(ai, model, {
       contents: [{ role: 'user', parts: [{ text: `Bổ sung chính xác ${missing} câu kiểm tra cuối bài còn thiếu cho bài học sau.\nChỉ dùng single_choice, true_false, fill_in_blank.\nCâu hỏi phải bám sát nội dung bài học, không lặp câu đã có.\nMỗi câu phải có id, explanation, level và đáp án hợp lệ.\nChỉ trả JSON dạng {"questions":[...]}.\n\nBài học: ${JSON.stringify({ metadata: lesson.metadata, activities: lesson.activities, existing: current.map((q) => q.question || q.sentence) }).slice(0, 45000)}` }] }],
       config: { systemInstruction: 'Chỉ trả JSON hợp lệ và tạo đủ chính xác số câu được yêu cầu.', responseMimeType: 'application/json', temperature: 0.2 },
     });
@@ -1603,8 +1763,7 @@ ${values.source_text.trim().slice(0, 25000)}`,
     });
   }
 
-  const response = await ai.models.generateContent({
-    model,
+  const response = await generateContentReliable(ai, model, {
     contents: [{ role: 'user', parts }],
     config: {
       systemInstruction: 'Bạn tạo học liệu số chất lượng cao cho học sinh phổ thông Việt Nam. Luôn xuất JSON hợp lệ.',
@@ -1650,8 +1809,7 @@ ${values.source_text.trim().slice(0, 18000)}`,
         });
       }
 
-      const retryResponse = await ai.models.generateContent({
-        model,
+      const retryResponse = await generateContentReliable(ai, model, {
         contents: [{ role: 'user', parts: retryParts }],
         config: {
           systemInstruction: 'Chỉ tạo JSON hợp lệ. Không markdown. Không giải thích. Ưu tiên JSON ngắn gọn nhưng đúng cú pháp.',
@@ -1666,7 +1824,8 @@ ${values.source_text.trim().slice(0, 18000)}`,
         try {
           parsed = await repairLessonJsonWithAI(apiKey, model, retryResponse.text || '', retryError);
         } catch (finalError) {
-          throw new Error(`AI tạo nội dung chưa đúng định dạng JSON sau nhiều lần sửa. Vui lòng bấm tạo lại hoặc giảm độ dài tài liệu. Chi tiết: ${finalError instanceof Error ? finalError.message : String(finalError || '')}`);
+          console.warn('[EduSmart][AI] lesson JSON regeneration failed.', finalError);
+          throw new Error('Chưa thể hoàn tất nội dung bài học ở lần tạo này. Vui lòng bấm tạo lại; tài liệu và cấu hình hiện tại vẫn được giữ nguyên.');
         }
       }
     }
@@ -1741,8 +1900,7 @@ export async function chatWithGemini(
 
   contents.push({ role: 'user', parts: [{ text: message }] });
 
-  const response = await ai.models.generateContent({
-    model,
+  const response = await generateContentReliable(ai, model, {
     contents,
     config: {
       systemInstruction: [
@@ -1805,8 +1963,7 @@ export async function streamGeminiChat(
 
   contents.push({ role: 'user', parts: [{ text: message }] });
 
-  const response = await ai.models.generateContentStream({
-    model,
+  const response = await generateContentStreamReliable(ai, model, {
     contents,
     config: {
       systemInstruction: [
@@ -1824,12 +1981,17 @@ export async function streamGeminiChat(
   });
 
   let fullText = '';
-  for await (const chunk of response) {
-    const chunkText = chunk.text;
-    if (chunkText) {
-      fullText += chunkText;
-      onToken?.(chunkText);
+  try {
+    for await (const chunk of response) {
+      const chunkText = chunk.text;
+      if (chunkText) {
+        fullText += chunkText;
+        onToken?.(chunkText);
+      }
     }
+  } catch (error) {
+    console.warn('[EduSmart][AI] streaming response interrupted.', error);
+    if (!fullText.trim()) throw safeGeminiUserError(error);
   }
   onComplete?.(fullText);
 }
@@ -1879,8 +2041,7 @@ function pcmToWavBlob(pcmBytes: Uint8Array, sampleRate = 24000, channels = 1, bi
 export async function synthesizeTeacherSpeech(apiKey: string, text: string): Promise<Blob> {
   const ai = new GoogleGenAI({ apiKey });
   const transcript = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 4000);
-  const response = await ai.models.generateContent({
-    model: 'gemini-3.1-flash-tts-preview',
+  const response = await generateContentReliable(ai, 'gemini-3.1-flash-tts-preview', {
     contents: [{
       parts: [{
         text: [
@@ -1899,7 +2060,7 @@ export async function synthesizeTeacherSpeech(apiKey: string, text: string): Pro
         },
       },
     },
-  });
+  }, { allowFallback: false, label: 'speech' });
 
   const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
   if (!base64Audio) {
@@ -1945,24 +2106,33 @@ function parseGeminiApiError(payload: any, status: number) {
 }
 
 async function fetchGeminiJson(url: string, apiKey: string, init?: RequestInit) {
-  const controller = new AbortController();
-  const timeoutId = globalThis.setTimeout(() => controller.abort(), 15000);
-  try {
-    const response = await fetch(url, {
-      ...init,
-      headers: {
-        'x-goog-api-key': apiKey,
-        ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
-        ...(init?.headers || {}),
-      },
-      signal: controller.signal,
-    });
-    let payload: any = null;
-    try { payload = await response.json(); } catch { payload = null; }
-    return { response, payload };
-  } finally {
-    globalThis.clearTimeout(timeoutId);
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const controller = new AbortController();
+    const timeoutId = globalThis.setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch(url, {
+        ...init,
+        headers: {
+          'x-goog-api-key': apiKey,
+          ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+          ...(init?.headers || {}),
+        },
+        signal: controller.signal,
+      });
+      let payload: any = null;
+      try { payload = await response.json(); } catch { payload = null; }
+      if (![429, 500, 502, 503, 504].includes(response.status) || attempt === 2) return { response, payload };
+      await waitFor(attempt === 0 ? 500 : 1200);
+    } catch (error) {
+      lastError = error;
+      if (attempt === 2) throw error;
+      await waitFor(attempt === 0 ? 500 : 1200);
+    } finally {
+      globalThis.clearTimeout(timeoutId);
+    }
   }
+  throw lastError instanceof Error ? lastError : new Error('Không thể kết nối dịch vụ AI lúc này.');
 }
 
 function chooseGeminiModel(requestedModel: string, availableModels: string[]) {
