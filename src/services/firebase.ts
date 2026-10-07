@@ -925,14 +925,14 @@ function firebaseImportIdentityError(code: string) {
   const normalized = cleanText(code).split(' : ')[0];
   const messages: Record<string, string> = {
     EMAIL_EXISTS: 'Mã học sinh đã được kích hoạt. Mật khẩu không đúng; hãy liên hệ quản trị viên nếu cần đặt lại mật khẩu.',
-    OPERATION_NOT_ALLOWED: 'Firebase Authentication chưa bật phương thức Email/Password.',
-    TOO_MANY_ATTEMPTS_TRY_LATER: 'Firebase đang tạm giới hạn số lần tạo tài khoản. Hãy chờ rồi tải lại cùng file để tiếp tục; dữ liệu đã lưu sẽ không bị trùng.',
-    QUOTA_EXCEEDED: 'Firebase đã chạm giới hạn tạo tài khoản trong lượt này. Hãy chờ rồi tải lại cùng file để tiếp tục.',
-    WEAK_PASSWORD: 'Mã học sinh phải có ít nhất 6 ký tự để dùng làm mật khẩu Firebase.',
+    OPERATION_NOT_ALLOWED: 'Chức năng đăng nhập bằng tài khoản và mật khẩu chưa sẵn sàng. Vui lòng kiểm tra cấu hình đăng nhập.',
+    TOO_MANY_ATTEMPTS_TRY_LATER: 'Hệ thống đang tạm giới hạn số lần tạo tài khoản. Vui lòng chờ ít phút rồi thử lại; dữ liệu đã lưu sẽ không bị trùng.',
+    QUOTA_EXCEEDED: 'Hệ thống đang tạm giới hạn số lượng tài khoản có thể tạo trong lượt này. Vui lòng chờ ít phút rồi thử lại.',
+    WEAK_PASSWORD: 'Mã học sinh phải có ít nhất 6 ký tự để sử dụng làm mật khẩu.',
     INVALID_EMAIL: 'Không tạo được email nội bộ từ Mã học sinh.',
-    USER_DISABLED: 'Tài khoản Firebase đã tồn tại nhưng đang bị vô hiệu hóa. Hãy kích hoạt tài khoản trong Firebase Authentication rồi nhập lại.',
+    USER_DISABLED: 'Tài khoản đã tồn tại nhưng đang tạm ngừng hoạt động. Vui lòng kích hoạt lại tài khoản rồi thử lại.',
   };
-  return messages[normalized] || `Firebase Authentication từ chối tạo tài khoản (${normalized || 'UNKNOWN'}).`;
+  return messages[normalized] || 'Chưa thể tạo tài khoản. Vui lòng kiểm tra thông tin và thử lại.';
 }
 
 /**
@@ -950,7 +950,7 @@ export async function registerFirebaseStudentForFirstLogin(identifier: string, p
   try {
     signUp = await identityToolkitRequest('signUp', { email, password: normalizedPassword });
   } catch {
-    throw new Error('Không kết nối được Firebase Authentication. Vui lòng kiểm tra Internet rồi thử lại.');
+    throw new Error('Không thể kết nối dịch vụ đăng nhập. Vui lòng kiểm tra Internet rồi thử lại.');
   }
   if (signUp.response.ok && signUp.body.localId) {
     return { uid: cleanText(signUp.body.localId), email, created: true };
@@ -969,7 +969,7 @@ export async function provisionFirebaseIdentityForImport(
 ): Promise<FirebaseProvisionedIdentity> {
   const normalizedPassword = cleanText(password);
   if (normalizedPassword.length < 6) {
-    throw new Error('Mã học sinh phải có ít nhất 6 ký tự để dùng làm mật khẩu Firebase.');
+    throw new Error('Mã học sinh phải có ít nhất 6 ký tự để sử dụng làm mật khẩu.');
   }
   const email = firebaseInternalEmailForUsername(username);
 
@@ -977,7 +977,7 @@ export async function provisionFirebaseIdentityForImport(
   try {
     signIn = await identityToolkitRequest('signInWithPassword', { email, password: normalizedPassword });
   } catch {
-    throw new Error('Không kết nối được Firebase Authentication. Vui lòng kiểm tra Internet rồi nhập lại.');
+    throw new Error('Không thể kết nối dịch vụ đăng nhập. Vui lòng kiểm tra Internet rồi thử lại.');
   }
   if (signIn.response.ok && signIn.body.localId) {
     return {
@@ -995,7 +995,7 @@ export async function provisionFirebaseIdentityForImport(
   try {
     signUp = await identityToolkitRequest('signUp', { email, password: normalizedPassword });
   } catch {
-    throw new Error('Không kết nối được Firebase Authentication. Vui lòng kiểm tra Internet rồi nhập lại.');
+    throw new Error('Không thể kết nối dịch vụ đăng nhập. Vui lòng kiểm tra Internet rồi thử lại.');
   }
   if (signUp.response.ok && signUp.body.localId) {
     return {
@@ -1011,15 +1011,15 @@ export async function provisionFirebaseIdentityForImport(
 
 export async function getFirebaseIdToken(forceRefresh = true) {
   const currentUser = firebaseAuth.currentUser;
-  if (!currentUser) throw new Error('Phiên Firebase không còn tồn tại. Vui lòng đăng nhập lại.');
+  if (!currentUser) throw new Error('Phiên đăng nhập không còn hiệu lực. Vui lòng đăng nhập lại.');
   return currentUser.getIdToken(forceRefresh);
 }
 
 export async function updateOwnFirebasePassword(newPassword: string) {
   const currentUser = firebaseAuth.currentUser;
-  if (!currentUser) throw new Error('Phiên Firebase không còn tồn tại. Vui lòng đăng nhập lại.');
+  if (!currentUser) throw new Error('Phiên đăng nhập không còn hiệu lực. Vui lòng đăng nhập lại.');
   const normalized = String(newPassword || '').trim();
-  if (normalized.length < 6) throw new Error('Mật khẩu Firebase phải có ít nhất 6 ký tự.');
+  if (normalized.length < 6) throw new Error('Mật khẩu phải có ít nhất 6 ký tự.');
   await updatePassword(currentUser, normalized);
   return true;
 }
@@ -1098,7 +1098,7 @@ export async function loadFirebaseBaseCatalog(expectedFingerprint = ''): Promise
 
 export async function migrateBaseCatalogToFirestore(source: FirebaseBaseCatalogMigrationSource) {
   const currentUser = firebaseAuth.currentUser;
-  if (!currentUser) throw new Error('Cần đăng nhập bằng Firebase trước khi đồng bộ dữ liệu.');
+  if (!currentUser) throw new Error('Vui lòng đăng nhập lại trước khi thực hiện đồng bộ dữ liệu.');
   if (cleanText(source.school_id) !== FIREBASE_SCHOOL_ID) throw new Error('Mã trường trong dữ liệu đồng bộ không hợp lệ.');
   if (numberValue(source.schema_version) !== 1) throw new Error('Phiên bản dữ liệu đồng bộ chưa được hỗ trợ.');
   if (!source.school_years?.length || !source.classes?.length || !source.subjects?.length) {

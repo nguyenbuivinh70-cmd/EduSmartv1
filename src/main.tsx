@@ -1,125 +1,98 @@
+import { Component, type ErrorInfo, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
+import App from './App';
 import './index.css';
 
+const APP_VERSION = 'EduSmart V6.98.5';
 const rootElement = document.getElementById('root');
-const APP_VERSION = 'EduSmart V6.88.13 CompactLessonCardsReliableGemini';
-let hasMountedReactApp = false;
 
-function escapeHtml(value: string) {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
+declare global {
+  interface Window {
+    __EDUSMART_STARTUP_WATCHDOG__?: number;
+    __EDUSMART_SHOW_RECOVERY__?: () => void;
+  }
 }
 
-function clearOldSessionAndReload() {
+function clearStartupWatchdog() {
+  if (window.__EDUSMART_STARTUP_WATCHDOG__) {
+    window.clearTimeout(window.__EDUSMART_STARTUP_WATCHDOG__);
+    delete window.__EDUSMART_STARTUP_WATCHDOG__;
+  }
+}
+
+function resetLoginSessionAndReload() {
   try {
     localStorage.removeItem('user');
     localStorage.removeItem('aiConfig');
     sessionStorage.clear();
   } catch {
-    // ignore storage errors
+    // Storage may be unavailable in a restricted browser context.
   }
-  window.location.reload();
+  window.location.replace(`${window.location.pathname}?refresh=${Date.now()}`);
 }
 
-function renderStartupScreen(message = 'Đang khởi động giao diện học tập...') {
-  if (!rootElement || rootElement.dataset.eduReactMounted === '1') return;
-  rootElement.innerHTML = `
-    <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f1f5f9;padding:24px;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
-      <div style="max-width:520px;width:100%;background:#fff;border-radius:26px;padding:30px;text-align:center;box-shadow:0 22px 60px rgba(15,23,42,.16);border:1px solid #e2e8f0">
-        <div style="width:68px;height:68px;margin:0 auto;border-radius:22px;background:linear-gradient(135deg,#4f46e5,#d946ef);color:#fff;display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:900">E</div>
-        <h1 style="margin:20px 0 0;font-size:24px;color:#0f172a">EduSmart đang mở ứng dụng</h1>
-        <p style="margin:12px 0 0;color:#475569;line-height:1.7;font-size:14px">${escapeHtml(message)}</p>
-        <div style="margin:22px auto 0;width:220px;height:8px;background:#e2e8f0;border-radius:999px;overflow:hidden">
-          <div style="height:100%;width:45%;background:linear-gradient(90deg,#4f46e5,#d946ef);border-radius:999px;animation:eduPulse 1.15s infinite alternate"></div>
+function reloadApplication() {
+  window.location.replace(`${window.location.pathname}?refresh=${Date.now()}`);
+}
+
+function RecoveryView({ title = 'Ứng dụng chưa thể mở', message = 'Vui lòng tải lại trang để tiếp tục.' }: { title?: string; message?: string }) {
+  return (
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f1f5f9', padding: 24, fontFamily: "system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" }}>
+      <div style={{ maxWidth: 560, width: '100%', background: '#fff', borderRadius: 28, padding: 32, textAlign: 'center', boxShadow: '0 24px 70px rgba(15,23,42,.16)', border: '1px solid #e2e8f0' }}>
+        <div style={{ width: 68, height: 68, margin: '0 auto', borderRadius: 22, background: '#eef2ff', color: '#4f46e5', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 32, fontWeight: 900 }}>↻</div>
+        <h1 style={{ margin: '20px 0 0', fontSize: 24, color: '#0f172a' }}>{title}</h1>
+        <p style={{ margin: '12px 0 0', color: '#475569', lineHeight: 1.7, fontSize: 14 }}>{message}</p>
+        <div style={{ marginTop: 22, display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
+          <button type="button" onClick={reloadApplication} style={{ border: 'none', borderRadius: 14, background: '#4f46e5', color: '#fff', padding: '11px 16px', fontWeight: 800, cursor: 'pointer' }}>Tải lại ứng dụng</button>
+          <button type="button" onClick={resetLoginSessionAndReload} style={{ border: '1px solid #e2e8f0', borderRadius: 14, background: '#fff', color: '#334155', padding: '11px 16px', fontWeight: 800, cursor: 'pointer' }}>Đăng nhập lại</button>
         </div>
-        <style>@keyframes eduPulse{from{transform:translateX(-90%)}to{transform:translateX(235%)}}</style>
-        <p style="margin:16px 0 0;color:#94a3b8;font-size:12px">${APP_VERSION}</p>
+        <p style={{ margin: '16px 0 0', color: '#94a3b8', fontSize: 12 }}>{APP_VERSION}</p>
       </div>
-    </div>`;
+    </div>
+  );
 }
 
-function renderRecoveryScreen(error?: unknown) {
-  if (!rootElement) return;
-  const rawMessage = error instanceof Error ? `${error.name}: ${error.message}` : String(error || 'Lỗi hiển thị không xác định');
-  const message = escapeHtml(rawMessage);
-  rootElement.dataset.eduReactMounted = '0';
-  rootElement.innerHTML = `
-    <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f1f5f9;padding:24px;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
-      <div style="max-width:660px;width:100%;background:#fff;border-radius:28px;padding:30px;text-align:center;box-shadow:0 24px 70px rgba(15,23,42,.18);border:1px solid #e2e8f0">
-        <div style="width:68px;height:68px;margin:0 auto;border-radius:22px;background:#fff1f2;color:#e11d48;display:flex;align-items:center;justify-content:center;font-size:36px;font-weight:900">!</div>
-        <h1 style="margin:20px 0 0;font-size:24px;color:#0f172a">Ứng dụng cần khởi động lại</h1>
-        <p style="margin:12px 0 0;color:#475569;line-height:1.7;font-size:14px">Phiên bản mới gặp lỗi khi khởi tạo giao diện. Hãy tải lại ứng dụng. Nếu vẫn lỗi, hãy xóa phiên cũ để đăng nhập lại bằng dữ liệu mới.</p>
-        <div style="margin:16px 0 0;background:#f8fafc;border-radius:16px;padding:12px;text-align:left;color:#64748b;font-size:12px;word-break:break-word;max-height:140px;overflow:auto">${message}</div>
-        <div style="margin-top:22px;display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
-          <button id="edu-reload" style="border:none;border-radius:16px;background:#4f46e5;color:white;padding:12px 18px;font-weight:800;cursor:pointer">Tải lại ứng dụng</button>
-          <button id="edu-reset" style="border:1px solid #e2e8f0;border-radius:16px;background:white;color:#334155;padding:12px 18px;font-weight:800;cursor:pointer">Xóa phiên cũ</button>
-        </div>
-        <p style="margin:16px 0 0;color:#94a3b8;font-size:12px">${APP_VERSION}</p>
-      </div>
-    </div>`;
-  document.getElementById('edu-reload')?.addEventListener('click', () => window.location.reload());
-  document.getElementById('edu-reset')?.addEventListener('click', clearOldSessionAndReload);
-}
+class AppErrorBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
 
-function reportStartupError(error: unknown) {
-  console.error('EduSmart startup/runtime error:', error);
-  renderRecoveryScreen(error);
-}
-
-function withTimeout<T>(promise: Promise<T>, ms: number, timeoutMessage: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<T>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(timeoutMessage)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => {
-    if (timer) clearTimeout(timer);
-  });
-}
-
-window.addEventListener('error', (event) => {
-  if (!hasMountedReactApp || !rootElement?.children.length) {
-    reportStartupError(event.error || event.message);
-  } else {
-    console.error('EduSmart runtime error:', event.error || event.message);
+  static getDerivedStateFromError() {
+    return { failed: true };
   }
-});
 
-window.addEventListener('unhandledrejection', (event) => {
-  if (!hasMountedReactApp || !rootElement?.children.length) {
-    reportStartupError(event.reason);
-  } else {
-    console.error('EduSmart unhandled promise rejection:', event.reason);
+  componentDidCatch(error: unknown, info: ErrorInfo) {
+    console.error('[EduSmart][UI] Application render failed', error, info);
   }
-});
 
-async function bootstrap() {
+  render() {
+    if (this.state.failed) {
+      return <RecoveryView title="Ứng dụng cần được tải lại" message="Phiên làm việc chưa khởi tạo hoàn tất. Vui lòng tải lại ứng dụng hoặc đăng nhập lại để tiếp tục." />;
+    }
+    return this.props.children;
+  }
+}
+
+function mountApplication() {
   if (!rootElement) {
-    renderRecoveryScreen('Không tìm thấy phần tử root của ứng dụng.');
+    console.error('[EduSmart][BOOT] Missing root element');
     return;
   }
 
-  renderStartupScreen();
-
-  const slowStartupTimer = window.setTimeout(() => {
-    if (!hasMountedReactApp) {
-      renderStartupScreen('Ứng dụng đang nạp dữ liệu. Nếu màn hình đứng quá lâu, hãy bấm tải lại hoặc xóa phiên cũ ở bản vá mới.');
-    }
-  }, 7000);
+  clearStartupWatchdog();
+  rootElement.dataset.eduReactMounted = '1';
 
   try {
-    const { default: App } = await withTimeout(import('./App.tsx'), 30000, 'Tải giao diện quá lâu. Có thể Google AI Studio đang giữ cache phiên bản cũ hoặc file nguồn chưa được biên dịch xong.');
-    window.clearTimeout(slowStartupTimer);
-    rootElement.dataset.eduReactMounted = '1';
-    hasMountedReactApp = true;
-    createRoot(rootElement).render(<App />);
+    createRoot(rootElement).render(
+      <AppErrorBoundary>
+        <App />
+      </AppErrorBoundary>,
+    );
   } catch (error) {
-    window.clearTimeout(slowStartupTimer);
-    reportStartupError(error);
+    console.error('[EduSmart][BOOT] Mount failed', error);
+    rootElement.dataset.eduReactMounted = '0';
+    createRoot(rootElement).render(
+      <RecoveryView title="Ứng dụng chưa thể mở" message="Vui lòng tải lại ứng dụng. Nếu tình trạng vẫn tiếp diễn, hãy chọn “Đăng nhập lại”." />,
+    );
   }
 }
 
-void bootstrap();
+mountApplication();

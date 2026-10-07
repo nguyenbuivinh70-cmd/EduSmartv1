@@ -1640,7 +1640,7 @@ useEffect(() => {
           || getComputedSchoolYear();
         setAnalyticsSchoolYearFilter((prev) => prev || currentYear);
       } else if (!handleSessionError(schoolYearsRes.message)) {
-        showToast('Không tải được năm học từ Firebase. Dữ liệu đã lưu trên thiết bị vẫn được giữ nguyên.', 'info');
+        showToast('Chưa tải được danh sách năm học mới nhất. Dữ liệu hiện có vẫn được giữ nguyên.', 'info');
       }
 
       if (userConfigRes.ok && userConfigRes.data) {
@@ -1853,8 +1853,8 @@ useEffect(() => {
     const coldLoad = domains.some((domain) => !loadedDataDomainsRef.current.has(domain));
     const generation = ++menuLoadGenerationRef.current;
     const menuLabels: Record<string, string> = {
-      accounts: 'Đang tải tài khoản từ Firebase...',
-      lessons: 'Đang tải kho bài học từ Firebase...',
+      accounts: 'Đang tải danh sách tài khoản...',
+      lessons: 'Đang tải kho bài học...',
       learning: 'Đang tải bài học và tiến trình...',
       analytics: 'Đang tổng hợp dữ liệu học tập...',
       approvals: 'Đang tải danh sách chờ duyệt...',
@@ -3941,7 +3941,7 @@ useEffect(() => {
     setConfirmDialog({
       isOpen: true,
       title: 'Xóa bài ôn tập',
-      description: `Bạn có chắc muốn xóa bài ôn tập “${review.tieu_de}”? Kết quả ôn tập đã nộp vẫn có thể được giữ trong dữ liệu theo dõi nếu backend cấu hình lưu lịch sử.`,
+      description: `Bạn có chắc muốn xóa bài ôn tập “${review.tieu_de}”? Kết quả ôn tập đã nộp vẫn có thể được giữ trong lịch sử theo dõi.`,
       confirmLabel: 'Xóa bài ôn tập',
       cancelLabel: 'Hủy',
       variant: 'danger',
@@ -3965,7 +3965,7 @@ useEffect(() => {
     setConfirmDialog({
       isOpen: true,
       title: 'Lưu trữ an toàn bài học',
-      description: `Bài “${lesson.tieu_de}” sẽ được khóa và ẩn khỏi thư viện hoạt động. Hệ thống không quét/xóa hàng loạt tiến trình hoặc điểm học sinh, vì vậy không làm mất lịch sử và không gây lỗi quota. Số bài được giải phóng để có thể tạo lại.`,
+      description: `Bài “${lesson.tieu_de}” sẽ được khóa và ẩn khỏi thư viện hoạt động. Hệ thống giữ nguyên lịch sử học tập và điểm của học sinh. Bài học sẽ được đưa ra khỏi thư viện hoạt động để có thể tạo lại khi cần.`,
       confirmLabel: 'Lưu trữ bài học',
       cancelLabel: 'Hủy',
       variant: 'danger',
@@ -4047,7 +4047,7 @@ useEffect(() => {
         job = step.data;
         reflect(job);
         if (job.status === 'retryable') {
-          showToast('Tiến trình xóa tạm dừng. Hệ thống đã lưu vị trí hiện tại; hãy bấm Tiếp tục xóa khi quota/mạng ổn định.', 'error');
+          showToast('Tiến trình xóa đang tạm dừng. Hệ thống đã lưu trạng thái hiện tại; vui lòng tiếp tục khi kết nối ổn định.', 'error');
           return;
         }
         if (job.status === 'completed') {
@@ -4099,7 +4099,7 @@ useEffect(() => {
     setConfirmDialog({
       isOpen: true,
       title: mode === 'preserve_grades' ? 'Xóa vĩnh viễn – giữ lịch sử điểm' : 'Xóa vĩnh viễn – xóa toàn bộ dữ liệu',
-      description: `Bài “${lesson.tieu_de}” có khoảng ${total} bản ghi/tham chiếu liên quan (${studentRecords} dữ liệu học sinh). ${summary}. ${modeText} Hệ thống sẽ xóa theo batch nhỏ và có thể tiếp tục nếu quota hoặc mạng gián đoạn.`,
+      description: `Bài “${lesson.tieu_de}” có khoảng ${total} bản ghi/tham chiếu liên quan (${studentRecords} dữ liệu học sinh). ${summary}. ${modeText} Hệ thống sẽ xử lý theo từng bước và có thể tiếp tục nếu kết nối tạm thời gián đoạn.`,
       confirmLabel: mode === 'preserve_grades' ? 'Xóa và giữ điểm' : 'Xóa toàn bộ vĩnh viễn',
       cancelLabel: 'Hủy',
       variant: 'danger',
@@ -4509,7 +4509,7 @@ useEffect(() => {
     setConfirmDialog({
       isOpen: true,
       title: 'Xóa tài khoản',
-      description: `Bạn có chắc muốn xóa tài khoản “${account.ho_ten}” (${account.ten_dang_nhap})? Dữ liệu cá nhân như cấu hình AI, tiến trình, bình luận và kết quả ôn tập sẽ bị xóa. Bài học do tài khoản tạo và dữ liệu liên quan sẽ được dọn. Danh tính Firebase được xóa bằng mật khẩu hiện tại hoặc do bạn hoàn tất trong Firebase Console; tệp Drive chuyển vào Thùng rác.`,
+      description: `Bạn có chắc muốn xóa tài khoản “${account.ho_ten}” (${account.ten_dang_nhap})? Dữ liệu cá nhân, tiến trình, bình luận, kết quả ôn tập và các bài học liên quan sẽ được xử lý theo quyền quản trị hiện có. Nếu còn hạng mục cần xác nhận thêm, hệ thống sẽ thông báo riêng.`,
       confirmLabel: 'Xóa tài khoản',
       cancelLabel: 'Hủy',
       variant: 'danger',
@@ -4542,7 +4542,7 @@ useEffect(() => {
     setConfirmDialog({
       isOpen: true,
       title: `Xóa ${selectedAccounts.length} tài khoản đã chọn`,
-      description: `Bạn có chắc muốn xóa các tài khoản đã chọn: ${previewNames}${moreText}? Dữ liệu ứng dụng và bài học do các tài khoản tạo sẽ được dọn; tệp Drive chuyển vào Thùng rác. Danh tính Firebase cần được xóa bằng xác thực hoặc hoàn tất trong Firebase Console. Các tác vụ chưa hoàn tất có thể được thực hiện lại.`,
+      description: `Bạn có chắc muốn xóa các tài khoản đã chọn: ${previewNames}${moreText}? Dữ liệu và bài học liên quan đến các tài khoản đã chọn sẽ được xử lý theo quyền quản trị hiện có. Các hạng mục chưa hoàn tất sẽ được thông báo để có thể thực hiện lại.`,
       confirmLabel: 'Xóa các tài khoản đã chọn',
       cancelLabel: 'Hủy',
       variant: 'danger',
@@ -5452,17 +5452,17 @@ useEffect(() => {
         {isAnalyticsProgressLoading
           ? 'Đang tải tiến trình đúng phạm vi đã chọn...'
           : analyticsProgressError
-            ? 'Không tải được dữ liệu tiến độ mới nhất từ Firestore.'
+            ? 'Chưa tải được dữ liệu theo dõi mới nhất.'
             : analyticsHasServerScope
-              ? 'Đang dùng truy vấn theo phạm vi để tiết kiệm Firestore Spark.'
-              : 'Chưa tải tiến trình toàn trường để bảo vệ hạn mức Firestore Spark.'}
+              ? 'Dữ liệu đang được tải theo phạm vi đã chọn.'
+              : 'Hãy chọn phạm vi để xem dữ liệu theo dõi.'}
       </div>
       <p className="mt-1 text-xs leading-5 opacity-85">
         {analyticsProgressError
-          ? `${analyticsProgressError} Dữ liệu gần nhất được giữ nguyên; hệ thống không quy lỗi tải thành 0%.`
+          ? 'Dữ liệu gần nhất vẫn được giữ nguyên. Vui lòng làm mới và thử lại.'
           : analyticsHasServerScope
             ? 'Thay đổi Khối, Lớp hoặc Bài học sẽ chỉ tải nhóm dữ liệu cần thiết. Tiến độ video được làm mới tự động khoảng 60 giây khi màn hình này đang mở.'
-            : 'Hãy chọn ít nhất Khối, Lớp hoặc Bài học. Hệ thống sẽ không tự quét toàn bộ learningProgress khi chưa có phạm vi.'}
+            : 'Hãy chọn ít nhất Khối, Lớp hoặc Bài học để xem đúng nhóm dữ liệu cần thiết.'}
       </p>
     </div>
   );
@@ -6048,7 +6048,7 @@ useEffect(() => {
     <div className="space-y-6">
       <DataToolbar
         title="Quản trị lớp học"
-        description="Quản lý lớp trực tiếp trên Firebase, nhập/xuất Excel theo mẫu vnEdu và cập nhật giao diện ngay sau thao tác."
+        description="Quản lý lớp tập trung, hỗ trợ nhập/xuất Excel theo mẫu vnEdu và cập nhật dữ liệu ngay sau thao tác."
         searchValue={classQuery}
         onSearchChange={setClassQuery}
         searchPlaceholder="Tìm theo mã lớp hoặc tên lớp..."
@@ -6267,20 +6267,20 @@ useEffect(() => {
                 <div className="mt-5 grid gap-4 text-sm leading-7 text-slate-600">
                   <div className="rounded-2xl bg-slate-50 p-4">
                     <p className="font-semibold text-slate-900">Dữ liệu cốt lõi đã được kết nối</p>
-                    <p>Firestore là nguồn dữ liệu chính cho tài khoản, danh mục, bài học, tiến trình, bình luận, ôn tập và cấu hình hệ thống.</p>
+                    <p>Tài khoản, lớp học, môn học, bài học, tiến trình và các cấu hình được quản lý tập trung để dữ liệu luôn nhất quán.</p>
                   </div>
                   <div className="rounded-2xl bg-slate-50 p-4">
                     <p className="font-semibold text-slate-900">Quản trị nhanh trên một giao diện</p>
-                    <p>Apps Script chỉ còn xử lý tác vụ đặc quyền Firebase Authentication và một số luồng tương thích cũ được gọi riêng; dữ liệu màn hình không còn chờ Sheet/Drive khi khởi động.</p>
+                    <p>Các thao tác quản trị được tối ưu theo từng nhiệm vụ để màn hình tải nhanh và hạn chế gián đoạn khi sử dụng.</p>
                   </div>
                 </div>
               </div>
               <div className="rounded-[28px] bg-white p-8 shadow-sm ring-1 ring-slate-100">
-                <h2 className="text-xl font-bold text-slate-900">Vận hành theo gói Spark miễn phí</h2>
+                <h2 className="text-xl font-bold text-slate-900">Vận hành ổn định và tiết kiệm tài nguyên</h2>
                 <div className="mt-5 space-y-3 text-sm text-slate-600">
-                  <p>Không dùng Firebase Storage, Cloud Functions, TTL hoặc dịch vụ bắt buộc Blaze.</p>
-                  <p>Tệp nguồn chỉ xử lý tạm trên trình duyệt; JSON bài học được giới hạn 750 KB để bảo vệ giới hạn document.</p>
-                  <p>Truy vấn được giới hạn theo vai trò, lớp, bài học và người dùng nhằm giảm số lượt đọc Firestore.</p>
+                  <p>Hệ thống ưu tiên các thành phần cần thiết để vận hành ổn định và dễ bảo trì.</p>
+                  <p>Học liệu được xử lý an toàn và kiểm soát dung lượng để bảo đảm tốc độ sử dụng.</p>
+                  <p>Dữ liệu được tải đúng theo vai trò, lớp và bài học để tăng tốc độ phản hồi.</p>
                   {currentUserIsAdmin && (
                     <button
                       type="button"
@@ -6289,7 +6289,7 @@ useEffect(() => {
                       className="mt-2 inline-flex items-center gap-2 rounded-xl bg-slate-800 px-4 py-2.5 text-xs font-bold text-white shadow-sm transition hover:bg-slate-900 disabled:cursor-wait disabled:opacity-60"
                     >
                       <RefreshCw className={`h-4 w-4 ${isSubmitting ? 'animate-spin' : ''}`} />
-                      {isSubmitting ? 'Đang quét...' : 'Quét chẩn đoán dữ liệu hỗ trợ'}
+                      {isSubmitting ? 'Đang kiểm tra...' : 'Kiểm tra dữ liệu'}
                     </button>
                   )}
                 </div>
@@ -6302,7 +6302,7 @@ useEffect(() => {
                   <div className="flex items-start justify-between gap-4">
                     <div>
                       <h2 className="text-xl font-bold text-slate-900">Chẩn đoán dữ liệu hệ thống</h2>
-                      <p className="mt-2 text-sm leading-6 text-slate-500">Khối này quét lớp dữ liệu Google Sheet/legacy hỗ trợ để phát hiện nhanh các bản ghi lệch logic giữa tài khoản, lớp, môn, bài học và tiến trình học tập.</p>
+                      <p className="mt-2 text-sm leading-6 text-slate-500">Công cụ này rà soát các dữ liệu hỗ trợ để phát hiện sớm thông tin chưa đồng nhất giữa tài khoản, lớp, môn, bài học và tiến trình học tập.</p>
                     </div>
                     <div className={`rounded-2xl px-4 py-2 text-sm font-semibold ${systemDiagnostics.summary.total_issues > 0 ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700'}`}>
                       {systemDiagnostics.summary.total_issues > 0 ? `Có ${systemDiagnostics.summary.total_issues} vấn đề cần rà` : 'Dữ liệu đang ổn định'}
@@ -6452,7 +6452,7 @@ useEffect(() => {
                 <Settings className="h-10 w-10" />
               </div>
               <h1 className="text-2xl font-bold text-slate-900">Cấu hình Trợ lý AI</h1>
-              <p className="mt-2 text-slate-500">API Key được lưu trong tài liệu Firestore riêng, chỉ chính tài khoản đang đăng nhập có quyền đọc/ghi và có thể dùng lại trên thiết bị khác.</p>
+              <p className="mt-2 text-slate-500">Khóa truy cập AI được bảo vệ theo tài khoản đang đăng nhập và có thể sử dụng lại trên các thiết bị của cùng tài khoản.</p>
             </div>
 
             <div className="rounded-[28px] bg-white p-8 shadow-sm ring-1 ring-slate-100">
@@ -6546,7 +6546,7 @@ useEffect(() => {
       <Layout user={user} classes={classes} onLogout={handleLogout} activeMenu={activeMenu} setActiveMenu={setActiveMenu}>
         <Suspense fallback={<DataModuleSkeleton message="Đang tải mô-đun chức năng..." />}>
           {(isCoreDataLoading || isMenuDataLoading)
-            ? <DataModuleSkeleton message={isCoreDataLoading ? 'Đang đồng bộ danh mục cốt lõi từ Firebase...' : menuLoadingMessage} />
+            ? <DataModuleSkeleton message={isCoreDataLoading ? 'Đang cập nhật danh mục hệ thống...' : menuLoadingMessage} />
             : renderContent()}
         </Suspense>
       </Layout>
@@ -6948,11 +6948,11 @@ useEffect(() => {
                     <div className="h-full rounded-full bg-gradient-to-r from-rose-500 to-orange-500 transition-all duration-300" style={{ width: `${lessonPurgeProgress.status === 'completed' ? 100 : Math.min(99, Math.max(3, Math.round((lessonPurgeProgress.processed / Math.max(1, lessonPurgeProgress.total)) * 100)))}%` }} />
                   </div>
                   <p className="mt-3 text-sm font-bold text-slate-700">{lessonPurgeProgress.status === 'completed' ? 'Đã hoàn tất xóa vĩnh viễn.' : `Đang xử lý: ${lessonPurgePhaseLabel(lessonPurgeProgress.phase)}`}</p>
-                  <p className="mt-1 text-xs leading-5 text-slate-500">Tiến trình được lưu sau từng batch. Có thể tiếp tục nếu mạng hoặc quota Firestore gián đoạn.</p>
+                  <p className="mt-1 text-xs leading-5 text-slate-500">Tiến trình được lưu sau từng bước. Có thể tiếp tục nếu kết nối tạm thời gián đoạn.</p>
                 </div>
                 {lessonPurgeProgress.status === 'retryable' ? (
                   <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
-                    <b>Tiến trình đang tạm dừng.</b> {lessonPurgeProgress.error || 'Hãy thử lại khi kết nối/quota ổn định.'}
+                    <b>Tiến trình đang tạm dừng.</b> {lessonPurgeProgress.error || 'Vui lòng thử lại khi kết nối ổn định.'}
                   </div>
                 ) : null}
               </div>
@@ -6967,7 +6967,7 @@ useEffect(() => {
                 ) : lessonPurgeProgress.status === 'completed' ? (
                   <button type="button" onClick={() => setLessonPurgeProgress(null)} className="rounded-2xl bg-emerald-600 px-4 py-2.5 text-sm font-black text-white hover:bg-emerald-700">Hoàn tất</button>
                 ) : (
-                  <span className="inline-flex items-center gap-2 text-sm font-bold text-slate-500"><RefreshCw className="h-4 w-4 animate-spin" /> Đang xóa an toàn theo từng batch…</span>
+                  <span className="inline-flex items-center gap-2 text-sm font-bold text-slate-500"><RefreshCw className="h-4 w-4 animate-spin" /> Đang xóa an toàn theo từng bước…</span>
                 )}
               </div>
             </motion.div>

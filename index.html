@@ -4,27 +4,61 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="google" content="notranslate" />
+    <meta name="theme-color" content="#4f46e5" />
     <title>Hệ thống học tập thông minh</title>
     <style>
       html, body, #root { min-height: 100%; margin: 0; }
       @keyframes eduStartupPulse { from { transform: translateX(-90%); } to { transform: translateX(235%); } }
+      .edu-startup-button { border:0; border-radius:14px; padding:11px 16px; font-weight:800; cursor:pointer; font:inherit; }
+      .edu-startup-button-primary { background:#4f46e5; color:#fff; }
+      .edu-startup-button-secondary { background:#fff; color:#334155; border:1px solid #e2e8f0; }
     </style>
   </head>
   <body translate="no" class="notranslate">
     <div id="root" translate="no" class="notranslate">
-      <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f1f5f9;padding:24px;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+      <div id="edu-startup-shell" style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f1f5f9;padding:24px;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
         <div style="max-width:520px;width:100%;background:#fff;border-radius:26px;padding:30px;text-align:center;box-shadow:0 22px 60px rgba(15,23,42,.16);border:1px solid #e2e8f0">
           <div style="width:68px;height:68px;margin:0 auto;border-radius:22px;background:linear-gradient(135deg,#4f46e5,#d946ef);color:#fff;display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:900">E</div>
-          <h1 style="margin:20px 0 0;font-size:24px;color:#0f172a">EduSmart đang mở ứng dụng</h1>
-          <p style="margin:12px 0 0;color:#475569;line-height:1.7;font-size:14px">Đang tải giao diện. Nếu Google AI Studio biên dịch chậm, vui lòng chờ trong giây lát.</p>
+          <h1 style="margin:20px 0 0;font-size:24px;color:#0f172a">EduSmart đang khởi động</h1>
+          <p style="margin:12px 0 0;color:#475569;line-height:1.7;font-size:14px">Đang chuẩn bị không gian học tập. Vui lòng chờ trong giây lát.</p>
           <div style="margin:22px auto 0;width:220px;height:8px;background:#e2e8f0;border-radius:999px;overflow:hidden">
             <div style="height:100%;width:45%;background:linear-gradient(90deg,#4f46e5,#d946ef);border-radius:999px;animation:eduStartupPulse 1.15s infinite alternate"></div>
           </div>
-          <p style="margin:16px 0 0;color:#94a3b8;font-size:12px">EduSmart V6.98.4 Reliable Co-Learning & Accurate Preparation Rates</p>
+          <p style="margin:16px 0 0;color:#94a3b8;font-size:12px">EduSmart V6.98.5 · Reliable Startup & Professional UX</p>
         </div>
       </div>
     </div>
-    <noscript>Ứng dụng cần bật JavaScript để hoạt động.</noscript>
-    <script type="module" src="/src/main.tsx"></script>
+    <noscript>Vui lòng bật JavaScript để sử dụng EduSmart.</noscript>
+    <script>
+      (function () {
+        var root = document.getElementById('root');
+        function resetLoginSession() {
+          try {
+            localStorage.removeItem('user');
+            localStorage.removeItem('aiConfig');
+            sessionStorage.clear();
+          } catch (_) {}
+          location.replace(location.pathname + '?refresh=' + Date.now());
+        }
+        function reloadApp() {
+          location.replace(location.pathname + '?refresh=' + Date.now());
+        }
+        function showRecovery() {
+          if (!root || root.dataset.eduReactMounted === '1') return;
+          root.innerHTML = '<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f1f5f9;padding:24px;font-family:system-ui,-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif"><div style="max-width:560px;width:100%;background:#fff;border-radius:28px;padding:32px;text-align:center;box-shadow:0 24px 70px rgba(15,23,42,.16);border:1px solid #e2e8f0"><div style="width:68px;height:68px;margin:0 auto;border-radius:22px;background:#eef2ff;color:#4f46e5;display:flex;align-items:center;justify-content:center;font-size:32px;font-weight:900">↻</div><h1 style="margin:20px 0 0;font-size:24px;color:#0f172a">Ứng dụng chưa khởi động hoàn tất</h1><p style="margin:12px 0 0;color:#475569;line-height:1.7;font-size:14px">Vui lòng tải lại trang để tiếp tục. Nếu vẫn chưa vào được màn hình đăng nhập, hãy chọn “Đăng nhập lại”.</p><div style="margin-top:22px;display:flex;gap:12px;justify-content:center;flex-wrap:wrap"><button id="edu-startup-reload" class="edu-startup-button edu-startup-button-primary">Tải lại ứng dụng</button><button id="edu-startup-reset" class="edu-startup-button edu-startup-button-secondary">Đăng nhập lại</button></div><p style="margin:16px 0 0;color:#94a3b8;font-size:12px">Dữ liệu học tập đã lưu trên thiết bị không bị xóa.</p></div></div>';
+          document.getElementById('edu-startup-reload')?.addEventListener('click', reloadApp);
+          document.getElementById('edu-startup-reset')?.addEventListener('click', resetLoginSession);
+        }
+        window.__EDUSMART_SHOW_RECOVERY__ = showRecovery;
+        window.__EDUSMART_STARTUP_WATCHDOG__ = window.setTimeout(showRecovery, 15000);
+        window.addEventListener('error', function (event) {
+          if (root && root.dataset.eduReactMounted !== '1') {
+            var target = event.target;
+            if (target && target.tagName === 'SCRIPT') window.setTimeout(showRecovery, 100);
+          }
+        }, true);
+      })();
+    </script>
+    <script type="module" src="/src/main.tsx" onerror="window.__EDUSMART_SHOW_RECOVERY__ && window.__EDUSMART_SHOW_RECOVERY__()"></script>
   </body>
 </html>

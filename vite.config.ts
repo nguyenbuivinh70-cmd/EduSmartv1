@@ -4,6 +4,7 @@ import path from 'path';
 import {defineConfig} from 'vite';
 
 export default defineConfig(() => ({
+    base: '/',
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
@@ -16,6 +17,10 @@ export default defineConfig(() => ({
       hmr: process.env.DISABLE_HMR !== 'true',
     },
     build: {
+      outDir: 'dist',
+      assetsDir: 'assets',
+      emptyOutDir: true,
+      sourcemap: false,
       // ExcelJS chỉ tải khi người dùng nhập/xuất Excel; ngưỡng này tránh cảnh
       // báo sai ngữ cảnh cho chunk động mà không làm tăng tải khởi động.
       chunkSizeWarningLimit: 1000,

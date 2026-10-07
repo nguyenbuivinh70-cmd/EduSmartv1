@@ -44,7 +44,7 @@ export default function LoadingOverlay({ isLoading, message = 'Đang xử lý...
               <p className="mt-2 text-base font-black leading-6 text-slate-900 sm:text-lg">{message}</p>
               <div className="mt-5 flex items-start gap-3 rounded-2xl bg-slate-50 px-4 py-3 text-left text-xs leading-5 text-slate-600 ring-1 ring-slate-100">
                 <MonitorUp className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" />
-                <span>Vui lòng giữ màn hình này và không tải lại trang cho đến khi hệ thống hoàn tất thao tác.</span>
+                <span>Vui lòng chờ trong giây lát để hệ thống hoàn tất thao tác.</span>
               </div>
             </div>
           </motion.div>

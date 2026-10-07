@@ -11,7 +11,7 @@ function cleanMessage(value: unknown) {
   return String(value ?? '').replace(/\s+/g, ' ').trim();
 }
 
-const TECHNICAL_TOKEN = /(firestore|firebase|security rules?|rules\b|permission[- ]denied|resource[- ]exhausted|schema(?:version)?|owneruid|authuid|uid\b|document\b|collection\b|cloud shell|deploy\b|ruleset|identity toolkit|google oauth|\[[A-Z][A-Z0-9_]{3,}\])/i;
+const TECHNICAL_TOKEN = /(firestore|firebase|security rules?|rules\b|permission[- ]denied|resource[- ]exhausted|schema(?:version)?|owneruid|authuid|uid\b|document\b|collection\b|cloud shell|deploy\b|ruleset|identity toolkit|google oauth|api\b|backend|frontend|cache\b|outbox|localstorage|sessionstorage|http\s?\d{3}|stack trace|quota\b|spark\b|blaze\b|batch\b|google ai studio|netlify|\[[A-Z][A-Z0-9_]{3,}\])/i;
 
 export type UserMessageAudience = 'student' | 'staff' | 'generic';
 

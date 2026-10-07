@@ -3,6 +3,7 @@ import { motion } from 'motion/react';
 import { BookOpenCheck, Eye, EyeOff, Lock, LogIn, MessageCircleMore, User } from 'lucide-react';
 import { loginApi } from '../services/api';
 import { User as UserType } from '../types';
+import { professionalUserMessage } from '../utils/userMessages';
 
 interface LoginProps {
   onLoginSuccess: (user: UserType) => void;
@@ -18,21 +19,32 @@ export default function Login({ onLoginSuccess, setLoading, showToast }: LoginPr
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!email || !password) {
-      showToast('Vui lòng nhập đầy đủ thông tin', 'error');
+      showToast('Vui lòng nhập tài khoản và mật khẩu.', 'error');
       return;
     }
 
     setLoading(true);
-    const res = await loginApi(email.trim(), password);
-    setLoading(false);
-
-    if (res.ok && res.data) {
-      showToast('Đăng nhập thành công', 'success');
-      onLoginSuccess(res.data);
-      return;
+    try {
+      const res = await loginApi(email.trim(), password);
+      if (res.ok && res.data) {
+        showToast('Đăng nhập thành công', 'success');
+        onLoginSuccess(res.data);
+        return;
+      }
+      showToast(
+        professionalUserMessage(
+          res.message,
+          'Không thể đăng nhập. Vui lòng kiểm tra tài khoản, mật khẩu và thử lại.',
+          'generic',
+        ),
+        'error',
+      );
+    } catch (error) {
+      console.error('[EduSmart][LOGIN] Login request failed', error);
+      showToast('Chưa thể đăng nhập lúc này. Vui lòng kiểm tra kết nối và thử lại.', 'error');
+    } finally {
+      setLoading(false);
     }
-
-    showToast(res.message || 'Đăng nhập thất bại', 'error');
   };
 
   return (
