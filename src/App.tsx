@@ -4165,7 +4165,7 @@ useEffect(() => {
     showToast(nextLocked ? `Đã khóa “${lesson.tieu_de}” đối với Học tập và Đấu trường tri thức.` : `Đã mở khóa “${lesson.tieu_de}” cho Học tập và Đấu trường tri thức.`, 'success');
   };
 
-  const selfStudyClassOptionsForLesson = (lesson: Lesson) => {
+  const selfStudyClassOptionsForLesson = (lesson: LessonRow) => {
     if (lesson.lop_id) return classes.filter((item) => sameClassIdentity(item.lop_id, lesson.lop_id) || sameClassIdentity(item.ten_lop, lesson.lop_id));
     return classes
       .filter((item) => String(item.khoi || '').replace(/\.0+$/, '') === String(lesson.khoi || '').replace(/\.0+$/, ''))
@@ -5402,7 +5402,7 @@ useEffect(() => {
                     lesson={lesson}
                     onClick={() => openLesson(lesson)}
                     variant="library"
-                    highlight={index === 0 && activeMenu === 'learning'}
+                    highlight={false}
                     actions={renderLessonTileActions(lesson)}
                   />
                 ))}
@@ -5428,7 +5428,7 @@ useEffect(() => {
           ) : (
             <div className="lesson-management-grid">
               {items.map((lesson, index) => (
-                <LessonCard key={lesson.lesson_id} lesson={lesson} onClick={() => openLesson(lesson)} variant="compact" highlight={index === 0 && activeMenu === 'learning'} actions={renderLessonActionBar(lesson, true)} progress={user?.vai_tro === 'student' ? currentStudentProgressByLesson[lesson.lesson_id] || null : null} />
+                <LessonCard key={lesson.lesson_id} lesson={lesson} onClick={() => openLesson(lesson)} variant="compact" highlight={false} actions={renderLessonActionBar(lesson, true)} progress={user?.vai_tro === 'student' ? currentStudentProgressByLesson[lesson.lesson_id] || null : null} />
               ))}
             </div>
           )

@@ -8,7 +8,7 @@ import LessonResultSummary from './LessonResultSummary';
 import LearningChatPanel from './LearningChatPanel';
 import { getLessonContentApi, getTeachingSessionApi, saveTeachingSessionApi, setTeachingActivityAccessApi } from '../services/api';
 import { calculateFairAssessmentScore, calculateSectionProgress } from '../utils/learningScoreEngine';
-import { getFirebaseCurrentMemberClassId, subscribeFirebaseTeachingSession } from '../services/firebaseOperational';
+import { getFirebaseCurrentMemberClassId, subscribeFirebaseTeachingSession, subscribeFirebaseSubmittedResult } from '../services/firebaseOperational';
 import { isQuizQuestionQualityAcceptable, resolveCorrectOption, sanitizeQuizQuestion } from '../utils/quizSanitizer';
 import { professionalErrorMessage } from '../utils/userMessages';
 
@@ -677,6 +677,10 @@ export default function LessonViewer({
   const [finalSubmissionSyncState, setFinalSubmissionSyncState] = useState<FinalSubmissionSyncState>('idle');
   const [pendingFinalSubmission, setPendingFinalSubmission] = useState<LessonCloseSnapshot | null>(null);
   const finalSubmitPersistedRef = useRef('');
+  const sealedSubmissionRef = useRef<LessonCloseSnapshot | null>(null);
+  const submissionLockedRef = useRef(false);
+  const submitBusyRef = useRef(false);
+  const initializedViewerRef = useRef('');
   const [examAutoSubmitted, setExamAutoSubmitted] = useState(false);
   const [examElapsedSeconds, setExamElapsedSeconds] = useState(0);
   const [examAttemptNumber, setExamAttemptNumber] = useState(1);
@@ -715,7 +719,7 @@ export default function LessonViewer({
     setLiveContent(content);
   }, [content, lesson?.lesson_id]);
 
-  const isTeachingMode = currentUserRole !== 'student';
+  const isTeachingMode = currentUserRole === 'teacher' || currentUserRole === 'admin';
 
   const teachingClassOptions = useMemo(() => {
     const grade = String(lesson?.khoi || '').trim();
@@ -796,8 +800,15 @@ export default function LessonViewer({
   }, [isOpen, lesson?.lesson_id, teachingClassId, currentUserRole, currentUser?.user_id, attemptMode]);
 
   useEffect(() => {
+    if (!isOpen) { initializedViewerRef.current = ''; return; }
+    const viewerKey = `${lesson?.lesson_id}:${currentUser?.user_id || currentUserRole}:${attemptMode}:${retakeAttemptNumber || 0}`;
+    if (initializedViewerRef.current === viewerKey) return;
+    initializedViewerRef.current = viewerKey;
+    sealedSubmissionRef.current = null;
+    submissionLockedRef.current = false;
+    finalSubmitPersistedRef.current = '';
     if (isOpen) {
-      const storedAnswers = progress?.step_details?.luyen_tap?.quizAnswers || {};
+      const storedAnswers = isTeachingMode ? {} : progress?.step_details?.luyen_tap?.quizAnswers || {};
       const storedSections = progress?.step_details?.luyen_tap?.sectionProgress || {};
       const initialSectionProgress = sections.reduce<Record<string, SectionLearningProgress>>((acc, section) => {
         const existing = storedSections[section.section_id] as SectionLearningProgress | undefined;
@@ -813,11 +824,16 @@ export default function LessonViewer({
       setCommentInput('');
       setReplyInputs({});
       setSubmittingCommentId(null);
-      const storedFinalExam = progress?.step_details?.luyen_tap?.finalExam;
+      const storedFinalExam = isTeachingMode ? undefined : progress?.step_details?.luyen_tap?.finalExam;
       const storedExamStatus = String(storedFinalExam?.status || 'not_started');
       const storedSnapshot = Array.isArray(storedFinalExam?.question_snapshot) ? storedFinalExam?.question_snapshot || [] : [];
-      const storedExamSubmitted = ['submitted', 'auto_submitted', 'expired'].includes(storedExamStatus);
-      setExamStarted(['in_progress', 'submitted', 'auto_submitted', 'expired'].includes(storedExamStatus));
+      const storedExamSubmitted = !isTeachingMode && (['submitted', 'auto_submitted', 'expired'].includes(storedExamStatus) || (attemptMode === 'official' && progress?.score_status === 'finalized' && progress?.score_reason !== 'deadline_missed'));
+      submissionLockedRef.current = storedExamSubmitted;
+      if (storedExamSubmitted) sealedSubmissionRef.current = {
+        answered: Number(progress?.quiz_answered || 0), correct: Number(progress?.quiz_correct || 0), total: Number(progress?.quiz_total || 0),
+        answers: storedAnswers, sectionProgress: storedSections, finalExam: storedFinalExam || { status: 'submitted', score: progress?.assessment_score },
+      };
+      setExamStarted(storedExamSubmitted || ['in_progress', 'submitted', 'auto_submitted', 'expired'].includes(storedExamStatus));
       setExamSubmitted(storedExamSubmitted);
       setExamAutoSubmitted(storedExamStatus === 'auto_submitted' || storedExamStatus === 'expired');
       setFinalSubmissionSyncState(storedExamSubmitted && attemptMode === 'official' ? 'synced' : 'idle');
@@ -833,7 +849,7 @@ export default function LessonViewer({
       setAnswerStates(storedAnswers);
       setSectionProgress(initialSectionProgress);
     }
-  }, [isOpen, lesson?.lesson_id, sections, progress?.progress_id]);
+  }, [isOpen, lesson?.lesson_id, sections, progress?.progress_id, attemptMode, retakeAttemptNumber, currentUserRole]);
 
   // V6.90.1: nếu học sinh đã bấm Nộp nhưng Firestore chưa xác nhận, giữ nguyên
   // snapshot đã chấm trên thiết bị. F5/mở lại bài vẫn xem được điểm, đáp án và
@@ -857,6 +873,8 @@ export default function LessonViewer({
       setPendingFinalSubmission(null);
       return;
     }
+    sealedSubmissionRef.current = snapshot;
+    submissionLockedRef.current = true;
     setPendingFinalSubmission(snapshot);
     setFinalSubmissionSyncState('pending');
     setFinalExamSaveError('Kết quả đã được chấm nhưng chưa gửi được. Em vẫn xem được đầy đủ kết quả và có thể thử gửi lại.');
@@ -870,6 +888,47 @@ export default function LessonViewer({
     setAnswerStates(snapshot.answers || {});
     setSectionProgress(snapshot.sectionProgress || {});
   }, [isOpen, isStudentView, pendingFinalSubmissionStorageKey, attemptMode, progress?.score_status, progress?.step_details?.luyen_tap?.finalExam?.submitted_at, progress?.step_details?.luyen_tap?.finalExam?.status]);
+
+  useEffect(() => {
+    if (!isOpen || !isStudentView || attemptMode !== 'official' || !currentUser?.user_id || !lesson?.lesson_id) return;
+    return subscribeFirebaseSubmittedResult(currentUser.user_id, lesson.lesson_id, (result) => {
+      const detail = result.step_details?.luyen_tap;
+      submissionLockedRef.current = true;
+      const snapshot: LessonCloseSnapshot = {
+        answered: Number(result.quiz_answered || 0), correct: Number(result.quiz_correct || 0), total: Number(result.quiz_total || 0),
+        answers: detail?.quizAnswers || sealedSubmissionRef.current?.answers || {},
+        sectionProgress: detail?.sectionProgress || sealedSubmissionRef.current?.sectionProgress || {},
+        finalExam: detail?.finalExam || { status: 'submitted', score: result.assessment_score },
+      };
+      sealedSubmissionRef.current = snapshot;
+      setExamSubmitted(true); setExamStarted(true);
+      setAnswerStates(snapshot.answers); setSectionProgress(snapshot.sectionProgress);
+      if (snapshot.finalExam?.question_snapshot?.length) setExamQuestions(snapshot.finalExam.question_snapshot);
+      setExamElapsedSeconds(Number(snapshot.finalExam?.time_spent_seconds || 0));
+      setPendingFinalSubmission(null); setFinalSubmissionSyncState('synced');
+      clearPendingFinalSubmission(pendingFinalSubmissionStorageKey);
+    });
+  }, [isOpen, isStudentView, attemptMode, currentUser?.user_id, lesson?.lesson_id]);
+
+  useEffect(() => {
+    if (!isOpen || !isStudentView || !pendingFinalSubmissionStorageKey) return;
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== pendingFinalSubmissionStorageKey || !event.newValue) return;
+      const envelope = readPendingFinalSubmission(pendingFinalSubmissionStorageKey);
+      if (!envelope) return;
+      const snapshot = envelope.snapshot;
+      submissionLockedRef.current = true;
+      sealedSubmissionRef.current = snapshot;
+      setAnswerStates(snapshot.answers || {});
+      setSectionProgress(snapshot.sectionProgress || {});
+      if (snapshot.finalExam?.question_snapshot?.length) setExamQuestions(snapshot.finalExam.question_snapshot);
+      setExamStarted(true); setExamSubmitted(true);
+      setExamElapsedSeconds(Number(snapshot.finalExam?.time_spent_seconds || 0));
+      setPendingFinalSubmission(snapshot); setFinalSubmissionSyncState('pending');
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, [isOpen, isStudentView, pendingFinalSubmissionStorageKey]);
 
   const settings = effectiveContent?.settings || {} as any;
   const finalQuizSourceMode = settings.final_quiz_source_mode === 'random_bank' ? 'random_bank' : 'fixed';
@@ -911,6 +970,7 @@ export default function LessonViewer({
       acc[section.section_id] = {
         ...base,
         ...calculated,
+        ...(isTeachingMode ? { requiredSeconds: 0, status: answeredQuestionIds.length >= questionIds.length ? 'completed' as const : 'viewing' as const, completionPercent: questionIds.length ? Math.round(answeredQuestionIds.length / questionIds.length * 100) : 100 } : {}),
         answeredQuestionIds,
         interactionCount: answeredQuestionIds.length,
         correctCount,
@@ -919,13 +979,13 @@ export default function LessonViewer({
       };
       return acc;
     }, {});
-  }, [sections, sectionProgress, answerStates]);
+  }, [sections, sectionProgress, answerStates, isTeachingMode]);
 
   const completedSectionsCount = useMemo(() => (Object.values(computedSectionProgress) as SectionLearningProgress[]).filter((item) => item.status === 'completed').length, [computedSectionProgress]);
   const incompleteSectionTitles = useMemo(() => sections.filter((section) => computedSectionProgress[section.section_id]?.status !== 'completed').map((section) => section.title), [sections, computedSectionProgress]);
 
   useEffect(() => {
-    if (!isOpen || !activeStep || !sections.some((section) => section.section_id === activeStep)) return;
+    if (!isOpen || isTeachingMode || examSubmitted || !activeStep || !sections.some((section) => section.section_id === activeStep)) return;
     const section = sections.find((item) => item.section_id === activeStep)!;
     if (isSectionLockedForStudent(section)) return;
     setSectionProgress((prev) => {
@@ -959,7 +1019,7 @@ export default function LessonViewer({
   }, [isOpen, activeStep, sections, selfStudyMode, attemptMode, releasedActivitySignature]);
 
   useEffect(() => {
-    if (!isOpen || lessonTimedOut) return;
+    if (!isOpen || isTeachingMode || lessonTimedOut || examSubmitted) return;
     const interval = window.setInterval(() => {
       if (document.visibilityState !== 'visible') return;
       setLessonElapsedSeconds((value) => {
@@ -967,6 +1027,7 @@ export default function LessonViewer({
         if (settings.auto_finish_lesson_on_timeout !== false && next >= lessonTimeLimitSeconds) {
           setLessonTimedOut(true);
           if (examStarted && !examSubmitted) {
+            submissionLockedRef.current = true;
             setExamSubmitted(true);
             setExamAutoSubmitted(true);
           }
@@ -979,11 +1040,12 @@ export default function LessonViewer({
   }, [isOpen, lessonTimedOut, lessonTimeLimitSeconds, settings.auto_finish_lesson_on_timeout, examStarted, examSubmitted]);
 
   useEffect(() => {
-    if (!isOpen || !examStarted || examSubmitted) return;
+    if (!isOpen || isTeachingMode || !examStarted || examSubmitted) return;
     const interval = window.setInterval(() => {
       setExamElapsedSeconds((value) => {
         const next = value + 1;
         if (next >= examTimeLimitSeconds) {
+          submissionLockedRef.current = true;
           setExamSubmitted(true);
           setExamAutoSubmitted(true);
         }
@@ -994,7 +1056,7 @@ export default function LessonViewer({
   }, [isOpen, examStarted, examSubmitted, examTimeLimitSeconds]);
 
   useEffect(() => {
-    if (!isOpen || !examStarted || examSubmitted) return;
+    if (!isOpen || isTeachingMode || !examStarted || examSubmitted) return;
     const increment = (key: keyof typeof examSecurityEvents) => {
       setExamSecurityEvents((prev) => ({ ...prev, [key]: Number(prev[key] || 0) + 1 }));
     };
@@ -1043,7 +1105,9 @@ export default function LessonViewer({
   }, [allQuestions, allInteractiveQuestions, activeFinalQuiz, answerStates, examSubmitted]);
 
   const finalExamScore = useMemo(() => {
-    if (!metrics.finalTotal || !examSubmitted) return undefined;
+    if (!examSubmitted) return undefined;
+    if (Number.isFinite(Number(sealedSubmissionRef.current?.finalExam?.score))) return Number(sealedSubmissionRef.current!.finalExam!.score);
+    if (!metrics.finalTotal) return undefined;
     return Math.min(10, Math.max(0, (metrics.finalCorrect / metrics.finalTotal) * 10));
   }, [metrics.finalCorrect, metrics.finalTotal, examSubmitted]);
 
@@ -1057,7 +1121,7 @@ export default function LessonViewer({
     || (progress?.pre_lesson_completed_before_deadline === true ? 'prepared'
       : progress?.pre_lesson_status === 'completed' ? 'late_completed'
         : Number(progress?.pre_lesson_watch_percent || 0) > 0 ? 'in_progress' : 'not_started');
-  const allRequiredSectionsCompleted = sections.every((section) => computedSectionProgress[section.section_id]?.status === 'completed');
+  const allRequiredSectionsCompleted = isTeachingMode || sections.every((section) => computedSectionProgress[section.section_id]?.status === 'completed');
   const availableFinalQuizCount = finalQuizSourceMode === 'random_bank' ? questionBank.length : finalQuiz.length;
   const weightedAssessment = useMemo(() => calculateFairAssessmentScore({
     finalQuizScore: finalExamScore,
@@ -1066,10 +1130,10 @@ export default function LessonViewer({
     allRequiredSectionsCompleted,
   }), [finalExamScore, metrics.finalTotal, examSubmitted, allRequiredSectionsCompleted]);
   const score = weightedAssessment.finalScore ?? 0;
-  const finalQuizLockedForStudent = isStudentView && attemptMode !== 'review' && availableFinalQuizCount > 0 && !allRequiredSectionsCompleted;
+  const finalQuizLockedForStudent = isStudentView && !examSubmitted && attemptMode !== 'review' && availableFinalQuizCount > 0 && !allRequiredSectionsCompleted;
 
   useEffect(() => {
-    if (!allQuestions.length && !sections.length) return;
+    if (isTeachingMode || submissionLockedRef.current || examSubmitted || (!allQuestions.length && !sections.length)) return;
     onQuizMetricsChange?.('luyen_tap', {
       answered: metrics.answered,
       correct: metrics.correct,
@@ -1097,7 +1161,7 @@ export default function LessonViewer({
   }, [metrics.answered, metrics.correct, metrics.total, metrics.finalCorrect, metrics.finalTotal, answerStates, allQuestions.length, onQuizMetricsChange, computedSectionProgress, sections.length, examStarted, examSubmitted, examAutoSubmitted, examElapsedSeconds, finalExamTimeMinutes, score, finalExamScore, activeFinalQuiz, allInteractiveQuestions.length, examAttemptNumber, examSecurityEvents]);
 
   useEffect(() => {
-    if (sections.length > 0 && completedSectionsCount === sections.length) {
+    if (!isTeachingMode && sections.length > 0 && completedSectionsCount === sections.length) {
       onStepViewedComplete?.('hinh_thanh_kien_thuc');
     }
   }, [sections.length, completedSectionsCount, onStepViewedComplete]);
@@ -1175,9 +1239,9 @@ export default function LessonViewer({
     if (step === 'comments') return;
     const stage: LessonStageKey = step === 'final_quiz' ? 'luyen_tap' : step === 'result' ? 'tong_ket' : step === 'intro' ? 'khoi_dong' : 'hinh_thanh_kien_thuc';
     onStageChange?.(stage);
-    onStepOpened?.(stage);
-    if (step === 'intro') onStepViewedComplete?.('khoi_dong');
-    if (step === 'result' && incompleteSectionTitles.length === 0 && metrics.answered >= metrics.total) onStepViewedComplete?.('tong_ket');
+    if (!isTeachingMode) onStepOpened?.(stage);
+    if (!isTeachingMode && step === 'intro') onStepViewedComplete?.('khoi_dong');
+    if (!isTeachingMode && step === 'result' && incompleteSectionTitles.length === 0 && metrics.answered >= metrics.total) onStepViewedComplete?.('tong_ket');
   };
 
   useEffect(() => {
@@ -1188,6 +1252,7 @@ export default function LessonViewer({
   }, [activeStep, isOpen]);
 
   const handleAnswerStateChange = (payload: LessonQuestionAnswerState) => {
+    if (isStudentView && (submissionLockedRef.current || examSubmitted)) return;
     setAnswerStates((prev) => {
       const current = prev[payload.questionId];
       if (current && JSON.stringify(current) === JSON.stringify(payload)) return prev;
@@ -1263,6 +1328,7 @@ export default function LessonViewer({
   };
 
   const startFinalExam = () => {
+    if (isStudentView && (submissionLockedRef.current || examSubmitted)) return;
     if (finalQuizLockedForStudent) {
       goToFirstIncompleteSection();
       return;
@@ -1336,9 +1402,13 @@ export default function LessonViewer({
   };
 
   const persistSubmittedExam = async (autoSubmitted = false, snapshotOverride?: LessonCloseSnapshot, silent = false) => {
-    const snapshot = snapshotOverride || buildSubmittedExamSnapshot(autoSubmitted);
+    if (isTeachingMode || submitBusyRef.current) return false;
+    const snapshot = readPendingFinalSubmission(pendingFinalSubmissionStorageKey)?.snapshot || sealedSubmissionRef.current || snapshotOverride || buildSubmittedExamSnapshot(autoSubmitted);
+    sealedSubmissionRef.current = snapshot;
+    submissionLockedRef.current = true;
     const submitKey = `${examAttemptNumber}:${snapshot.finalExam?.submitted_at || ''}:${autoSubmitted ? 'auto' : 'manual'}`;
     if (finalSubmitPersistedRef.current && !autoSubmitted && !pendingFinalSubmission) return true;
+    submitBusyRef.current = true;
     const envelope: PendingFinalSubmissionEnvelope = {
       version: 1,
       saved_at: new Date().toISOString(),
@@ -1371,6 +1441,7 @@ export default function LessonViewer({
       setFinalExamSaveError(professionalErrorMessage(error, 'Điểm đã được chấm nhưng chưa gửi được. Em vẫn có thể xem kết quả chi tiết và thử gửi lại.'));
       return false;
     } finally {
+      submitBusyRef.current = false;
       setFinalExamSaving(false);
     }
   };
@@ -1384,6 +1455,7 @@ export default function LessonViewer({
   };
 
   const submitFinalExam = async (force = false) => {
+    if (isTeachingMode || submissionLockedRef.current || examSubmitted || submitBusyRef.current) return;
     if (finalQuizLockedForStudent) {
       setSubmitConfirmState(null);
       goToFirstIncompleteSection();
@@ -1398,12 +1470,22 @@ export default function LessonViewer({
     setExamAutoSubmitted(false);
     // V6.90.1: Nộp bài là một hành động chốt bài trên thiết bị. Học sinh được
     // xem điểm/kết quả ngay cả khi mạng hoặc Rules làm bước đồng bộ thất bại.
-    const snapshot = buildSubmittedExamSnapshot(false);
+    const snapshot = readPendingFinalSubmission(pendingFinalSubmissionStorageKey)?.snapshot || JSON.parse(JSON.stringify(buildSubmittedExamSnapshot(false))) as LessonCloseSnapshot;
+    submissionLockedRef.current = true;
+    sealedSubmissionRef.current = snapshot;
     setExamSubmitted(true);
     setPendingFinalSubmission(snapshot);
     const persisted = await persistSubmittedExam(false, snapshot, false);
     if (!persisted) setActiveStep('final_quiz');
   };
+
+  useEffect(() => {
+    if (!isStudentView || !examSubmitted || !examAutoSubmitted || sealedSubmissionRef.current) return;
+    const snapshot = JSON.parse(JSON.stringify(buildSubmittedExamSnapshot(true))) as LessonCloseSnapshot;
+    sealedSubmissionRef.current = snapshot;
+    submissionLockedRef.current = true;
+    void persistSubmittedExam(true, snapshot);
+  }, [examSubmitted, examAutoSubmitted, isStudentView]);
 
   // Retry nền ở tần suất thấp. Retry dùng silent để không tạo toast lỗi lặp lại.
   useEffect(() => {
@@ -1427,8 +1509,9 @@ export default function LessonViewer({
   }, [isOpen, finalSubmissionSyncState, pendingFinalSubmission, pendingFinalSubmissionStorageKey]);
 
   const retryFinalExam = () => {
+    if (isStudentView) return;
     if (settings.allow_exam_retry === false) return;
-    const maxAttempts = Math.max(1, Number(settings.max_exam_attempts || 2));
+    const maxAttempts = isStudentView ? 1 : Math.max(1, Number(settings.max_exam_attempts || 2));
     if (examAttemptNumber >= maxAttempts) return;
     const finalIds = activeFinalQuiz.map((question, index) => getQuestionKey(question, index + allInteractiveQuestions.length));
     setAnswerStates((prev) => {
@@ -1528,6 +1611,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
   };
 
   const renderSectionCompletionGuide = (section: LessonSectionV2, sp: SectionLearningProgress, timePercent: number, interactionPercent: number) => {
+    if (isTeachingMode) return null;
     const questionTotal = section.interactive_questions?.length || 0;
     const missingTime = Math.max(0, Number(sp.requiredSeconds || MIN_SECTION_SECONDS) - Number(sp.timeSpentSeconds || 0));
     const missingQuestions = Math.max(0, questionTotal - Number(sp.interactionCount || 0));
@@ -1615,7 +1699,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
             const sp = computedSectionProgress[section.section_id] || createSectionProgress(section);
             const done = sp.status === 'completed';
             if (isSectionLockedForStudent(section)) return <div key={section.section_id} className="rounded-2xl bg-slate-100 px-4 py-3 text-sm font-semibold text-slate-500"><LockKeyhole className="mr-2 inline h-4 w-4" /> {section.title} • Giáo viên chưa mở</div>;
-            return <div key={section.section_id} className={`rounded-2xl px-4 py-3 text-sm ${done ? 'bg-emerald-50 text-emerald-800' : 'bg-rose-50 text-rose-800'}`}>{done ? '✓' : '!' } {section.title} • {sp.timeSpentSeconds}/{sp.requiredSeconds}s • {sp.interactionCount}/{section.interactive_questions?.length || 0} câu{done ? ' • Hoàn thành' : ''}</div>;
+            return <div key={section.section_id} className={`rounded-2xl px-4 py-3 text-sm ${done ? 'bg-emerald-50 text-emerald-800' : 'bg-rose-50 text-rose-800'}`}>{done ? '✓' : '!' } {section.title} • {!isTeachingMode ? `${sp.timeSpentSeconds}/${sp.requiredSeconds}s • ` : ''}{sp.interactionCount}/{section.interactive_questions?.length || 0} câu{done ? ' • Hoàn thành' : ''}</div>;
           })}
         </div>
       </section>
@@ -1672,7 +1756,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
             <h3 className="mt-3 text-xl font-black leading-tight text-slate-900 sm:mt-4 sm:text-2xl">{section.title}</h3>
             {currentUserRole === 'student' ? (
               <>
-                <p className="mt-2 text-[10px] font-semibold uppercase leading-5 tracking-[0.11em] text-slate-500 sm:mt-3 sm:text-xs sm:tracking-[0.15em]">Thời gian học: {sp.timeSpentSeconds}/{sp.requiredSeconds} giây • Tương tác: {sp.interactionCount}/{section.interactive_questions?.length || 0} câu</p>
+                {!isTeachingMode ? <p className="mt-2 text-xs font-semibold text-slate-500">Thời gian học: {sp.timeSpentSeconds}/{sp.requiredSeconds} giây • Tương tác: {sp.interactionCount}/{section.interactive_questions?.length || 0} câu</p> : null}
                 <div className="mt-3 overflow-hidden rounded-full bg-white/80 shadow-inner"><div className={`h-2.5 rounded-full transition-all ${isComplete ? 'bg-emerald-500' : needsWork ? 'bg-rose-500' : 'bg-amber-400'}`} style={{ width: `${sectionPercent}%` }} /></div>
                 {renderSectionCompletionGuide(section, sp, timePercent, interactionPercent)}
                 <div className="mt-3 flex gap-2 overflow-x-auto pb-1 sm:mt-4 sm:flex-wrap sm:overflow-visible sm:pb-0">
@@ -1736,10 +1820,10 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
         </section>
         <section className={`rounded-[22px] p-4 shadow-sm ring-1 sm:rounded-[28px] sm:p-6 ${isComplete ? 'bg-white ring-emerald-100' : 'bg-white ring-rose-100'}`}>
           <h4 className="mb-4 flex items-center gap-2 font-black text-slate-900"><CheckCircle2 className="h-5 w-5 text-indigo-500" /> Câu hỏi tương tác</h4>
-          {!isComplete ? <div className="mb-4 rounded-2xl bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-700">Hãy đọc đủ thời gian và hoàn thành câu hỏi để mục này chuyển sang dấu check xanh.</div> : null}
+          {!isTeachingMode && !isComplete ? <div className="mb-4 rounded-2xl bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-700">Hãy đọc đủ thời gian và hoàn thành câu hỏi để mục này chuyển sang dấu check xanh.</div> : null}
           <div className="space-y-4">
             {(section.interactive_questions || []).length ? section.interactive_questions.map((question, qIndex) => (
-              <InteractiveQuestionCard key={getQuestionKey(question, qIndex)} question={question} index={qIndex} initialAnswer={answerStates[getQuestionKey(question, qIndex)] || null} onAnswerStateChange={handleAnswerStateChange} onAskAI={(prompt, displayText) => handleAskLessonAI(`Mục đang học: “${section.title}”. Nội dung bắt buộc của mục: “${cleanText(section.content || section.summary || section.source_note || '').slice(0, 1200)}”. Câu hỏi hiện tại thuộc đúng mục này. ${prompt}`, displayText || 'Hỏi AI về câu này')} />
+              <InteractiveQuestionCard key={getQuestionKey(question, qIndex)} question={question} index={qIndex} teachingMode={isTeachingMode} readOnly={isStudentView && examSubmitted} initialAnswer={answerStates[getQuestionKey(question, qIndex)] || null} onAnswerStateChange={handleAnswerStateChange} onAskAI={(prompt, displayText) => handleAskLessonAI(`Mục đang học: “${section.title}”. Nội dung bắt buộc của mục: “${cleanText(section.content || section.summary || section.source_note || '').slice(0, 1200)}”. Câu hỏi hiện tại thuộc đúng mục này. ${prompt}`, displayText || 'Hỏi AI về câu này')} />
             )) : <p className="text-sm text-slate-500">Chưa có câu hỏi tương tác.</p>}
           </div>
         </section>
@@ -1748,11 +1832,21 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
   };
 
   const renderFinalQuiz = () => {
+    if (isTeachingMode) {
+      const teachingQuestions = finalQuizSourceMode === 'random_bank' && questionBank.length ? questionBank : finalQuiz;
+      return <section className="space-y-4 rounded-[28px] bg-white p-5">
+        <h3 className="text-2xl font-black text-slate-900">Kiểm tra cuối bài • Giảng dạy</h3>
+        <p className="rounded-2xl bg-indigo-50 p-4 text-sm text-indigo-800">Không giới hạn thời gian. Chọn câu trả lời rồi bấm Chốt đáp án để trình bày lời giải.</p>
+        {teachingQuestions.map((question, index) => <InteractiveQuestionCard key={getQuestionKey(question, index + allInteractiveQuestions.length)} question={question} index={index} teachingMode disableAI initialAnswer={answerStates[getQuestionKey(question, index + allInteractiveQuestions.length)] || null} onAnswerStateChange={handleAnswerStateChange} />)}
+        {!teachingQuestions.length ? <p>Chưa có câu hỏi kiểm tra cuối bài.</p> : null}
+      </section>;
+    }
+
     const finalAnsweredCount = activeFinalQuiz.filter((question, index) => answerStates[getQuestionKey(question, index + allInteractiveQuestions.length)]?.submitted).length;
     const finalUnansweredCount = Math.max(0, activeFinalQuiz.length - finalAnsweredCount);
     const securityTotal = Object.values(examSecurityEvents).reduce<number>((sum, value) => sum + Number(value || 0), 0);
-    const maxAttempts = Math.max(1, Number(settings.max_exam_attempts || 2));
-    const canRetryExam = settings.allow_exam_retry !== false && examSubmitted && examAttemptNumber < maxAttempts && !['pending', 'syncing'].includes(finalSubmissionSyncState);
+    const maxAttempts = isStudentView ? 1 : Math.max(1, Number(settings.max_exam_attempts || 2));
+    const canRetryExam = !isStudentView && settings.allow_exam_retry !== false && examSubmitted && examAttemptNumber < maxAttempts && !['pending', 'syncing'].includes(finalSubmissionSyncState);
 
     const scrollToExamQuestion = (questionIndex: number) => {
       setFocusedExamIndex(questionIndex);
@@ -2000,6 +2094,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                       onAnswerStateChange={handleAnswerStateChange}
                       disableAI
                       disableReset
+                      readOnly={isStudentView && examSubmitted}
                       hideFeedback={!examSubmitted || settings.show_final_answers_after_submit === false}
                       examMode
                     />
@@ -2015,7 +2110,13 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
   };
 
 
-  const renderResult = () => (
+  const renderResult = () => isTeachingMode ? (
+    <div className="rounded-3xl bg-white p-6 text-slate-800">
+      <h3 className="text-xl font-black">Tổng kết giảng dạy</h3>
+      <p className="mt-3">Đã trình bày {completedSectionsCount}/{sections.length} mục. Thao tác minh họa không ghi vào điểm học sinh.</p>
+      <button type="button" onClick={() => selectStep('final_quiz')} className="mt-4 rounded-xl bg-indigo-600 px-4 py-2 font-bold text-white">Trình bày câu hỏi cuối bài</button>
+    </div>
+  ) : (
     <div className="space-y-4">
       {examSubmitted && finalSubmissionSyncState === 'pending' ? (
         <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-900">
@@ -2229,7 +2330,7 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
           question_bank_mode: finalQuizSourceMode,
         },
       };
-      await onClose(snapshot);
+      await onClose(isTeachingMode ? undefined : sealedSubmissionRef.current || snapshot);
     } finally {
       setClosingLesson(false);
     }
@@ -2254,12 +2355,13 @@ Không dùng lại nguyên văn câu hỏi đã có nếu có thể tạo câu h
                 </div>
               </div>
               <div className="flex shrink-0 items-center gap-1.5 sm:gap-3">
+                {isTeachingMode ? <span className="rounded-xl bg-white/15 px-3 py-2 text-xs font-bold">Giảng dạy • Không giới hạn</span> : null}
                 {currentUserRole === 'student' && coLearningGroupSize > 1 && onManageCoLearning && !(activeStep === 'final_quiz' && examStarted) ? (
                   <button type="button" onClick={onManageCoLearning} className="hidden min-h-10 items-center gap-2 rounded-xl bg-white/15 px-3 py-2 text-xs font-black text-white ring-1 ring-white/15 hover:bg-white/20 sm:inline-flex" title="Thêm hoặc bỏ bạn học cùng">
                     <Users className="h-4 w-4" /> Nhóm {coLearningGroupSize}
                   </button>
                 ) : null}
-                {!(activeStep === 'final_quiz' && examStarted) ? (
+                {!isTeachingMode && !(activeStep === 'final_quiz' && examStarted) ? (
                   <div className={`flex min-h-10 items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-black shadow-lg ring-1 sm:gap-2 sm:rounded-2xl sm:px-4 sm:py-2 ${lessonRemainingSeconds <= 300 ? 'bg-amber-400 text-white ring-white/30' : 'bg-white/20 text-white ring-white/20'}`}>
                     <TimerReset className="h-4 w-4 sm:h-5 sm:w-5" />
                     <span className="leading-tight">

@@ -682,6 +682,7 @@ export interface LessonPresentationPage {
 
 export interface LessonActivityV3 {
   activity_id: string;
+  requirement_ids?: string[];
   title: string;
   objective?: string;
   activity_type?: LessonActivityType;
@@ -768,6 +769,17 @@ export interface LessonAssessmentV2 {
 
 export interface LessonMetadata {
   tieu_de: string;
+  curriculum_program?: string;
+  curriculum_version?: string;
+  textbook_series?: string;
+  textbook_catalog_version?: string;
+  textbook_lesson_id?: string;
+  textbook_lesson_code?: string;
+  textbook_topic_id?: string;
+  curriculum_requirement_ids?: string[];
+  curriculum_requirements?: Array<{ id: string; text: string; competency?: string; source_kind?: 'official_normalized' | 'normalized_profile'; source_url?: string }>;
+  curriculum_source_url?: string;
+  textbook_source_url?: string;
   lesson_number?: number;
   lesson_name?: string;
   mon_hoc?: string;
@@ -792,6 +804,8 @@ export interface LessonKnowledgeUnit {
 
 export interface QuizQuestion {
   id?: string;
+  requirement_ids?: string[];
+  assessment_evidence?: string;
   type?: QuizQuestionType;
   question: string;
   options?: string[];
@@ -926,7 +940,18 @@ export interface GoogleSlidesPromptSaveResponse {
 export interface GoogleSlidesPromptDetailResponse extends GoogleSlidesPromptSaveResponse {}
 
 export interface LessonComposerValues {
+  client_creation_id?: string;
   lesson_id?: string;
+  lesson_source_mode?: 'catalog' | 'custom';
+  textbook_series?: string;
+  textbook_catalog_version?: string;
+  textbook_lesson_id?: string;
+  textbook_lesson_code?: string;
+  textbook_topic_id?: string;
+  curriculum_program?: string;
+  curriculum_version?: string;
+  curriculum_requirement_ids?: string[];
+  curriculum_override_confirmed?: boolean;
   tieu_de: string;
   lesson_number?: number;
   lesson_name: string;
@@ -1264,6 +1289,8 @@ export interface ScoreTrackingConfig {
 }
 
 export interface StudentLearningAnalyticsRow {
+  completed_at?: string;
+  final_exam_submitted_at?: string;
   user_id: string;
   /** Firebase Auth UID nếu dữ liệu đến từ Firestore canonical/preparation submission. */
   ownerUid?: string;

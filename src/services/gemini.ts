@@ -14,18 +14,93 @@ import {
 } from '../types';
 import { isQuizQuestionQualityAcceptable, sanitizeQuizQuestion } from '../utils/quizSanitizer';
 import { AI_MODELS, normalizeGeminiModelName } from '../constants';
+import { CURRICULUM_PROGRAM, CURRICULUM_REFERENCE_URL, CURRICULUM_VERSION, TEXTBOOK_CATALOG_VERSION, TEXTBOOK_SERIES_KNTT, getCurriculumRequirementsByIds, getSubjectAssessmentGuidance, getTextbookCatalogVersion, getTextbookLessonById, getTextbookReferenceUrl } from '../data/curriculum/registry';
+import { completeCurriculumReferences, normalizeCurriculumAlignment } from '../utils/curriculumAlignment';
 
 
-// V6.98.6: Production-safe Gemini request layer.
+// V6.98.7: Production-safe Gemini request layer.
 // Google documents 429/5xx (especially 503 UNAVAILABLE/high demand) as transient
 // conditions that should be retried with exponential backoff. On a deployed web
 // app we also fail over to another compatible Flash model so a temporary capacity
 // spike on one model does not block lesson creation.
 const GEMINI_RUNTIME_HINT_TTL_MS = 10 * 60 * 1000;
+const GEMINI_DEFAULT_TOTAL_TIMEOUT_MS = 120 * 1000;
+const GEMINI_DEFAULT_ATTEMPT_TIMEOUT_MS = 55 * 1000;
 const geminiRuntimeModelHints = new Map<string, { model: string; expiresAt: number }>();
+const GEMINI_MODEL_CATALOG_TTL_MS = 15 * 60 * 1000;
+const geminiAvailableModelCache = new Map<string, { models: string[]; expiresAt: number }>();
 
-function waitFor(ms: number) {
-  return new Promise<void>((resolve) => globalThis.setTimeout(resolve, ms));
+type ReliableGeminiOptions = {
+  allowFallback?: boolean;
+  label?: string;
+  signal?: AbortSignal;
+  totalTimeoutMs?: number;
+  attemptTimeoutMs?: number;
+  maxCandidates?: number;
+  primaryAttempts?: number;
+};
+
+function waitFor(ms: number, signal?: AbortSignal) {
+  if (!signal) return new Promise<void>((resolve) => globalThis.setTimeout(resolve, ms));
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      const error = new Error('AI_REQUEST_CANCELLED');
+      (error as any).name = 'AbortError';
+      reject(error);
+      return;
+    }
+    const timer = globalThis.setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      globalThis.clearTimeout(timer);
+      const error = new Error('AI_REQUEST_CANCELLED');
+      (error as any).name = 'AbortError';
+      reject(error);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function createGeminiTimeoutError(label: string, timeoutMs: number) {
+  const error = new Error(`EDUSMART_AI_TIMEOUT:${label}:${timeoutMs}`);
+  (error as any).name = 'GeminiTimeoutError';
+  (error as any).code = 'EDUSMART_AI_TIMEOUT';
+  return error;
+}
+
+function isGeminiAbortError(error: unknown) {
+  const value = error as any;
+  return value?.name === 'AbortError' || /AI_REQUEST_CANCELLED/i.test(String(value?.message || ''));
+}
+
+async function runGeminiBounded<T>(operation: () => Promise<T>, timeoutMs: number, label: string, signal?: AbortSignal): Promise<T> {
+  if (signal?.aborted) {
+    const error = new Error('AI_REQUEST_CANCELLED');
+    (error as any).name = 'AbortError';
+    throw error;
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (fn: (value: any) => void, value: any) => {
+      if (settled) return;
+      settled = true;
+      globalThis.clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      fn(value);
+    };
+    const timer = globalThis.setTimeout(() => finish(reject, createGeminiTimeoutError(label, timeoutMs)), Math.max(1000, timeoutMs));
+    const onAbort = () => {
+      const error = new Error('AI_REQUEST_CANCELLED');
+      (error as any).name = 'AbortError';
+      finish(reject, error);
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve()
+      .then(operation)
+      .then((value) => finish(resolve, value), (error) => finish(reject, error));
+  });
 }
 
 function geminiErrorText(error: unknown) {
@@ -39,8 +114,6 @@ function geminiErrorText(error: unknown) {
   ].filter(Boolean).map((item) => String(item));
   const joined = parts.join(' | ').trim();
   if (!joined) return 'UNKNOWN_GEMINI_ERROR';
-  // SDK errors sometimes put the complete API JSON in message. Extract its
-  // human message only for diagnostics; raw payload is never shown to users.
   try {
     const firstBrace = joined.indexOf('{');
     const lastBrace = joined.lastIndexOf('}');
@@ -64,6 +137,7 @@ function geminiHttpStatus(error: unknown) {
 }
 
 function isGeminiTransientError(error: unknown) {
+  if ((error as any)?.code === 'EDUSMART_AI_TIMEOUT') return true;
   const status = geminiHttpStatus(error);
   const text = geminiErrorText(error).toLowerCase();
   return [408, 429, 500, 502, 503, 504].includes(status)
@@ -77,6 +151,12 @@ function isGeminiModelUnavailable(error: unknown) {
 }
 
 function safeGeminiUserError(error: unknown) {
+  if (isGeminiAbortError(error)) {
+    return new Error('Đã dừng tạo bài học. Học liệu và cấu hình hiện tại vẫn được giữ nguyên.');
+  }
+  if ((error as any)?.code === 'EDUSMART_AI_TIMEOUT' || /EDUSMART_AI_TIMEOUT/i.test(String((error as any)?.message || ''))) {
+    return new Error('Dịch vụ AI phản hồi quá chậm nên hệ thống đã dừng yêu cầu để tránh treo màn hình. Hãy bấm tạo lại; học liệu và cấu hình hiện tại vẫn được giữ nguyên.');
+  }
   const status = geminiHttpStatus(error);
   const text = geminiErrorText(error).toLowerCase();
   if (status === 503 || /high demand|overload|decode_preempted|service.+unavailable/.test(text)) {
@@ -104,58 +184,260 @@ function geminiModelCandidates(requestedModel: string, allowFallback = true) {
   if (hint && hint.expiresAt <= Date.now()) geminiRuntimeModelHints.delete(requested);
   if (!allowFallback) return [requested];
 
-  // Favor reliable Flash variants for interactive production workloads. The
-  // user's chosen model is always attempted; fallback is temporary and does not
-  // overwrite the saved account configuration.
+  // V6.98.7: chỉ ưu tiên các Flash production phù hợp cho luồng tạo bài trên web.
+  // Giảm số model thử nối tiếp để một model quá tải không biến thành trạng thái
+  // "đang tạo" kéo dài nhiều phút trên Netlify.
   const productionFallbacks = [
+    'gemini-3.8-flash',
     'gemini-3.5-flash',
     'gemini-3.5-flash-lite',
     'gemini-3.1-flash-lite',
-    'gemini-2.5-flash',
-    'gemini-2.5-flash-lite',
   ];
-  return Array.from(new Set([hinted, requested, ...productionFallbacks, ...AI_MODELS].filter(Boolean))).slice(0, 6);
+  return Array.from(new Set([hinted, requested, ...productionFallbacks, ...AI_MODELS].filter(Boolean)));
 }
 
 async function generateContentReliable(
   ai: GoogleGenAI,
   requestedModel: string,
   request: any,
-  options: { allowFallback?: boolean; label?: string } = {},
+  options: ReliableGeminiOptions = {},
 ): Promise<any> {
   const allowFallback = options.allowFallback !== false;
   const requested = normalizeGeminiModelName(requestedModel);
-  const candidates = geminiModelCandidates(requested, allowFallback);
+  const candidates = geminiModelCandidates(requested, allowFallback).slice(0, Math.max(1, options.maxCandidates || 4));
+  const totalTimeoutMs = Math.max(15_000, options.totalTimeoutMs || GEMINI_DEFAULT_TOTAL_TIMEOUT_MS);
+  const attemptTimeoutMs = Math.max(10_000, options.attemptTimeoutMs || GEMINI_DEFAULT_ATTEMPT_TIMEOUT_MS);
+  const deadlineAt = Date.now() + totalTimeoutMs;
   let lastError: unknown = null;
 
   for (let modelIndex = 0; modelIndex < candidates.length; modelIndex += 1) {
+    if (options.signal?.aborted) throw safeGeminiUserError(Object.assign(new Error('AI_REQUEST_CANCELLED'), { name: 'AbortError' }));
     const candidate = candidates[modelIndex];
-    const maxAttempts = modelIndex === 0 ? 2 : 1;
+    const maxAttempts = modelIndex === 0 ? Math.max(1, options.primaryAttempts || 2) : 1;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 1000) throw safeGeminiUserError(createGeminiTimeoutError(options.label || 'generateContent', totalTimeoutMs));
       try {
-        const response = await ai.models.generateContent({ ...request, model: candidate });
+        const response = await runGeminiBounded(
+          () => ai.models.generateContent({ ...request, model: candidate }),
+          Math.min(attemptTimeoutMs, remainingMs),
+          `${options.label || 'generateContent'}:${candidate}`,
+          options.signal,
+        );
         geminiRuntimeModelHints.set(requested, { model: candidate, expiresAt: Date.now() + GEMINI_RUNTIME_HINT_TTL_MS });
-        if (candidate !== requested) {
-          console.info(`[EduSmart][AI] ${options.label || 'generateContent'} recovered with fallback model ${candidate}.`);
-        }
+        if (candidate !== requested) console.info(`[EduSmart][AI] ${options.label || 'generateContent'} recovered with fallback model ${candidate}.`);
         return response;
       } catch (error) {
+        if (isGeminiAbortError(error)) throw safeGeminiUserError(error);
         lastError = error;
         const transient = isGeminiTransientError(error);
         const modelUnavailable = isGeminiModelUnavailable(error);
         console.warn(`[EduSmart][AI] ${options.label || 'generateContent'} failed on ${candidate} (attempt ${attempt + 1}/${maxAttempts}).`, error);
         if (!transient && !modelUnavailable) throw safeGeminiUserError(error);
         if (transient && attempt + 1 < maxAttempts) {
-          await waitFor(attempt === 0 ? 700 : 1600);
+          const remainingBeforeRetry = deadlineAt - Date.now();
+          if (remainingBeforeRetry <= 1500) break;
+          await waitFor(Math.min(attempt === 0 ? 900 : 1800, remainingBeforeRetry - 500), options.signal);
           continue;
         }
         break;
       }
     }
-    if (modelIndex + 1 < candidates.length) await waitFor(250);
+    const remainingBeforeFallback = deadlineAt - Date.now();
+    if (modelIndex + 1 < candidates.length && remainingBeforeFallback > 1000) {
+      await waitFor(Math.min(300, remainingBeforeFallback - 500), options.signal);
+    }
   }
 
-  throw safeGeminiUserError(lastError);
+  throw safeGeminiUserError(lastError || createGeminiTimeoutError(options.label || 'generateContent', totalTimeoutMs));
+}
+
+
+function lessonModelCandidates(requestedModel: string, availableModels: string[] = []) {
+  const requested = normalizeGeminiModelName(requestedModel);
+  const hint = geminiRuntimeModelHints.get(requested);
+  const hinted = hint && hint.expiresAt > Date.now() ? hint.model : '';
+  if (hint && hint.expiresAt <= Date.now()) geminiRuntimeModelHints.delete(requested);
+
+  // V6.99.0: lesson generation keeps the production-safe Flash fallback path from V6.98.8.
+  // V6.98.7 put several newer/high-demand models before 2.5 and then truncated the
+  // candidate list, so Netlify could exhaust all attempts without ever reaching a
+  // stable fallback even though the API key supported it.
+  const priority = [
+    hinted,
+    requested,
+    'gemini-2.5-flash',
+    'gemini-2.5-flash-lite',
+    'gemini-3.1-flash-lite',
+    'gemini-3.5-flash-lite',
+    'gemini-3.5-flash',
+    'gemini-3.8-flash',
+    ...AI_MODELS,
+  ].filter(Boolean).map((name) => normalizeGeminiModelName(name));
+  const unique = Array.from(new Set(priority));
+  if (!availableModels.length) return unique;
+  const discovered = Array.from(new Set(availableModels.map((name) => normalizeGeminiModelName(name))));
+  const available = new Set(discovered);
+  const filtered = unique.filter((name) => available.has(name));
+  // Keep every generateContent-capable model discovered for this exact API key as
+  // a final fallback. This prevents a static client list from hiding a working
+  // model introduced or aliased by Google after the app was deployed.
+  return Array.from(new Set([...filtered, ...discovered]));
+}
+
+async function getAvailableGenerateModels(apiKey: string, signal?: AbortSignal): Promise<string[]> {
+  const key = String(apiKey || '').trim();
+  const cached = geminiAvailableModelCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.models;
+  if (cached) geminiAvailableModelCache.delete(key);
+
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = globalThis.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, 7000);
+  const onAbort = () => controller.abort();
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000', {
+      headers: { 'x-goog-api-key': key },
+      signal: controller.signal,
+    });
+    if (!response.ok) return [];
+    const payload: any = await response.json();
+    const models = (Array.isArray(payload?.models) ? payload.models : [])
+      .filter((item: any) => Array.isArray(item?.supportedGenerationMethods) && item.supportedGenerationMethods.includes('generateContent'))
+      .map((item: any) => String(item?.baseModelId || item?.name || '').replace(/^models\//, '').trim())
+      .filter((name: string) => /^gemini-/i.test(name));
+    const unique = Array.from(new Set(models)) as string[];
+    if (unique.length) geminiAvailableModelCache.set(key, { models: unique, expiresAt: Date.now() + GEMINI_MODEL_CATALOG_TTL_MS });
+    return unique;
+  } catch (error) {
+    if (signal?.aborted) throw Object.assign(new Error('AI_REQUEST_CANCELLED'), { name: 'AbortError' });
+    if (timedOut) console.info('[EduSmart][AI] model catalog timed out; using local fallback order.');
+    else console.info('[EduSmart][AI] model catalog unavailable; using local fallback order.');
+    return [];
+  } finally {
+    globalThis.clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
+  }
+}
+
+function toGeminiRestBody(request: any) {
+  const { config = {}, model: _ignoredModel, ...rest } = request || {};
+  const { systemInstruction, ...generationConfig } = config || {};
+  const body: any = { ...rest };
+  if (systemInstruction) {
+    body.systemInstruction = typeof systemInstruction === 'string'
+      ? { parts: [{ text: systemInstruction }] }
+      : systemInstruction;
+  }
+  if (Object.keys(generationConfig).length) body.generationConfig = generationConfig;
+  return body;
+}
+
+function textFromGeminiRestPayload(payload: any) {
+  return (Array.isArray(payload?.candidates) ? payload.candidates : [])
+    .flatMap((candidate: any) => Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [])
+    .map((part: any) => typeof part?.text === 'string' ? part.text : '')
+    .filter(Boolean)
+    .join('');
+}
+
+async function generateContentRestOnce(
+  apiKey: string,
+  model: string,
+  request: any,
+  timeoutMs: number,
+  label: string,
+  signal?: AbortSignal,
+): Promise<any> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = globalThis.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, Math.max(5000, timeoutMs));
+  const onAbort = () => controller.abort();
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': String(apiKey || '').trim(),
+      },
+      body: JSON.stringify(toGeminiRestBody(request)),
+      signal: controller.signal,
+    });
+    let payload: any = null;
+    try { payload = await response.json(); } catch { payload = null; }
+    if (!response.ok) {
+      const error: any = new Error(String(payload?.error?.message || payload?.message || `Gemini request failed (${response.status})`));
+      error.status = response.status;
+      error.statusCode = response.status;
+      error.code = payload?.error?.code || response.status;
+      error.error = payload?.error || payload;
+      throw error;
+    }
+    return { ...(payload || {}), text: textFromGeminiRestPayload(payload) };
+  } catch (error) {
+    if (signal?.aborted) throw Object.assign(new Error('AI_REQUEST_CANCELLED'), { name: 'AbortError' });
+    if (timedOut) throw createGeminiTimeoutError(label, timeoutMs);
+    throw error;
+  } finally {
+    globalThis.clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
+  }
+}
+
+async function generateLessonContentReliableRest(
+  apiKey: string,
+  requestedModel: string,
+  request: any,
+  options: ReliableGeminiOptions = {},
+): Promise<any> {
+  const requested = normalizeGeminiModelName(requestedModel);
+  const totalTimeoutMs = Math.max(20_000, options.totalTimeoutMs || 95_000);
+  const attemptTimeoutMs = Math.max(12_000, options.attemptTimeoutMs || 30_000);
+  const deadlineAt = Date.now() + totalTimeoutMs;
+  let lastError: unknown = null;
+
+  const availableModels = await getAvailableGenerateModels(apiKey, options.signal);
+  const candidates = lessonModelCandidates(requested, availableModels)
+    .slice(0, Math.max(1, options.maxCandidates || 4));
+
+  for (let modelIndex = 0; modelIndex < candidates.length; modelIndex += 1) {
+    if (options.signal?.aborted) throw safeGeminiUserError(Object.assign(new Error('AI_REQUEST_CANCELLED'), { name: 'AbortError' }));
+    const candidate = candidates[modelIndex];
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 1500) break;
+    try {
+      const response = await generateContentRestOnce(
+        apiKey,
+        candidate,
+        request,
+        Math.min(attemptTimeoutMs, remainingMs),
+        `${options.label || 'lesson-generation'}:${candidate}`,
+        options.signal,
+      );
+      geminiRuntimeModelHints.set(requested, { model: candidate, expiresAt: Date.now() + GEMINI_RUNTIME_HINT_TTL_MS });
+      if (candidate !== requested) console.info(`[EduSmart][AI] ${options.label || 'lesson-generation'} recovered with ${candidate}.`);
+      return response;
+    } catch (error) {
+      if (isGeminiAbortError(error)) throw safeGeminiUserError(error);
+      lastError = error;
+      console.warn(`[EduSmart][AI] ${options.label || 'lesson-generation'} REST attempt failed on ${candidate}.`, error);
+      if (!isGeminiTransientError(error) && !isGeminiModelUnavailable(error)) throw safeGeminiUserError(error);
+      const remainingBeforeFallback = deadlineAt - Date.now();
+      if (modelIndex + 1 < candidates.length && remainingBeforeFallback > 1000) {
+        await waitFor(Math.min(250, remainingBeforeFallback - 500), options.signal);
+      }
+    }
+  }
+
+  throw safeGeminiUserError(lastError || createGeminiTimeoutError(options.label || 'lesson-generation', totalTimeoutMs));
 }
 
 async function generateContentStreamReliable(
@@ -164,22 +446,29 @@ async function generateContentStreamReliable(
   request: any,
 ): Promise<any> {
   const requested = normalizeGeminiModelName(requestedModel);
-  const candidates = geminiModelCandidates(requested, true).slice(0, 5);
+  const candidates = geminiModelCandidates(requested, true).slice(0, 4);
+  const deadlineAt = Date.now() + 65_000;
   let lastError: unknown = null;
   for (let modelIndex = 0; modelIndex < candidates.length; modelIndex += 1) {
     const candidate = candidates[modelIndex];
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 1000) break;
     try {
-      const response = await ai.models.generateContentStream({ ...request, model: candidate });
+      const response = await runGeminiBounded(
+        () => ai.models.generateContentStream({ ...request, model: candidate }),
+        Math.min(30_000, remainingMs),
+        `stream:${candidate}`,
+      );
       geminiRuntimeModelHints.set(requested, { model: candidate, expiresAt: Date.now() + GEMINI_RUNTIME_HINT_TTL_MS });
       return response;
     } catch (error) {
       lastError = error;
       console.warn(`[EduSmart][AI] stream start failed on ${candidate}.`, error);
       if (!isGeminiTransientError(error) && !isGeminiModelUnavailable(error)) throw safeGeminiUserError(error);
-      if (modelIndex + 1 < candidates.length) await waitFor(modelIndex === 0 ? 700 : 300);
+      if (modelIndex + 1 < candidates.length && deadlineAt - Date.now() > 1000) await waitFor(400);
     }
   }
-  throw safeGeminiUserError(lastError);
+  throw safeGeminiUserError(lastError || createGeminiTimeoutError('stream', 65_000));
 }
 
 function cleanTextValue(value: unknown): string {
@@ -281,6 +570,8 @@ function safeQuizArray(value: unknown) {
       const hint = cleanTextValue(raw?.hint ?? raw?.goi_y ?? '');
       const sourceSection = cleanTextValue(raw?.sourceSection ?? raw?.nguon_muc ?? '');
       const level = normalizeLevel(raw?.level ?? raw?.muc_do);
+      const requirementIds = safeArray(raw?.requirement_ids ?? raw?.curriculum_requirement_ids ?? raw?.yccd_ids);
+      const assessmentEvidence = cleanTextValue(raw?.assessment_evidence ?? raw?.minh_chung_danh_gia ?? '');
       const wrongAnswerExplanations = typeof raw?.wrongAnswerExplanations === 'object' && raw?.wrongAnswerExplanations
         ? Object.fromEntries(
             Object.entries(raw.wrongAnswerExplanations).map(([key, val]) => [cleanTextValue(key), cleanTextValue(val ?? '')]).filter(([, val]) => val),
@@ -293,6 +584,8 @@ function safeQuizArray(value: unknown) {
         if (!question || !correctAnswer) return null;
         const result: QuizQuestion = {
           id: String(raw?.id || `TF${index + 1}`),
+          requirement_ids: requirementIds,
+          assessment_evidence: assessmentEvidence,
           type,
           question,
           options: ['Đúng', 'Sai'],
@@ -316,6 +609,8 @@ function safeQuizArray(value: unknown) {
         const sentence = ensureFillSentence(rawQuestion, correctAnswers[0]);
         const result: QuizQuestion = {
           id: String(raw?.id || `FB${index + 1}`),
+          requirement_ids: requirementIds,
+          assessment_evidence: assessmentEvidence,
           type: 'fill_in_blank',
           question: sentence,
           sentence,
@@ -338,6 +633,8 @@ function safeQuizArray(value: unknown) {
       if (!question || options.length < 2 || !correctAnswer) return null;
       const result = sanitizeQuizQuestion({
         id: String(raw?.id || `SC${index + 1}`),
+        requirement_ids: requirementIds,
+        assessment_evidence: assessmentEvidence,
         type: 'single_choice',
         question,
         options,
@@ -645,6 +942,7 @@ function normalizeActivityV3(activity: any, index: number) {
   const interactions = safeQuizArray(activity?.interactions || activity?.interactive_questions || activity?.questions || []);
   return {
     activity_id: cleanTextValue(activity?.activity_id || activity?.id || `A${index + 1}`),
+    requirement_ids: safeArray(activity?.requirement_ids || activity?.curriculum_requirement_ids || activity?.yccd_ids),
     title: cleanTextValue(activity?.title || activity?.tieu_de || `Hoạt động ${index + 1}`),
     objective: cleanTextValue(activity?.objective || activity?.muc_tieu || ''),
     activity_type: cleanTextValue(activity?.activity_type || activity?.loai_hoat_dong || (index === 0 ? 'warmup' : 'knowledge')) as any,
@@ -671,9 +969,26 @@ function normalizeLessonV3(raw: any): LessonContent {
     interactive_questions: activity.interactions,
   }, index));
   const legacy = buildLegacyFromV2(syntheticSections, base.final_quiz || []);
+  const rawMetadata = raw?.metadata || {};
   return {
     ...base,
     schema_version: 'lesson_v3',
+    metadata: {
+      ...base.metadata,
+      curriculum_program: cleanTextValue(rawMetadata.curriculum_program || ''),
+      curriculum_version: cleanTextValue(rawMetadata.curriculum_version || ''),
+      textbook_series: cleanTextValue(rawMetadata.textbook_series || ''),
+      textbook_catalog_version: cleanTextValue(rawMetadata.textbook_catalog_version || ''),
+      textbook_lesson_id: cleanTextValue(rawMetadata.textbook_lesson_id || ''),
+      textbook_lesson_code: cleanTextValue(rawMetadata.textbook_lesson_code || ''),
+      textbook_topic_id: cleanTextValue(rawMetadata.textbook_topic_id || ''),
+      curriculum_requirement_ids: safeArray(rawMetadata.curriculum_requirement_ids),
+      curriculum_requirements: Array.isArray(rawMetadata.curriculum_requirements)
+        ? rawMetadata.curriculum_requirements.map((item: any) => ({ id: cleanTextValue(item?.id), text: cleanTextValue(item?.text), competency: cleanTextValue(item?.competency), source_kind: cleanTextValue(item?.source_kind) as 'official_normalized' | 'normalized_profile', source_url: cleanTextValue(item?.source_url) })).filter((item: any) => item.id && item.text)
+        : [],
+      curriculum_source_url: cleanTextValue(rawMetadata.curriculum_source_url || ''),
+      textbook_source_url: cleanTextValue(rawMetadata.textbook_source_url || ''),
+    },
     activities,
     sections: syntheticSections,
     hinh_thanh_kien_thuc: legacy.hinh_thanh_kien_thuc,
@@ -1034,183 +1349,126 @@ function extractJson(text: string) {
   }
 }
 
-async function repairLessonJsonWithAI(apiKey: string, model: string, brokenJsonText: string, originalError: unknown) {
-  const ai = new GoogleGenAI({ apiKey });
-  const response = await generateContentReliable(ai, model, {
+async function repairLessonJsonWithAI(apiKey: string, model: string, brokenJsonText: string, originalError: unknown, runtime?: { signal?: AbortSignal; totalTimeoutMs?: number }) {
+  const response = await generateLessonContentReliableRest(apiKey, model, {
     contents: [{
       role: 'user',
-      parts: [{ text: `JSON sau bị lỗi cú pháp khi phân tích bài học. Hãy sửa thành JSON hợp lệ theo schema lesson_v3. Không thêm markdown, không giải thích. Lưu ý: nếu trong chuỗi có dấu ngoặc kép tiếng Việt như "bộ não", hãy đổi thành dấu nháy đơn hoặc escape đúng chuẩn JSON.\n\nLỗi: ${originalError instanceof Error ? originalError.message : String(originalError || '')}\n\nJSON cần sửa:\n${sliceLikelyJson(brokenJsonText).slice(0, 65000)}` }],
+      parts: [{ text: `JSON bài học sau bị lỗi cú pháp. Hãy chỉ sửa thành JSON hợp lệ, giữ nguyên nội dung chính và không thêm markdown. Nếu chuỗi có dấu ngoặc kép thô, hãy escape hoặc đổi sang dấu nháy đơn.\n\nLỗi: ${originalError instanceof Error ? originalError.message : String(originalError || '')}\n\nJSON cần sửa:\n${sliceLikelyJson(brokenJsonText).slice(0, 52000)}` }],
     }],
     config: {
-      systemInstruction: 'Bạn chỉ sửa cú pháp JSON. Luôn trả về JSON hợp lệ, không markdown.',
+      systemInstruction: 'Chỉ sửa cú pháp JSON lesson_v3. Chỉ trả JSON hợp lệ.',
       responseMimeType: 'application/json',
-      temperature: 0.05,
+      temperature: 0.02,
     },
+  }, {
+    label: 'lesson-json-repair',
+    signal: runtime?.signal,
+    totalTimeoutMs: Math.max(10_000, runtime?.totalTimeoutMs || 30_000),
+    attemptTimeoutMs: 22_000,
+    maxCandidates: 2,
+    primaryAttempts: 1,
   });
   return tryParseJsonCandidate(response.text || '');
 }
 
 function buildAnalysisPrompt(
-  values: Pick<LessonComposerValues, 'tieu_de' | 'mon_id' | 'khoi' | 'source_text'>,
+  values: Pick<LessonComposerValues, 'tieu_de' | 'mon_id' | 'khoi' | 'source_text' | 'textbook_series' | 'textbook_catalog_version' | 'textbook_lesson_id' | 'textbook_lesson_code' | 'textbook_topic_id' | 'curriculum_program' | 'curriculum_version' | 'curriculum_requirement_ids'>,
   subjectLabel?: string,
   settings?: LessonBuilderSettings,
 ) {
   const config = settings || {} as LessonBuilderSettings;
+  const coreFinalCount = Math.max(3, Math.min(6, Number(config.final_quiz_count || 10)));
+  const requirements = getCurriculumRequirementsByIds(values.curriculum_requirement_ids || []);
+  const catalogLesson = getTextbookLessonById(values.textbook_lesson_id);
+  const subjectGuidance = getSubjectAssessmentGuidance(subjectLabel || values.mon_id || '');
+  const catalogVersion = values.textbook_catalog_version || getTextbookCatalogVersion(subjectLabel || values.mon_id || '') || TEXTBOOK_CATALOG_VERSION;
+  const hasNormalizedProfiles = requirements.some((item) => item.sourceKind === 'normalized_profile');
+  const curriculumTargetHeading = hasNormalizedProfiles
+    ? 'ĐÍCH HỌC TẬP CHUẨN HÓA BÁM CTGDPT 2018'
+    : 'YÊU CẦU CẦN ĐẠT ĐƯỢC LIÊN KẾT VỚI CTGDPT 2018';
+  const curriculumBlock = requirements.length
+    ? requirements.map((item) => `- [${item.id}]${item.sourceKind ? ` [${item.sourceKind}]` : ''} ${item.text}${item.verbs?.length ? ` | Động từ trọng tâm: ${item.verbs.join(', ')}` : ''}`).join('\n')
+    : '- Không có YCCD/đích học tập catalog bắt buộc; bám sát học liệu giáo viên cung cấp.';
   return `
 Bạn là chuyên gia thiết kế bài học trực tuyến tương tác cho học sinh phổ thông Việt Nam.
-
-Nhiệm vụ:
-- Phân tích học liệu gốc và tạo DUY NHẤT 1 JSON hợp lệ bằng tiếng Việt.
-- Tạo bài học theo mô hình HOẠT ĐỘNG DẠY HỌC: Mục tiêu → Hoạt động khởi động → Hoạt động hình thành kiến thức → Luyện tập/Vận dụng → Kiểm tra cuối bài. Mỗi hoạt động có các trang trình bày giống slide 16:9 và phần tương tác cho học sinh.
-- Tự xác định số hoạt động dạy học dựa trên học liệu nguồn; mỗi activity phải tương ứng với một mục tiêu/nhiệm vụ học tập thật. Không tách vụn máy móc. Mỗi activity nên có 2-6 pages tùy lượng kiến thức.
-- Mỗi hoạt động kiến thức/luyện tập bắt buộc có ít nhất ${config.interactive_questions_per_section || 1} câu hỏi tương tác.
-- Câu hỏi tương tác trong từng nội dung chỉ hỗ trợ 3 dạng: single_choice, true_false, fill_in_blank. Không tạo short_answer/tự luận ngắn trong bài học.
-- Dạng fill_in_blank là câu chọn từ/cụm từ có sẵn để điền vào chỗ trống: mỗi câu có đúng 1 ô trống ký hiệu _____, đúng 4 choices, correctAnswers gồm đúng 1 từ/cụm từ đúng. Các câu mở dạng kể tên, nêu ý kiến, giải thích, liên hệ thực tế phải chuyển thành fill_in_blank bằng cách chọn một khái niệm/từ khóa/cụm từ trọng tâm để điền, không tạo ô nhập tự luận.
-- Chỉ tạo true_false khi câu hỏi là một phát biểu có thể xác định Đúng hoặc Sai rõ ràng.
-- Không dùng markdown thô như **, ##, ký tự đầu dòng rối trong nội dung.
-- Không tạo tiêu đề dạng "Nội dung 1: ...", "Nội dung 2: ...". Nếu học liệu đã có tiêu đề "1. ...", "2. ..." thì giữ nguyên tiêu đề đó.
-- Mỗi page là một trang trình bày ngắn gọn, ít chữ, có title rõ. Chỉ dùng 8 layout chuẩn cho bài giảng: hero_concept, story_visual, visual_explain, comparison, process, card_grid, remember, task. Chọn layout theo ý nghĩa nội dung, không đổi layout chỉ để trang trí.
-- Trình bày như bài giảng chuyên nghiệp dùng máy chiếu: tiêu đề tối đa khoảng 10-12 từ, mỗi trang chỉ 1 ý chính; tối đa 3 blocks; toàn trang ưu tiên không quá 90-110 từ; mỗi block khoảng 20-55 từ. Nếu nội dung dài phải tự chia thành page tiếp theo, tuyệt đối không tạo slide cần cuộn.
-- teacher_notes chỉ dành cho giáo viên, không đưa nội dung teacher_notes vào blocks hoặc student_prompt hay nội dung học sinh nhìn thấy. Nội dung học sinh cần thấy phải nằm trong blocks/student_prompt.
-- Không lặp lại cùng một thông tin ở nhiều vị trí trên slide: không lặp tên hoạt động trong title, không đưa tên môn/loại hoạt động/thời lượng/metadata AI vào visual, không tạo chip chứa lại title hoặc visual_hint.
-- Với trang dùng để giảng dạy trên máy chiếu, ưu tiên từ khóa, cụm ý, quy trình, bảng so sánh/card; tránh câu văn dài khi có thể tách thành 2-4 ý ngắn.
-- Với mỗi content_blocks, gán category phù hợp: khai_niem, giai_thich, vi_du, ung_dung, ghi_nho, hoat_dong, lien_he_thuc_te, mo_rong. Gán theme màu nhẹ: blue, violet, amber, emerald, rose, cyan, orange.
-- Mỗi activity nên có 2-6 pages theo trật tự sư phạm: tình huống/nhiệm vụ → khái niệm/giải thích → ví dụ/ứng dụng → ghi nhớ. Minh hoạ phải mang ý nghĩa học tập, không phải danh sách từ khóa trang trí. Mỗi page nên có visual dạng object khi phù hợp: type, title, items, center_label, relationship. visual.type chỉ dùng: none, icon_cards, hub_spoke, process, comparison, timeline, device_diagram, concept_map, numbered_steps.
-- Nếu học liệu có khung hoặc mục Ghi nhớ/Kết luận/Em cần nhớ/Lưu ý thì phải đưa đúng nội dung đó vào page layout="remember" và summary của activity tương ứng.
-- Nếu học liệu có câu hỏi/hoạt động/bài tập/Em hãy/Quan sát/Thảo luận thì phải ưu tiên chuyển các câu hỏi đó thành activity.interactions hoặc final_quiz; chỉ sinh thêm câu hỏi khi không đủ số lượng cấu hình.
-- Với học liệu dạng SGK có các khối “Sau bài này em sẽ”, “Hoạt động”, “Hình”, “Luyện tập”, “Vận dụng”: hãy giữ logic sư phạm này. Hoạt động quan sát/hỏi đáp trong bài dùng làm interactive_questions; Luyện tập/Vận dụng dùng làm final_quiz hoặc fill_in_blank trong section nếu là câu hỏi mở.\n- Nếu học liệu có ví dụ, quy trình, thao tác từng bước hoặc hoạt động minh hoạ cụ thể, hãy ưu tiên biến chính ví dụ/hoạt động đó thành các câu tương tác bám sát ngữ cảnh nguồn thay vì tạo câu hỏi lý thuyết chung chung. Có thể chia một ví dụ thành nhiều câu single_choice / true_false / fill_in_blank liên tiếp để mô phỏng tiến trình của hoạt động.
-- Không trả về HTML thô như <br>, <p>, <div>. Dùng xuống dòng \n hoặc content_blocks.
-- Bắt buộc bảo đảm JSON hợp lệ tuyệt đối: nếu nội dung có dấu ngoặc kép trong câu như “bộ não”, hãy đổi sang dấu nháy đơn hoặc escape thành \"bộ não\"; không để dấu ngoặc kép thô bên trong chuỗi JSON.
-- Không xuất markdown, không xuất chú thích ngoài JSON, không dùng danh sách bằng dấu • bên ngoài chuỗi. Mọi array phải có dấu phẩy giữa các phần tử; không để phần tử cuối có dấu phẩy thừa; không bỏ sót dấu đóng } hoặc ].
-- Nếu không chắc chắn, hãy tạo JSON ngắn hơn nhưng đúng cú pháp, thay vì tạo JSON dài dễ lỗi.
+Hãy đọc học liệu nguồn và tạo MỘT JSON lesson_v3 hợp lệ. Đây là bản lõi tối ưu cho môi trường web production: ưu tiên đúng kiến thức, đủ cấu trúc và JSON ngắn gọn; hệ thống sẽ tự bổ sung số lượng câu hỏi còn thiếu sau khi nhận kết quả.
 
 Bối cảnh:
 - Tiêu đề: ${values.tieu_de || 'Chưa nhập'}
-- Môn học: ${subjectLabel || values.mon_id || 'Chưa rõ'}
-- Khối lớp: ${values.khoi || 'Chưa rõ'}
+- Môn: ${subjectLabel || values.mon_id || 'Chưa rõ'}
+- Khối: ${values.khoi || 'Chưa rõ'}
+- Chương trình: ${values.curriculum_program || CURRICULUM_PROGRAM} (${values.curriculum_version || CURRICULUM_VERSION})
+- Bộ sách: ${values.textbook_series || TEXTBOOK_SERIES_KNTT}${catalogLesson ? ` – ${catalogLesson.topicTitle}` : ''}
+- Mã bài SGK: ${values.textbook_lesson_code || catalogLesson?.lessonCode || 'Bài tùy chỉnh'}
+- Phiên bản danh mục: ${catalogVersion}
 
-Cấu hình bài học:
-- Số câu hỏi tương tác mỗi nội dung: ${config.interactive_questions_per_section || 1}
-- Số câu hỏi cuối bài: ${config.final_quiz_count || 10}
-- Chế độ kiểm tra cuối bài: ${config.final_quiz_source_mode === 'random_bank' ? 'lấy ngẫu nhiên từ ngân hàng câu hỏi' : 'bộ câu cố định'}
-- Số câu mục tiêu của ngân hàng: ${config.question_bank_size || 30}
-- Loại câu hỏi: ${config.question_mix || 'mixed'} (mixed = kết hợp single_choice, true_false, fill_in_blank)
-- Mức độ: ${config.difficulty || 'medium'}
-- Có ví dụ minh họa: ${config.include_examples !== false ? 'có' : 'không'}
-- Có ghi nhớ cuối mỗi nội dung: ${config.include_summary !== false ? 'có' : 'không'}
-- Hiển thị giải thích đáp án: ${config.show_explanation !== false ? 'có' : 'không'}
-- Điểm đạt: ${config.pass_score || 5}/10
-- Cách tính điểm: CHỈ kiểm tra cuối bài tạo điểm chính thức (100%); tương tác trong các mục học tập chỉ dùng để xác nhận hoàn thành và không tính điểm.
-- Thời gian học toàn bài: ${config.lesson_time_minutes || 45} phút
-- Tự kết thúc khi hết thời gian học: ${config.auto_finish_lesson_on_timeout !== false ? 'có' : 'không'}
-- Thời gian kiểm tra cuối bài: ${config.final_exam_time_minutes || 15} phút
-- Đảo câu hỏi kiểm tra cuối bài: ${config.shuffle_final_questions !== false ? 'có' : 'không'}
-- Đảo đáp án kiểm tra cuối bài: ${config.shuffle_final_options !== false ? 'có' : 'không'}
-- Với câu trắc nghiệm: options chỉ chứa NỘI DUNG đáp án, tuyệt đối không thêm tiền tố A./B./C./D.; các options không được trùng nhau; correctAnswer phải là nguyên văn nội dung đáp án đúng, không chỉ là chữ cái.
-- CHUẨN CHẤT LƯỢNG CÂU HỎI: câu hỏi phải đủ chủ ngữ/ngữ cảnh, không cụt ý, không mơ hồ, không có lỗi chính tả; chỉ có đúng 1 đáp án đúng rõ ràng.
-- Phương án nhiễu phải cùng kiểu nội dung với đáp án đúng, hợp lý nhưng sai về kiến thức; không dùng phương án vô nghĩa, quá dễ loại hoặc chỉ khác đáp án đúng bởi một từ phủ định gây mơ hồ.
-- correctAnswer BẮT BUỘC trùng chính xác từng ký tự với đúng một phần tử trong options sau khi tạo JSON. Trước khi trả JSON phải tự đối chiếu lại question → options → correctAnswer → explanation.
-- Với fill_in_blank: câu phải có đúng 1 _____; choices có đúng 4 từ/cụm từ khác nhau, cùng loại ngữ nghĩa; correctAnswers có đúng 1 phần tử và phần tử đó BẮT BUỘC trùng chính xác với đúng một choice. Không dùng cụm từ bị cắt, sai chính tả hoặc không hoàn chỉnh.
-- explanation phải giải thích trực tiếp vì sao đáp án đúng phù hợp với kiến thức nguồn; không được giải thích mâu thuẫn với correctAnswer/correctAnswers.
-- Phân bố mức độ hợp lý: khoảng 30% nhận biết, 40% thông hiểu, 30% vận dụng nếu học liệu cho phép; câu vận dụng phải có tình huống cụ thể, không chỉ đổi nhãn level.
-- Cho xem đáp án sau khi nộp: ${config.show_final_answers_after_submit !== false ? 'có' : 'không'}
-- Cho xem giải thích sau khi nộp: ${config.show_final_explanations_after_submit !== false ? 'có' : 'không'}
-- Kiểm tra cuối bài mặc định là một lượt chính thức; không thiết kế logic làm lại trong cùng cấu hình bài học. Nếu cần học lại cập nhật điểm, giáo viên sẽ cấp quyền riêng trong theo dõi học tập.
-- Yêu cầu riêng: ${config.ai_instructions || 'Không có'}
+${curriculumTargetHeading}:
+${curriculumBlock}
 
-Yêu cầu nội dung:
-1. metadata.muc_tieu_bai_hoc có 3-5 ý ngắn gọn.
-2. activities: tự chia thành các hoạt động dạy học. Mỗi activity có activity_id, title, objective, activity_type, estimated_minutes, pages, interactions, summary.
-3. Mỗi page có page_id, title, subtitle, layout, blocks, teacher_notes, student_prompt và visual. visual gồm type, title, items, center_label, relationship. visual_hint/illustration_keywords chỉ dùng làm tương thích, không dùng để lặp lại tiêu đề hoặc hiển thị như chip cho học sinh.
-4. page.blocks chia nội dung thành các khối ngắn. Mỗi khối có type, title, category, theme, text; title phải bám sát nội dung.
-5. activity.interactions gồm câu hỏi/nhiệm vụ tương tác sau phần trình bày và chỉ có 3 dạng: single_choice, true_false, fill_in_blank. Với fill_in_blank phải có sentence chứa đúng một _____, choices đúng 4 từ/cụm từ, correctAnswers đúng 1 từ/cụm từ đúng và explanation.
-6. final_quiz gồm câu hỏi cuối bài khách quan thuộc 3 dạng single_choice, true_false, fill_in_blank; không dùng short_answer/tự luận. question_bank là ngân hàng câu hỏi lớn hơn dùng cho đề ngẫu nhiên; khi cấu hình random_bank, hãy tạo tối thiểu số câu theo question_bank_size (nếu học liệu đủ), mỗi câu có id duy nhất và explanation. Với single_choice phải có đúng 4 options và correctAnswer trùng nguyên văn đúng một option. Với fill_in_blank phải có đúng một _____, đúng 4 choices và correctAnswers gồm đúng một choice. Mọi câu đều có explanation ngắn, chính xác và đáp án đúng không phụ thuộc thứ tự hiển thị để hệ thống có thể đảo đáp án.
-7. settings phải lưu đầy đủ cấu hình thời gian học, thời gian kiểm tra, đảo câu hỏi, đảo đáp án, xem đáp án sau khi nộp và các cấu hình ngân hàng câu hỏi/ngẫu nhiên hoá.
-8. assessment quy định thang điểm 10.
-9. Nếu học liệu có nội dung vận dụng, đưa vào phần section hoặc final_quiz theo hướng đánh giá năng lực.
+Nguyên tắc bám chương trình và học liệu:
+- Các yêu cầu/đích học tập ở trên là chuẩn đích của phiên tạo bài; KHÔNG được tự sửa sai nghĩa hoặc bịa thêm mã ngoài registry.
+${hasNormalizedProfiles ? '- Với mục có source_kind=normalized_profile, đây là mô tả chuẩn hóa phục vụ thiết kế bài, không phải trích nguyên văn pháp lý; phải bám học liệu giáo viên và không được suy diễn vượt phạm vi.\n' : ''}- Học liệu giáo viên tải lên là nguồn nội dung cụ thể ưu tiên. Không đưa kiến thức ngoài phạm vi YCCD và học liệu nếu không thật sự cần để giải thích.
+- Mỗi activity phải có requirement_ids là mảng chứa ít nhất một mã YCCD phù hợp trong danh sách trên.
+- Mỗi câu interactions/final_quiz phải có requirement_ids và assessment_evidence mô tả ngắn minh chứng học sinh đạt YCCD nào.
+- Chọn dạng câu hỏi theo động từ YCCD: “nêu/nhận biết” → nhận biết/thông hiểu; “giải thích/phân biệt” → lí giải/so sánh; “sử dụng/thực hiện/tạo” → tình huống vận dụng/thực hành; “đánh giá” → lựa chọn có căn cứ/lập luận.
+- Mục tiêu bài học là sự cụ thể hóa YCCD/đích học tập, không thay thế chuẩn chương trình.
+${subjectGuidance ? `- Hướng dẫn đánh giá theo môn: ${subjectGuidance}\n` : ''}
+Yêu cầu sư phạm:
+1. Tạo 3-6 mục tiêu ngắn gọn và tự chia thành các activity hợp lý theo học liệu; không tách vụn máy móc.
+2. Mỗi activity có 1-4 pages theo trình tự phù hợp: tình huống/nhiệm vụ → giải thích/khái niệm → ví dụ/ứng dụng → ghi nhớ. Mỗi page tối đa 3 blocks, ít chữ, phù hợp trình chiếu 16:9.
+3. layout chỉ dùng: hero_concept, story_visual, visual_explain, comparison, process, card_grid, remember, task.
+4. visual.type chỉ dùng: none, icon_cards, hub_spoke, process, comparison, timeline, device_diagram, concept_map, numbered_steps.
+5. content block gồm type, title, category, theme, text; category dùng khai_niem/giai_thich/vi_du/ung_dung/ghi_nho/hoat_dong/lien_he_thuc_te/mo_rong; theme dùng blue/violet/amber/emerald/rose/cyan/orange.
+6. Mỗi activity chỉ cần tạo TỐI THIỂU 1 câu interactions chất lượng ở bản lõi. Chỉ dùng single_choice, true_false, fill_in_blank. Hệ thống sẽ tự bổ sung đến ${Number(config.interactive_questions_per_section || 1)} câu/hoạt động sau đó.
+7. final_quiz chỉ tạo ${coreFinalCount} câu chất lượng ở bản lõi. Hệ thống sẽ tự hoàn thiện đến ${Number(config.final_quiz_count || 10)} câu. question_bank BẮT BUỘC để [] trong phản hồi để giảm kích thước; hệ thống sẽ dựng ngân hàng ${Number(config.question_bank_size || 30)} câu cục bộ sau đó.
+8. Ưu tiên chuyển câu hỏi/hoạt động/luyện tập/vận dụng có sẵn trong học liệu thành câu tương tác; không bịa kiến thức ngoài nguồn.
+9. single_choice: đúng 4 options, không có A/B/C/D, correctAnswer trùng chính xác 1 option. true_false: options ["Đúng","Sai"]. fill_in_blank: đúng một _____, đúng 4 choices, correctAnswers đúng 1 choice.
+10. explanation phải ngắn gọn và thống nhất với đáp án. Không dùng short_answer. Không xuất HTML thô hoặc markdown.
+11. teacher_notes chỉ cho giáo viên; nội dung học sinh nhìn thấy phải nằm trong blocks/student_prompt.
+12. Nếu học liệu có Ghi nhớ/Kết luận/Em cần nhớ thì tạo page layout="remember".
 
-JSON bắt buộc:
+Cấu hình phải lưu trong settings:
+- interactive_questions_per_section: ${Number(config.interactive_questions_per_section || 1)}
+- final_quiz_count: ${Number(config.final_quiz_count || 10)}
+- final_quiz_source_mode: "${config.final_quiz_source_mode === 'random_bank' ? 'random_bank' : 'fixed'}"
+- question_bank_size: ${Number(config.question_bank_size || 30)}
+- question_mix: "${config.question_mix || 'mixed'}"
+- difficulty: "${config.difficulty || 'medium'}"
+- include_examples: ${config.include_examples !== false}
+- include_summary: ${config.include_summary !== false}
+- show_explanation: ${config.show_explanation !== false}
+- pass_score: ${Number(config.pass_score || 5)}
+- lesson_time_minutes: ${Number(config.lesson_time_minutes || 45)}
+- auto_finish_lesson_on_timeout: ${config.auto_finish_lesson_on_timeout !== false}
+- final_exam_time_minutes: ${Number(config.final_exam_time_minutes || 15)}
+- shuffle_final_questions: ${config.shuffle_final_questions !== false}
+- shuffle_final_options: ${config.shuffle_final_options !== false}
+- show_final_answers_after_submit: ${config.show_final_answers_after_submit !== false}
+- show_final_explanations_after_submit: ${config.show_final_explanations_after_submit !== false}
+- allow_retry: false
+- interactive_weight: 0
+- final_quiz_weight: 100
+- ai_instructions: ${JSON.stringify(config.ai_instructions || '')}
+
+Schema tối thiểu bắt buộc:
 {
-  "schema_version": "lesson_v3",
-  "title": "",
-  "metadata": {
-    "tieu_de": "", "mon_hoc": "", "khoi": "", "chu_de": "", "tom_tat": "",
-    "muc_tieu_bai_hoc": [""], "tu_khoa": [""], "thong_diep_chinh": "", "thoi_luong_goi_y": ""
-  },
-  "settings": {
-    "content_count": 0,
-    "interactive_questions_per_section": ${config.interactive_questions_per_section || 1},
-    "final_quiz_count": ${config.final_quiz_count || 10},
-    "final_quiz_source_mode": "${config.final_quiz_source_mode === 'random_bank' ? 'random_bank' : 'fixed'}",
-    "question_bank_size": ${config.question_bank_size || 30},
-    "question_mix": "${config.question_mix || 'mixed'}",
-    "difficulty": "${config.difficulty || 'medium'}",
-    "include_examples": ${config.include_examples !== false},
-    "include_summary": ${config.include_summary !== false},
-    "allow_retry": false,
-    "show_explanation": ${config.show_explanation !== false},
-    "interactive_weight": 0,
-    "final_quiz_weight": 100,
-    "pass_score": ${config.pass_score || 5},
-    "lesson_time_minutes": ${config.lesson_time_minutes || 45},
-    "auto_finish_lesson_on_timeout": ${config.auto_finish_lesson_on_timeout !== false},
-    "final_exam_time_minutes": ${config.final_exam_time_minutes || 15},
-    "shuffle_final_questions": ${config.shuffle_final_questions !== false},
-    "shuffle_final_options": ${config.shuffle_final_options !== false},
-    "show_final_answers_after_submit": ${config.show_final_answers_after_submit !== false},
-    "show_final_explanations_after_submit": ${config.show_final_explanations_after_submit !== false},
-    "allow_exam_retry": ${config.allow_exam_retry !== false},
-    "max_exam_attempts": ${config.max_exam_attempts || 2},
-    "exam_score_policy": "${config.exam_score_policy || 'best'}",
-    "ai_instructions": ""
-  },
-  "activities": [
-    {
-      "activity_id": "A1",
-      "title": "Khởi động: ...",
-      "objective": "",
-      "activity_type": "warmup",
-      "estimated_minutes": 5,
-      "pages": [
-        {
-          "page_id": "A1_P1",
-          "title": "",
-          "subtitle": "",
-          "layout": "story_visual",
-          "visual": {
-            "type": "hub_spoke",
-            "title": "Vai trò của người điều hành",
-            "center_label": "Trưởng nhóm",
-            "items": ["Phân công nhiệm vụ", "Theo dõi tiến độ", "Kết nối thành viên"],
-            "relationship": "Các nhiệm vụ phối hợp để nhóm hoàn thành mục tiêu"
-          },
-          "blocks": [
-            { "type": "activity", "title": "Tình huống", "category": "hoat_dong", "theme": "violet", "text": "" }
-          ],
-          "teacher_notes": "Lời dẫn ngắn cho giáo viên.",
-          "student_prompt": "Nhiệm vụ học sinh cần thực hiện."
-        }
-      ],
-      "interactions": [
-        { "id": "IQ_A1_1", "type": "single_choice", "question": "", "options": ["phương án 1", "phương án 2", "phương án 3", "phương án 4"], "correctAnswer": "phương án 1", "explanation": "", "level": "nhan_biet" }
-      ],
-      "summary": ""
-    }
-  ],
-  "question_bank": [],
-  "final_quiz": [
-    { "id": "FQ1", "type": "single_choice", "question": "", "options": ["phương án 1", "phương án 2", "phương án 3", "phương án 4"], "correctAnswer": "phương án 1", "explanation": "", "level": "thong_hieu" }
-  ],
-  "assessment": {
-    "interactive_weight": 0,
-    "final_quiz_weight": 100,
-    "score_scale": 10,
-    "pass_score": ${config.pass_score || 5}
-  },
-  "raw_text_excerpt": ""
+  "schema_version":"lesson_v3",
+  "title":"",
+  "metadata":{"tieu_de":"","mon_hoc":"","khoi":"","chu_de":"","tom_tat":"","muc_tieu_bai_hoc":[""],"tu_khoa":[""],"thong_diep_chinh":"","thoi_luong_goi_y":"","curriculum_program":"${values.curriculum_program || CURRICULUM_PROGRAM}","curriculum_version":"${values.curriculum_version || CURRICULUM_VERSION}","textbook_series":"${values.textbook_series || TEXTBOOK_SERIES_KNTT}","textbook_catalog_version":"${catalogVersion}","textbook_lesson_id":"${values.textbook_lesson_id || ''}","textbook_lesson_code":"${values.textbook_lesson_code || ''}","textbook_topic_id":"${values.textbook_topic_id || ''}","curriculum_requirement_ids":${JSON.stringify(requirements.map((item) => item.id))}},
+  "settings":{},
+  "activities":[{
+    "activity_id":"A1","requirement_ids":["${requirements[0]?.id || ''}"],"title":"","objective":"","activity_type":"warmup|knowledge|practice|application","estimated_minutes":5,
+    "pages":[{"page_id":"A1_P1","title":"","subtitle":"","layout":"visual_explain","visual":{"type":"none","title":"","items":[],"center_label":"","relationship":""},"blocks":[{"type":"paragraph","title":"","category":"giai_thich","theme":"blue","text":""}],"teacher_notes":"","student_prompt":""}],
+    "interactions":[{"id":"IQ_A1_1","requirement_ids":["${requirements[0]?.id || ''}"],"assessment_evidence":"","type":"single_choice","question":"","options":["","","",""],"correctAnswer":"","explanation":"","level":"nhan_biet"}],
+    "summary":""
+  }],
+  "question_bank":[],
+  "final_quiz":[{"id":"FQ1","requirement_ids":["${requirements[0]?.id || ''}"],"assessment_evidence":"","type":"single_choice","question":"","options":["","","",""],"correctAnswer":"","explanation":"","level":"thong_hieu"}],
+  "assessment":{"interactive_weight":0,"final_quiz_weight":100,"score_scale":10,"pass_score":${Number(config.pass_score || 5)}},
+  "raw_text_excerpt":""
 }
 
-Chỉ trả về JSON, không giải thích thêm.
+Bắt buộc: chỉ trả JSON hợp lệ, không markdown, không giải thích. Nếu nguồn dài, giảm số trang chứ không được làm JSON dang dở.
 `;
 }
 
@@ -1222,10 +1480,10 @@ export async function reviseLessonWithAI(
   settings?: LessonBuilderSettings,
 ): Promise<LessonContent> {
   const ai = new GoogleGenAI({ apiKey });
-  const response = await generateContentReliable(ai, model, {
+  const response = await generateLessonContentReliableRest(apiKey, model, {
     contents: [{
       role: 'user',
-      parts: [{ text: `Bạn là chuyên gia thiết kế bài học trực tuyến. Hãy chỉnh sửa JSON bài học theo yêu cầu của giáo viên, giữ nguyên schema_version lesson_v3, bảo toàn cấu trúc activities, pages, interactions, final_quiz, assessment. Không tạo tiêu đề dạng "Nội dung 1" dư thừa, không trả HTML thô như <br>, ưu tiên giữ ghi nhớ và câu hỏi lấy từ học liệu gốc; không ép câu hỏi mở thành đúng/sai; nếu cần câu hỏi mở, hãy chuyển thành fill_in_blank với 1 chỗ trống và 4 từ/cụm từ lựa chọn. Với content_blocks, đặt title ngắn gọn theo đúng ý chính, gán category/theme để giao diện hiển thị màu nền nhẹ phù hợp. Mọi single_choice phải có correctAnswer trùng nguyên văn đúng một option; mọi fill_in_blank phải có đúng 4 choices và correctAnswers trùng nguyên văn đúng một choice. Loại bỏ câu hỏi mơ hồ, cụt ý, sai chính tả hoặc có hơn một đáp án hợp lý; explanation phải thống nhất với đáp án đúng.\n\nYêu cầu chỉnh sửa: ${request}\n\nCấu hình hiện tại: ${JSON.stringify(settings || lesson.settings || {})}\n\nJSON bài học hiện tại:\n${JSON.stringify(lesson).slice(0, 60000)}\n\nChỉ trả về JSON bài học đã chỉnh sửa, không giải thích thêm.` }],
+      parts: [{ text: `Bạn là chuyên gia thiết kế bài học trực tuyến. Hãy chỉnh sửa JSON bài học theo yêu cầu của giáo viên, giữ nguyên schema_version lesson_v3, bảo toàn cấu trúc activities, pages, interactions, final_quiz, assessment. Nếu metadata có curriculum_requirement_ids/curriculum_requirements thì đó là YCCD CTGDPT 2018 bắt buộc: KHÔNG được đổi mã hoặc sửa nội dung chuẩn; mọi activity/interactions/final_quiz sau chỉnh sửa phải tiếp tục có requirement_ids phù hợp và câu hỏi phải bám động từ của YCCD. Không tạo tiêu đề dạng "Nội dung 1" dư thừa, không trả HTML thô như <br>, ưu tiên giữ ghi nhớ và câu hỏi lấy từ học liệu gốc; không ép câu hỏi mở thành đúng/sai; nếu cần câu hỏi mở, hãy chuyển thành fill_in_blank với 1 chỗ trống và 4 từ/cụm từ lựa chọn. Với content_blocks, đặt title ngắn gọn theo đúng ý chính, gán category/theme để giao diện hiển thị màu nền nhẹ phù hợp. Mọi single_choice phải có correctAnswer trùng nguyên văn đúng một option; mọi fill_in_blank phải có đúng 4 choices và correctAnswers trùng nguyên văn đúng một choice. Loại bỏ câu hỏi mơ hồ, cụt ý, sai chính tả hoặc có hơn một đáp án hợp lý; explanation phải thống nhất với đáp án đúng.\n\nYêu cầu chỉnh sửa: ${request}\n\nCấu hình hiện tại: ${JSON.stringify(settings || lesson.settings || {})}\n\nJSON bài học hiện tại:\n${JSON.stringify(lesson).slice(0, 60000)}\n\nChỉ trả về JSON bài học đã chỉnh sửa, không giải thích thêm.` }],
     }],
     config: {
       systemInstruction: 'Luôn trả về JSON hợp lệ theo schema lesson_v3. Không trả về markdown.',
@@ -1241,6 +1499,9 @@ export async function reviseLessonWithAI(
   }
   let normalized = normalizeLessonContent(parsed);
   normalized = await ensureLessonQuestionQuotas(ai, model, normalized, settings || lesson.settings);
+  const curriculumIds = Array.isArray(lesson.metadata?.curriculum_requirement_ids) ? lesson.metadata.curriculum_requirement_ids : [];
+  normalized = completeCurriculumReferences(normalizeCurriculumAlignment(normalized, curriculumIds), curriculumIds);
+  normalized.metadata = { ...normalized.metadata, ...lesson.metadata, curriculum_requirement_ids: curriculumIds };
   return normalized;
 }
 
@@ -1579,6 +1840,7 @@ async function ensureInteractiveQuestionCount(
   model: string,
   lesson: LessonContent,
   requestedCount: number,
+  options: { localOnly?: boolean } = {},
 ): Promise<LessonContent> {
   const target = Math.max(0, Math.min(10, Math.floor(Number(requestedCount || 0))));
   if (!target || !Array.isArray(lesson.activities) || !lesson.activities.length) return lesson;
@@ -1593,7 +1855,7 @@ async function ensureInteractiveQuestionCount(
   if (!shortages.length) return lesson;
 
   let supplemental: Record<string, QuizQuestion[]> = {};
-  try {
+  if (!options.localOnly) try {
     const compactActivities = shortages.map(({ activity, missing }) => ({
       activity_id: activity.activity_id,
       title: activity.title,
@@ -1643,6 +1905,13 @@ async function ensureInteractiveQuestionCount(
         question: source.question || source.sentence || `Câu hỏi tương tác ${current.length + 1}`,
       });
     }
+    const activitySeed = [activity.title, activity.objective, activity.summary]
+      .map((value) => cleanTextValue(value || ''))
+      .find(Boolean) || lesson.metadata?.tieu_de || lesson.title || 'Nội dung bài học';
+    while (current.length < target) {
+      const idx = current.length;
+      current.push(makeGuaranteedFallbackQuestion(activitySeed, `IQ_${activity.activity_id}_FALLBACK_${idx + 1}`, idx));
+    }
     return { ...activity, interactions: current.slice(0, target) };
   });
 
@@ -1651,15 +1920,43 @@ async function ensureInteractiveQuestionCount(
 
 function makeGuaranteedFallbackQuestion(seed: string, id: string, index: number): QuizQuestion {
   const title = cleanTextValue(seed || 'nội dung đang học') || 'nội dung đang học';
-  const correct = title.length > 90 ? title.slice(0, 90) : title;
+  const correct = title.length > 96 ? `${title.slice(0, 93)}…` : title;
+  const distractors = [
+    'Một nội dung không được đề cập trong phần học',
+    'Một nhận định trái với nội dung đang học',
+    'Một thao tác không liên quan đến nhiệm vụ học tập',
+  ];
+  const variant = index % 3;
+  if (variant === 1) {
+    return {
+      id,
+      type: 'true_false',
+      question: `Nhận định sau phù hợp với nội dung bài học: “${correct}”.`,
+      options: ['Đúng', 'Sai'],
+      correctAnswer: 'Đúng',
+      explanation: `Nội dung “${correct}” được rút ra từ phần học đang xét.`,
+      level: 'thong_hieu',
+    } as QuizQuestion;
+  }
+  if (variant === 2) {
+    return {
+      id,
+      type: 'fill_in_blank',
+      sentence: 'Một nội dung trọng tâm của phần học là _____.',
+      choices: [correct, ...distractors].slice(0, 4),
+      correctAnswers: [correct],
+      explanation: `Đáp án phù hợp với trọng tâm phần học là “${correct}”.`,
+      level: 'van_dung',
+    } as QuizQuestion;
+  }
   return {
     id,
     type: 'single_choice',
-    question: `Nội dung nào phù hợp nhất với trọng tâm của phần học này?`,
-    options: [correct, 'Một nội dung không liên quan đến bài học', 'Một thao tác không xuất hiện trong phần học', 'Một nhận định trái với nội dung đang học'],
+    question: `Ý nào phù hợp nhất với trọng tâm “${correct}”?`,
+    options: [correct, ...distractors],
     correctAnswer: correct,
-    explanation: `Trọng tâm của phần học là: ${correct}.`,
-    level: index % 3 === 0 ? 'nhan_biet' : index % 3 === 1 ? 'thong_hieu' : 'van_dung',
+    explanation: `Trọng tâm của phần học là “${correct}”.`,
+    level: 'nhan_biet',
   } as QuizQuestion;
 }
 
@@ -1678,13 +1975,14 @@ async function ensureFinalQuizCount(
   model: string,
   lesson: LessonContent,
   requestedCount: number,
+  options: { localOnly?: boolean } = {},
 ): Promise<LessonContent> {
   const target = Math.max(0, Math.min(100, Math.floor(Number(requestedCount || 0))));
   if (!target) return lesson;
   let current = [...(lesson.final_quiz || [])];
   if (current.length >= target) return normalizeLessonV3({ ...lesson, final_quiz: current.slice(0, target) });
   const missing = target - current.length;
-  try {
+  if (!options.localOnly) try {
     const response = await generateContentReliable(ai, model, {
       contents: [{ role: 'user', parts: [{ text: `Bổ sung chính xác ${missing} câu kiểm tra cuối bài còn thiếu cho bài học sau.\nChỉ dùng single_choice, true_false, fill_in_blank.\nCâu hỏi phải bám sát nội dung bài học, không lặp câu đã có.\nMỗi câu phải có id, explanation, level và đáp án hợp lệ.\nChỉ trả JSON dạng {"questions":[...]}.\n\nBài học: ${JSON.stringify({ metadata: lesson.metadata, activities: lesson.activities, existing: current.map((q) => q.question || q.sentence) }).slice(0, 45000)}` }] }],
       config: { systemInstruction: 'Chỉ trả JSON hợp lệ và tạo đủ chính xác số câu được yêu cầu.', responseMimeType: 'application/json', temperature: 0.2 },
@@ -1709,6 +2007,48 @@ async function ensureFinalQuizCount(
   return normalizeLessonV3({ ...lesson, schema_version: 'lesson_v3', final_quiz: current.slice(0, target) });
 }
 
+
+function quizStem(question: QuizQuestion) {
+  return cleanTextValue((question as any).question || (question as any).sentence || '').toLocaleLowerCase('vi');
+}
+
+function ensureQuestionBankCount(lesson: LessonContent, requestedCount: number): LessonContent {
+  const target = Math.max(0, Math.min(120, Math.floor(Number(requestedCount || 0))));
+  if (!target) return normalizeLessonV3({ ...lesson, question_bank: [] });
+  const pool = [
+    ...(lesson.question_bank || []),
+    ...(lesson.final_quiz || []),
+    ...(lesson.activities || []).flatMap((activity) => activity.interactions || []),
+  ];
+  const seen = new Set<string>();
+  const bank: QuizQuestion[] = [];
+  for (const raw of pool) {
+    const normalized = sanitizeQuizQuestion(raw as QuizQuestion);
+    if (!normalized) continue;
+    const stem = quizStem(normalized);
+    if (!stem || seen.has(stem)) continue;
+    seen.add(stem);
+    bank.push({ ...normalized, id: `QB${bank.length + 1}` });
+    if (bank.length >= target) break;
+  }
+  const seeds = lessonFallbackSeeds(lesson);
+  let cursor = 0;
+  while (bank.length < target) {
+    const seed = seeds[cursor % seeds.length];
+    const generated = makeGuaranteedFallbackQuestion(seed, `QB${bank.length + 1}`, cursor);
+    const stem = quizStem(generated);
+    if (!seen.has(stem)) {
+      seen.add(stem);
+      bank.push(generated);
+    } else {
+      const uniqueSeed = `${seed} — ý ${cursor + 1}`;
+      bank.push(makeGuaranteedFallbackQuestion(uniqueSeed, `QB${bank.length + 1}`, cursor));
+    }
+    cursor += 1;
+  }
+  return normalizeLessonV3({ ...lesson, schema_version: 'lesson_v3', question_bank: bank.slice(0, target) });
+}
+
 export function getLessonQuestionQuotaStatus(lesson: LessonContent, settings?: LessonBuilderSettings) {
   const effective = (settings || lesson.settings || {}) as Partial<LessonBuilderSettings>;
   const interactionTarget = Math.max(0, Math.floor(Number(effective.interactive_questions_per_section || 0)));
@@ -1725,26 +2065,40 @@ export function getLessonQuestionQuotaStatus(lesson: LessonContent, settings?: L
 
 async function ensureLessonQuestionQuotas(ai: GoogleGenAI, model: string, lesson: LessonContent, settings?: LessonBuilderSettings) {
   const effective = (settings || lesson.settings || {}) as Partial<LessonBuilderSettings>;
-  let repaired = await ensureInteractiveQuestionCount(ai, model, lesson, Number(effective.interactive_questions_per_section || 0));
-  repaired = await ensureFinalQuizCount(ai, model, repaired, Number(effective.final_quiz_count || 0));
-  // Chuẩn hóa có thể loại câu không hợp lệ; chạy lại một lần nữa để quota là ràng buộc cuối cùng.
+  // V6.98.7: quota phải không tạo thêm chuỗi request AI sau khi bài học chính đã
+  // sinh xong. Trên Netlify, các lượt bổ sung nối tiếp là nguyên nhân phổ biến
+  // khiến màn hình giữ trạng thái "đang tạo" quá lâu khi Gemini quá tải.
+  // Ưu tiên câu AI đã có; phần còn thiếu được hoàn thiện cục bộ từ ngân hàng/nội dung.
+  let repaired = normalizeLessonContent(lesson);
+  repaired = await ensureInteractiveQuestionCount(ai, model, repaired, Number(effective.interactive_questions_per_section || 0), { localOnly: true });
+  repaired = await ensureFinalQuizCount(ai, model, repaired, Number(effective.final_quiz_count || 0), { localOnly: true });
   repaired = normalizeLessonContent(repaired);
-  repaired = await ensureInteractiveQuestionCount(ai, model, repaired, Number(effective.interactive_questions_per_section || 0));
-  repaired = await ensureFinalQuizCount(ai, model, repaired, Number(effective.final_quiz_count || 0));
+  repaired = await ensureInteractiveQuestionCount(ai, model, repaired, Number(effective.interactive_questions_per_section || 0), { localOnly: true });
+  repaired = await ensureFinalQuizCount(ai, model, repaired, Number(effective.final_quiz_count || 0), { localOnly: true });
+  repaired = ensureQuestionBankCount(repaired, Number(effective.question_bank_size || 0));
   const status = getLessonQuestionQuotaStatus(repaired, effective as LessonBuilderSettings);
-  if (!status.ok) throw new Error(`AI chưa tạo đủ số câu theo cấu hình. Tương tác: ${status.activities.map((x) => `${x.actual}/${x.target}`).join(', ')}; cuối bài: ${status.final.actual}/${status.final.target}.`);
+  if (!status.ok) throw new Error(`Chưa hoàn thiện đủ số câu theo cấu hình. Tương tác: ${status.activities.map((x) => `${x.actual}/${x.target}`).join(', ')}; cuối bài: ${status.final.actual}/${status.final.target}.`);
   return repaired;
 }
 
 export async function analyzeLessonMaterial(
   apiKey: string,
   model: string,
-  values: Pick<LessonComposerValues, 'tieu_de' | 'mon_id' | 'khoi' | 'source_text'>,
+  values: Pick<LessonComposerValues, 'tieu_de' | 'mon_id' | 'khoi' | 'source_text' | 'textbook_series' | 'textbook_catalog_version' | 'textbook_lesson_id' | 'textbook_lesson_code' | 'textbook_topic_id' | 'curriculum_program' | 'curriculum_version' | 'curriculum_requirement_ids'>,
   sourceFile?: UploadedSourceFile | null,
   subjectLabel?: string,
   settings?: LessonBuilderSettings,
+  runtime?: { signal?: AbortSignal },
 ): Promise<LessonContent> {
   const ai = new GoogleGenAI({ apiKey });
+  // V6.98.7: một lần tạo bài trên web có ngân sách thời gian tổng. Nếu Gemini
+  // chậm/quá tải, yêu cầu phải kết thúc có kiểm soát thay vì giữ UI vô thời hạn.
+  const taskDeadlineAt = Date.now() + 120_000;
+  const taskBudget = (capMs: number) => {
+    const remaining = taskDeadlineAt - Date.now();
+    if (remaining <= 2_000) throw safeGeminiUserError(createGeminiTimeoutError('lesson-generation', 120_000));
+    return Math.max(2_000, Math.min(capMs, remaining));
+  };
   const parts: any[] = [{ text: buildAnalysisPrompt(values, subjectLabel, settings) }];
 
   if (sourceFile?.base64) {
@@ -1763,13 +2117,20 @@ ${values.source_text.trim().slice(0, 25000)}`,
     });
   }
 
-  const response = await generateContentReliable(ai, model, {
+  const response = await generateLessonContentReliableRest(apiKey, model, {
     contents: [{ role: 'user', parts }],
     config: {
       systemInstruction: 'Bạn tạo học liệu số chất lượng cao cho học sinh phổ thông Việt Nam. Luôn xuất JSON hợp lệ.',
       responseMimeType: 'application/json',
       temperature: 0.3,
     },
+  }, {
+    label: 'lesson-analysis',
+    signal: runtime?.signal,
+    totalTimeoutMs: taskBudget(82_000),
+    attemptTimeoutMs: 28_000,
+    maxCandidates: 4,
+    primaryAttempts: 1,
   });
 
   let parsed: any;
@@ -1777,7 +2138,7 @@ ${values.source_text.trim().slice(0, 25000)}`,
     parsed = extractJson(response.text || '');
   } catch (error) {
     try {
-      parsed = await repairLessonJsonWithAI(apiKey, model, response.text || '', error);
+      parsed = await repairLessonJsonWithAI(apiKey, model, response.text || '', error, { signal: runtime?.signal, totalTimeoutMs: taskBudget(32_000) });
     } catch (repairError) {
       const retryParts: any[] = [{
         text: `${buildAnalysisPrompt(values, subjectLabel, settings)}
@@ -1809,20 +2170,27 @@ ${values.source_text.trim().slice(0, 18000)}`,
         });
       }
 
-      const retryResponse = await generateContentReliable(ai, model, {
+      const retryResponse = await generateLessonContentReliableRest(apiKey, model, {
         contents: [{ role: 'user', parts: retryParts }],
         config: {
           systemInstruction: 'Chỉ tạo JSON hợp lệ. Không markdown. Không giải thích. Ưu tiên JSON ngắn gọn nhưng đúng cú pháp.',
           responseMimeType: 'application/json',
           temperature: 0.05,
         },
+      }, {
+        label: 'lesson-json-regeneration',
+        signal: runtime?.signal,
+        totalTimeoutMs: taskBudget(32_000),
+        attemptTimeoutMs: 22_000,
+        maxCandidates: 3,
+        primaryAttempts: 1,
       });
 
       try {
         parsed = extractJson(retryResponse.text || '');
       } catch (retryError) {
         try {
-          parsed = await repairLessonJsonWithAI(apiKey, model, retryResponse.text || '', retryError);
+          parsed = await repairLessonJsonWithAI(apiKey, model, retryResponse.text || '', retryError, { signal: runtime?.signal, totalTimeoutMs: taskBudget(24_000) });
         } catch (finalError) {
           console.warn('[EduSmart][AI] lesson JSON regeneration failed.', finalError);
           throw new Error('Chưa thể hoàn tất nội dung bài học ở lần tạo này. Vui lòng bấm tạo lại; tài liệu và cấu hình hiện tại vẫn được giữ nguyên.');
@@ -1832,6 +2200,23 @@ ${values.source_text.trim().slice(0, 18000)}`,
   }
   let normalized = normalizeLessonContent(parsed);
   normalized = await ensureLessonQuestionQuotas(ai, model, normalized, settings);
+  const curriculumIds = Array.isArray(values.curriculum_requirement_ids) ? values.curriculum_requirement_ids : [];
+  normalized = completeCurriculumReferences(normalizeCurriculumAlignment(normalized, curriculumIds), curriculumIds);
+  const selectedRequirements = getCurriculumRequirementsByIds(curriculumIds);
+  normalized.metadata = {
+    ...normalized.metadata,
+    curriculum_program: values.curriculum_program || CURRICULUM_PROGRAM,
+    curriculum_version: values.curriculum_version || CURRICULUM_VERSION,
+    textbook_series: values.textbook_series || TEXTBOOK_SERIES_KNTT,
+    textbook_catalog_version: values.textbook_catalog_version || getTextbookCatalogVersion(subjectLabel || values.mon_id || '') || TEXTBOOK_CATALOG_VERSION,
+    textbook_lesson_id: values.textbook_lesson_id || '',
+    textbook_lesson_code: values.textbook_lesson_code || '',
+    textbook_topic_id: values.textbook_topic_id || '',
+    curriculum_requirement_ids: curriculumIds,
+    curriculum_requirements: selectedRequirements.map((item) => ({ id: item.id, text: item.text, competency: item.competency, source_kind: item.sourceKind, source_url: item.sourceUrl || CURRICULUM_REFERENCE_URL })),
+    curriculum_source_url: selectedRequirements.length ? CURRICULUM_REFERENCE_URL : normalized.metadata?.curriculum_source_url,
+    textbook_source_url: values.textbook_lesson_id ? getTextbookReferenceUrl(subjectLabel || values.mon_id || '') : normalized.metadata?.textbook_source_url,
+  };
   if (!normalized.metadata.tieu_de) {
     normalized.metadata.tieu_de = values.tieu_de || 'Bài học mới';
   }
@@ -2184,7 +2569,7 @@ export async function testGeminiKey(apiKey: string, model: string): Promise<Gemi
       .map((item: any) => String(item?.baseModelId || item?.name || '').replace(/^models\//, '').trim())
       .filter((name: string) => /^gemini-/i.test(name));
 
-    const uniqueAvailable = Array.from(new Set(availableModels));
+    const uniqueAvailable = Array.from(new Set<string>(availableModels));
     if (!uniqueAvailable.length) {
       return {
         ok: false,

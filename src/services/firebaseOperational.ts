@@ -31,6 +31,7 @@ import {
 import { getAllQueryDocs } from './firebaseQueries';
 import { resolveLessonSaveState } from '../utils/lessonWorkflow';
 import { buildLessonTitle, normalizeLessonName, normalizeLessonNumber, resolveLessonIdentity } from '../utils/lessonCatalog';
+import { buildTextbookLessonTitle, getTextbookLessonById } from '../data/curriculum/registry';
 import { getLessonScheduleAccess } from '../utils/lessonAccess';
 import { calculateFairAssessmentScore, mergeSectionProgressMonotonic } from '../utils/learningScoreEngine';
 import { firebaseErrorCode } from '../utils/firebaseErrors';
@@ -215,16 +216,17 @@ function audienceKeys(grade: unknown, classId: unknown) {
   return ['all'];
 }
 
-function lessonRegistryKey(source: { nam_hoc?: unknown; hoc_ky?: unknown; mon_id?: unknown; khoi?: unknown; lesson_number?: unknown; tieu_de?: unknown }) {
+function lessonRegistryKey(source: { nam_hoc?: unknown; hoc_ky?: unknown; mon_id?: unknown; khoi?: unknown; lesson_number?: unknown; tieu_de?: unknown; textbook_lesson_id?: unknown }) {
   const identity = resolveLessonIdentity(source);
-  if (!identity.lessonNumber) return '';
+  const catalogLessonId = clean(source.textbook_lesson_id);
+  if (!identity.lessonNumber && !catalogLessonId) return '';
   const encode = (value: unknown) => encodeURIComponent(clean(value).toLowerCase());
   return [
     encode(source.nam_hoc || 'unknown-year'),
     encode(source.hoc_ky || 'HK1'),
     encode(source.mon_id),
     `g${encode(source.khoi)}`,
-    `n${identity.lessonNumber}`,
+    catalogLessonId ? `t${encode(catalogLessonId)}` : `n${identity.lessonNumber}`,
   ].join('__');
 }
 
@@ -1298,11 +1300,13 @@ export async function saveFirebaseLesson(payload: LessonComposerValues, updating
   if (!lessonNumber) throw new Error('Bài số phải là số nguyên dương. Ví dụ nhập 1 để tạo Bài 1.');
   if (!lessonName) throw new Error('Tên bài không được để trống.');
 
+  const catalogLesson = getTextbookLessonById(payload.textbook_lesson_id);
+  const structuredTitle = catalogLesson ? buildTextbookLessonTitle(catalogLesson) : buildLessonTitle(lessonNumber, lessonName);
   const normalizedPayload: LessonComposerValues = {
     ...payload,
     lesson_number: lessonNumber,
     lesson_name: lessonName,
-    tieu_de: buildLessonTitle(lessonNumber, lessonName),
+    tieu_de: structuredTitle,
     nam_hoc: clean(payload.nam_hoc),
     hoc_ky: clean(payload.hoc_ky || 'HK1').toUpperCase(),
     mon_id: clean(payload.mon_id),
@@ -1328,6 +1332,14 @@ export async function saveFirebaseLesson(payload: LessonComposerValues, updating
           lesson_number: lessonNumber,
           lesson_name: lessonName,
           khoi: normalizedPayload.khoi,
+          curriculum_program: normalizedPayload.curriculum_program || payload.lesson_json.metadata?.curriculum_program,
+          curriculum_version: normalizedPayload.curriculum_version || payload.lesson_json.metadata?.curriculum_version,
+          textbook_series: normalizedPayload.textbook_series || payload.lesson_json.metadata?.textbook_series,
+          textbook_catalog_version: normalizedPayload.textbook_catalog_version || payload.lesson_json.metadata?.textbook_catalog_version,
+          textbook_lesson_id: normalizedPayload.textbook_lesson_id || payload.lesson_json.metadata?.textbook_lesson_id,
+          textbook_lesson_code: normalizedPayload.textbook_lesson_code || payload.lesson_json.metadata?.textbook_lesson_code,
+          textbook_topic_id: normalizedPayload.textbook_topic_id || payload.lesson_json.metadata?.textbook_topic_id,
+          curriculum_requirement_ids: normalizedPayload.curriculum_requirement_ids || payload.lesson_json.metadata?.curriculum_requirement_ids || [],
         },
       }
     : payload.lesson_json;
@@ -2996,7 +3008,7 @@ export async function listFirebasePreLessonSubmissions(filters: Record<string, u
     if (filterUserId && clean(item.user_id) !== filterUserId) return false;
     if (filterClassId && !sameClassId(item.lop_id, filterClassId)) return false;
     if (filterGrade && !sameGrade(item.khoi, filterGrade)) return false;
-    if (me.role === 'teacher' && me.adminPermission !== true && !teacherLessonResultsPermission && !teacherCanManageGrade(me, item.khoi)) return false;
+    if (me.role === 'teacher' && me.adminPermission !== true && !canIdentityUseLessonPermission(me, lessonDataById.get(clean(item.lesson_id)) || {}, 'results') && !teacherCanManageGrade(me, item.khoi)) return false;
     return true;
   });
   if (!filtered.length && flattened.length > 0 && memberLoadErrors.length > 0 && (filterClassId || filterUserId)) {
@@ -3702,8 +3714,13 @@ export async function saveFirebaseLessonRetake(attempt: LessonRetakeAttempt): Pr
     completed_at: completed ? (clean(attempt.completed_at) || now) : '',
     updatedAt: serverTimestamp(),
   });
-  await setDoc(retakeRef(officialId, clean(attempt.attempt_id)), data, { merge: true });
-  return data as unknown as LessonRetakeAttempt;
+  return runTransaction(firestoreDb, async (tx) => {
+    const ref = retakeRef(officialId, clean(attempt.attempt_id));
+    const snap = await tx.get(ref);
+    if (snap.exists() && snap.data().status === 'completed') return snap.data() as LessonRetakeAttempt;
+    tx.set(ref, data, { merge: true });
+    return data as unknown as LessonRetakeAttempt;
+  });
 }
 
 /** V6.84.1: promote một official retake thành điểm chính thức mới. */
@@ -3737,13 +3754,18 @@ export async function finalizeFirebaseOfficialRetake(attempt: LessonRetakeAttemp
       && clean(current.score_reason) === 'official_retake'
       && Number(current.official_retake_remaining || 0) === 0;
     if (alreadyPromoted) return current as unknown as LessonProgressRecord;
+    if (!attemptSnap.exists() || attemptServer.status !== 'completed' || JSON.stringify(attemptServer.progress) !== JSON.stringify(attempt.progress)) {
+      // Compare stable scoring fields below; Firestore may reorder map keys.
+      if (!attemptSnap.exists() || attemptServer.status !== 'completed' || Number(attemptServer.progress?.assessment_score) !== Number(progress.assessment_score)) throw new Error('Lượt học lại chưa được chốt trên hệ thống.');
+    }
+    const sealedProgress = normalizeScoreModelV4SubmissionEnvelope(attemptServer.progress);
     const grantId = clean(current.official_retake_grant_id);
     if (Number(current.official_retake_remaining || 0) < 1 || !grantId || grantId !== clean(attempt.official_retake_grant_id)) {
       throw new Error('Quyền học lại cập nhật điểm đã hết hiệu lực.');
     }
     const previousScore = Number.isFinite(Number(current.assessment_score)) ? Number(current.assessment_score) : (Number.isFinite(Number(current.previous_official_score)) ? Number(current.previous_official_score) : undefined);
     const next = withoutUndefined({
-      ...progress,
+      ...sealedProgress,
       schoolId: FIREBASE_SCHOOL_ID,
       schemaVersion: 2,
       progress_id: officialId,
@@ -3757,6 +3779,7 @@ export async function finalizeFirebaseOfficialRetake(attempt: LessonRetakeAttemp
       retake_allowed: true,
       result_version: Math.max(Number(current.result_version || 0) + 1, Date.now()),
       official_retake_remaining: 0,
+      official_retake_grant_id: grantId,
       official_retake_last_consumed_at: now,
       official_retake_count: Number(current.official_retake_count || 0) + 1,
       previous_official_score: previousScore,
@@ -3768,18 +3791,19 @@ export async function finalizeFirebaseOfficialRetake(attempt: LessonRetakeAttemp
     // V6.88.22: update the durable official-submission ledger in the same
     // atomic promotion. Without this, analytics could overlay the previous score
     // from finalSubmissions after a successful official retake.
-    const durableRetake = buildCanonicalFinalSubmission({ ...progress, score_reason: 'official_retake' } as LessonProgressRecord, me);
+    const durableRetake = buildCanonicalFinalSubmission({ ...sealedProgress, score_reason: 'official_retake' } as LessonProgressRecord, me);
     if (durableRetake) {
       tx.set(finalSubmissionRef(clean(me.userId), clean(attempt.lesson_id)), {
         ...durableRetake,
         score_reason: 'official_retake',
+        official_retake_grant_id: grantId,
         result_version: Number(next.result_version || durableRetake.result_version || Date.now()),
         updated_at: now,
         updatedAt: serverTimestamp(),
       }, { merge: true });
     }
     tx.set(officialRef, next, { merge: false });
-    tx.set(attemptRef, { status: 'completed', promoted_to_official: true, promoted_at: now, updatedAt: serverTimestamp() }, { merge: true });
+    tx.set(attemptRef, { status: 'completed', promoted_to_official: true, promoted_at: now, previous_official_result: withoutUndefined({ score: previousScore, step_details: current.step_details || {}, score_reason: current.score_reason || '', completed_at: current.previous_official_completed_at || current.updated_at || '' }), updatedAt: serverTimestamp() }, { merge: true });
     return next as unknown as LessonProgressRecord;
     });
   } catch (error) {
@@ -4197,7 +4221,8 @@ function mergeProgressPayloadMonotonic(current: any, incoming: LessonProgressRec
   const incomingFinalized = clean(incoming?.score_status) === 'finalized' && Number.isFinite(Number(incoming?.assessment_score));
   // V6.88.9: autosave/in-progress packets can arrive after the official submit.
   // Never let such a late packet erase or downgrade a score already finalized on server.
-  const preserveOfficialScore = currentFinalized && !incomingFinalized;
+  const preserveOfficialScore = currentFinalized && current?.score_reason !== 'deadline_missed';
+  if (preserveOfficialScore) return current;
   const stageKeys = ['khoi_dong', 'hinh_thanh_kien_thuc', 'luyen_tap', 'van_dung', 'tong_ket'];
   const mergedSteps: Record<string, any> = {};
   stageKeys.forEach((stage) => {
@@ -4396,6 +4421,9 @@ function buildCanonicalFinalSubmission(payload: LessonProgressRecord, me: any) {
     total_count: Math.max(1, Math.floor(totalCount)),
     attempt_number: Math.max(1, Math.floor(Number(finalExam.attempt_number || 1))),
     final_exam_status: finalStatus,
+    final_exam_snapshot: finalExam,
+    quiz_answers: normalized.step_details?.luyen_tap?.quizAnswers || {},
+    section_progress: normalized.step_details?.luyen_tap?.sectionProgress || {},
     completion_percent: Math.max(0, Math.min(100, Number(normalized.completion_percent || 0))),
     result_version: Math.max(Number(normalized.result_version || 0), Date.now()),
     submitted_at: clean(finalExam.submitted_at) || new Date().toISOString(),
@@ -4407,20 +4435,13 @@ async function saveCanonicalFinalSubmission(payload: LessonProgressRecord, me: a
   const data = buildCanonicalFinalSubmission(payload, me);
   if (!data) return null;
   const ref = finalSubmissionRef(data.user_id, data.lesson_id);
-  await setDoc(ref, { ...data, updatedAt: serverTimestamp() }, { merge: true });
-  const verified = await getDoc(ref);
-  if (!verified.exists()) throw Object.assign(new Error('Kết quả nộp bài chưa được xác nhận. Hãy thử lại.'), { diagnosticCode: 'FINAL_SUBMISSION_NOT_CONFIRMED' });
-  const row = verified.data() as any;
-  const serverScore = Number(row.assessment_score ?? row.score);
-  if (clean(row.ownerUid) !== clean(me.uid)
-    || clean(row.user_id) !== clean(me.userId)
-    || clean(row.lesson_id) !== clean(data.lesson_id)
-    || clean(row.score_status) !== 'finalized'
-    || !Number.isFinite(serverScore)
-    || Math.abs(serverScore - Number(data.assessment_score)) > 0.001) {
-    throw Object.assign(new Error('Kết quả nộp bài chưa được xác nhận đầy đủ. Hãy thử lại.'), { diagnosticCode: 'FINAL_SUBMISSION_VERIFY_FAILED' });
-  }
-  return { ...data, ...row, assessment_score: serverScore, final_quiz_score: serverScore, score: serverScore };
+  return runTransaction(firestoreDb, async (tx) => {
+    const existing = await tx.get(ref);
+    if (existing.exists()) return existing.data();
+    const row = { ...data, updatedAt: serverTimestamp() };
+    tx.set(ref, row);
+    return data;
+  });
 }
 
 function progressFallbackFromFinalSubmission(payload: LessonProgressRecord, submission: any): LessonProgressRecord {
@@ -4449,8 +4470,10 @@ function progressFallbackFromFinalSubmission(payload: LessonProgressRecord, subm
       luyen_tap: {
         ...(payload.step_details?.luyen_tap || {}),
         completed: true,
+        quizAnswers: submission.quiz_answers || payload.step_details?.luyen_tap?.quizAnswers || {},
+        sectionProgress: submission.section_progress || payload.step_details?.luyen_tap?.sectionProgress || {},
         finalExam: {
-          ...finalExam,
+          ...(submission.final_exam_snapshot || finalExam),
           status: clean(submission?.final_exam_status || finalExam.status) || 'submitted',
           score,
           total_score: score,
@@ -4464,6 +4487,28 @@ function progressFallbackFromFinalSubmission(payload: LessonProgressRecord, subm
   }) as unknown as LessonProgressRecord;
 }
 
+/** Confirmed submissions only. Cached/pending writes cannot unlock or replace a result. */
+export function subscribeFirebaseSubmittedResult(userId: string, lessonId: string, onResult: (result: LessonProgressRecord) => void) {
+  let progress: any = null;
+  let ledger: any = null;
+  const emit = () => {
+    if (progress?.score_status === 'retake_pending') return;
+    if (ledger?.score_status === 'finalized') {
+      onResult(progressFallbackFromFinalSubmission(progress || { user_id: userId, lesson_id: lessonId }, ledger));
+    } else if (progress?.score_status === 'finalized' && progress?.score_reason !== 'deadline_missed') onResult(progress);
+  };
+  const error = () => { /* Offline: keep the local sealed snapshot and retry queue. */ };
+  const unsubscribeProgress = onSnapshot(doc(school(), 'learningProgress', `${userId}_${lessonId}`), { includeMetadataChanges: true }, (snap) => {
+    if (snap.metadata.hasPendingWrites || snap.metadata.fromCache) return;
+    progress = snap.exists() ? snap.data() : null; emit();
+  }, error);
+  const unsubscribeLedger = onSnapshot(finalSubmissionRef(userId, lessonId), { includeMetadataChanges: true }, (snap) => {
+    if (snap.metadata.hasPendingWrites || snap.metadata.fromCache) return;
+    ledger = snap.exists() ? snap.data() : null; emit();
+  }, error);
+  return () => { unsubscribeProgress(); unsubscribeLedger(); };
+}
+
 async function saveFirebaseProgressNow(payload: LessonProgressRecord) {
   const me = await identity();
   const canonicalUserId = me.role === 'student' ? clean(me.userId) : clean(payload.user_id || me.userId);
@@ -4471,6 +4516,12 @@ async function saveFirebaseProgressNow(payload: LessonProgressRecord) {
   const progressId = payload.study_mode === 'co_learning'
     ? (clean(payload.progress_id) || `${canonicalUserId}_${canonicalLessonId}`)
     : `${canonicalUserId}_${canonicalLessonId}`;
+  const existingProgress = await getDoc(doc(school(), 'learningProgress', progressId));
+  const existingData = existingProgress.exists() ? existingProgress.data() : null;
+  if (me.role === 'student' && existingData) {
+    if (existingData.score_status === 'retake_pending' || existingData.result_state === 'invalid_cheating') return existingData as LessonProgressRecord;
+    if (existingData.score_status === 'finalized' && existingData.score_reason !== 'deadline_missed') return existingData as LessonProgressRecord;
+  }
   const now = new Date().toISOString();
   const resultVersion = Math.max(Number(payload.result_version || 0) + 1, Date.now());
   const commonIncoming = withoutUndefined({
@@ -4641,7 +4692,8 @@ async function saveFirebaseProgressNow(payload: LessonProgressRecord) {
     ...commonIncoming,
     result_group_id: clean(payload.result_group_id) || `${canonicalUserId}_${canonicalLessonId}`,
   }) as unknown as LessonProgressRecord;
-  const data = mergeProgressPayloadMonotonic(currentData, incoming) as LessonProgressRecord;
+  const canonicalIncoming = durableSubmission ? progressFallbackFromFinalSubmission(incoming, durableSubmission) : incoming;
+  const data = mergeProgressPayloadMonotonic(currentData, canonicalIncoming) as LessonProgressRecord;
   try {
     await setDoc(ref, progressFirestoreWriteData(data), { merge: true });
   } catch (error) {
@@ -4663,6 +4715,7 @@ async function saveFirebaseProgressNow(payload: LessonProgressRecord) {
   }
   const verified = verifiedSnap.data() as LessonProgressRecord;
   if (Number(verified.result_version || 0) < Number(resultVersion || 0)) {
+    if (durableSubmission) return progressFallbackFromFinalSubmission(verified, durableSubmission);
     throw Object.assign(new Error('Kết quả đang được đồng bộ. Bài làm của em vẫn được giữ an toàn; hãy thử lại.'), { diagnosticCode: 'LEARNING_RESULT_VERSION_NOT_CONFIRMED' });
   }
   if (clean(data.score_status) === 'finalized' && Number.isFinite(Number(data.assessment_score))) {

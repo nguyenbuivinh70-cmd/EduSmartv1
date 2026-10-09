@@ -25,6 +25,8 @@ import LessonContentEditorWindow from './LessonContentEditorWindow';
 import YoutubeEmbedBlock, { getYoutubeEmbedUrl } from './YoutubeEmbedBlock';
 import { LESSON_TEACHER_PERMISSION_KEYS, LESSON_TEACHER_PERMISSION_LABELS, normalizeLessonTeacherPermissionList, normalizeLessonTeacherPermissionMap } from '../utils/lessonPermissions';
 import { professionalUserMessage } from '../utils/userMessages';
+import { CURRICULUM_PROGRAM, CURRICULUM_REFERENCE_URL, CURRICULUM_VERSION, TEXTBOOK_CATALOG_VERSION, TEXTBOOK_SERIES_KNTT, buildTextbookLessonTitle, getCurriculumRequirementsByIds, getKnttLessons, getTextbookCatalogVersion, getTextbookLessonById, getTextbookReferenceUrl, getTopicOptionsForSubjectGrade, isCurriculumCatalogAvailable, textbookLessonOptionLabel } from '../data/curriculum/registry';
+import { completeCurriculumReferences, getCurriculumCoverageStatus, normalizeCurriculumAlignment } from '../utils/curriculumAlignment';
 
 function gradeIncluded(subjectGradeList: string | undefined, grade: string) {
   const normalizedGrade = String(grade || '').trim();
@@ -72,7 +74,7 @@ interface LessonComposerProps {
 type ComposerStep = 'info' | 'settings' | 'material' | 'content' | 'publish';
 
 const COMPOSER_STEPS: Array<{ id: ComposerStep; label: string; description: string; icon: typeof FileText }> = [
-  { id: 'info', label: 'Thông tin', description: 'Môn, khối, số bài và tên bài', icon: FileText },
+  { id: 'info', label: 'Thông tin', description: 'Môn, khối và bài học', icon: FileText },
   { id: 'settings', label: 'Thiết kế', description: 'Cấu hình trước khi tạo', icon: Settings2 },
   { id: 'material', label: 'Học liệu', description: 'Nguồn bài và video', icon: PlayCircle },
   { id: 'content', label: 'Biên tập', description: 'Nội dung AI đã tạo', icon: Sparkles },
@@ -151,6 +153,8 @@ function formatDefaultUpdatedAt(value?: string) {
 
 function buildInitialValues(user: User, lesson?: Lesson | null, content?: LessonContent | null, systemSchoolYear?: string, defaultBuilderSettings?: LessonBuilderSettings | null): LessonComposerValues {
   const quickDefaults = !lesson ? readSavedAssignmentConfiguration(user) : null;
+  const rawLesson = (lesson?.raw || {}) as any;
+  const initialCatalogLesson = getTextbookLessonById(rawLesson.textbook_lesson_id || content?.metadata?.textbook_lesson_id);
   const savedBuilderSettings = (lesson?.raw as any)?.builder_settings as LessonBuilderSettings | undefined;
   const settings = mergeLessonBuilderSettings(savedBuilderSettings || content?.settings || (!lesson ? defaultBuilderSettings : null));
   const sectionVideoLinks = (content?.sections || []).map((section) => section.youtube_url || section.youtube_embed_url || '').join('\n');
@@ -166,9 +170,19 @@ function buildInitialValues(user: User, lesson?: Lesson | null, content?: Lesson
     : Boolean(introVideoUrl) || !lesson;
   return {
     lesson_id: lesson?.lesson_id,
-    tieu_de: identity.title,
-    lesson_number: identity.lessonNumber,
-    lesson_name: identity.lessonName,
+    lesson_source_mode: rawLesson.lesson_source_mode || (lesson ? (rawLesson.textbook_lesson_id ? 'catalog' : 'custom') : 'catalog'),
+    textbook_series: rawLesson.textbook_series || TEXTBOOK_SERIES_KNTT,
+    textbook_catalog_version: rawLesson.textbook_catalog_version || TEXTBOOK_CATALOG_VERSION,
+    textbook_lesson_id: rawLesson.textbook_lesson_id || content?.metadata?.textbook_lesson_id || '',
+    textbook_lesson_code: rawLesson.textbook_lesson_code || content?.metadata?.textbook_lesson_code || '',
+    textbook_topic_id: rawLesson.textbook_topic_id || content?.metadata?.textbook_topic_id || '',
+    curriculum_program: rawLesson.curriculum_program || content?.metadata?.curriculum_program || CURRICULUM_PROGRAM,
+    curriculum_version: rawLesson.curriculum_version || content?.metadata?.curriculum_version || CURRICULUM_VERSION,
+    curriculum_requirement_ids: rawLesson.curriculum_requirement_ids || content?.metadata?.curriculum_requirement_ids || [],
+    curriculum_override_confirmed: rawLesson.curriculum_override_confirmed === true,
+    tieu_de: initialCatalogLesson ? buildTextbookLessonTitle(initialCatalogLesson) : identity.title,
+    lesson_number: initialCatalogLesson?.lessonNumber ?? identity.lessonNumber,
+    lesson_name: initialCatalogLesson?.title ?? identity.lessonName,
     tom_tat: lesson?.mo_ta || content?.metadata?.tom_tat || '',
     mon_id: lesson?.mon_id || '',
     khoi: lesson?.khoi || getManagedGradeScope(user)[0] || user.khoi || '6',
@@ -315,10 +329,16 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
   const [contentNeedsRegeneration, setContentNeedsRegeneration] = useState(false);
   const [savedStatusMessage, setSavedStatusMessage] = useState('');
   const savedSnapshotRef = useRef('');
+  const analyzeAbortRef = useRef<AbortController | null>(null);
   const isEditMode = Boolean(initialLesson?.lesson_id);
   const currentSnapshot = useMemo(() => lessonEditSnapshot(values), [values]);
   const hasUnsavedChanges = isEditMode && Boolean(savedSnapshotRef.current) && savedSnapshotRef.current !== currentSnapshot;
   const gradeOptions = useMemo(() => getAvailableLessonGrades(classes, user), [classes, user]);
+
+  useEffect(() => () => {
+    analyzeAbortRef.current?.abort();
+    analyzeAbortRef.current = null;
+  }, []);
 
   useEffect(() => {
     if (isOpen) {
@@ -425,6 +445,15 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
     .sort((a, b) => String(a.ho_ten || a.ten_dang_nhap).localeCompare(String(b.ho_ten || b.ten_dang_nhap), 'vi')),
   [accounts, user.user_id, values.khoi]);
   const selectedSubject = useMemo(() => subjects.find((item) => item.mon_id === values.mon_id)?.ten_mon || '', [subjects, values.mon_id]);
+  const curriculumCatalogAvailable = isCurriculumCatalogAvailable(selectedSubject, values.khoi || '');
+  const curriculumLessons = useMemo(() => curriculumCatalogAvailable ? getKnttLessons(selectedSubject, values.khoi) : [], [curriculumCatalogAvailable, selectedSubject, values.khoi]);
+  const curriculumTopics = useMemo(() => curriculumCatalogAvailable ? getTopicOptionsForSubjectGrade(selectedSubject, values.khoi) : [], [curriculumCatalogAvailable, selectedSubject, values.khoi]);
+  const activeCatalogVersion = getTextbookCatalogVersion(selectedSubject);
+  const activeTextbookReferenceUrl = getTextbookReferenceUrl(selectedSubject);
+  const selectedCatalogLesson = useMemo(() => getTextbookLessonById(values.textbook_lesson_id), [values.textbook_lesson_id]);
+  const selectedRequirements = useMemo(() => getCurriculumRequirementsByIds(values.curriculum_requirement_ids || selectedCatalogLesson?.requirementIds || []), [values.curriculum_requirement_ids, selectedCatalogLesson]);
+  const curriculumCoverage = useMemo(() => getCurriculumCoverageStatus(values.lesson_json, selectedRequirements.map((item) => item.id)), [values.lesson_json, selectedRequirements]);
+  const effectiveLessonSourceMode: 'catalog' | 'custom' = curriculumCatalogAvailable ? (values.lesson_source_mode === 'custom' ? 'custom' : 'catalog') : 'custom';
   const settings = mergeLessonBuilderSettings(values.builder_settings || lessonBuilderDefaults || DEFAULT_LESSON_BUILDER_SETTINGS);
   const duplicateLesson = useMemo(() => {
     const lessonNumber = normalizeLessonNumber(values.lesson_number);
@@ -433,7 +462,10 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
     return existingLessons.find((lesson) => {
       if (lesson.lesson_id === (values.lesson_id || initialLesson?.lesson_id)) return false;
       const candidate = resolveLessonIdentity(lesson);
-      if (candidate.lessonNumber !== lessonNumber) return false;
+      const selectedCatalogId = String(values.textbook_lesson_id || '').trim();
+      const candidateCatalogId = String((lesson.raw as any)?.textbook_lesson_id || '').trim();
+      if (selectedCatalogId && candidateCatalogId && selectedCatalogId !== candidateCatalogId) return false;
+      if ((!selectedCatalogId || !candidateCatalogId) && candidate.lessonNumber !== lessonNumber) return false;
       if (String(lesson.mon_id || '') !== String(values.mon_id)) return false;
       if (String(lesson.khoi || '') !== String(values.khoi)) return false;
       if (String(lesson.nam_hoc || lesson.raw?.nam_hoc || '') !== String(values.nam_hoc || '')) return false;
@@ -441,7 +473,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
       const candidateClassId = String(lesson.lop_id || '').trim();
       return !classId || !candidateClassId || classId === candidateClassId;
     }) || null;
-  }, [existingLessons, initialLesson?.lesson_id, values.lesson_id, values.lesson_number, values.mon_id, values.khoi, values.lop_id, values.nam_hoc, values.hoc_ky]);
+  }, [existingLessons, initialLesson?.lesson_id, values.lesson_id, values.lesson_number, values.textbook_lesson_id, values.mon_id, values.khoi, values.lop_id, values.nam_hoc, values.hoc_ky]);
 
   const markGenerationInputChanged = () => {
     setConfigurationConfirmed(false);
@@ -472,6 +504,89 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
     if (values.lesson_json) setContentNeedsRegeneration(true);
   };
 
+  const selectCatalogLesson = (lessonId: string) => {
+    const lesson = getTextbookLessonById(lessonId);
+    if (!lesson) {
+      setValues((prev) => ({
+        ...prev,
+        textbook_lesson_id: '',
+        textbook_lesson_code: '',
+        textbook_topic_id: '',
+        curriculum_requirement_ids: [],
+        curriculum_override_confirmed: false,
+        lesson_number: undefined,
+        lesson_name: '',
+        tieu_de: '',
+      }));
+      if (values.lesson_json) setContentNeedsRegeneration(true);
+      return;
+    }
+    setValues((prev) => ({
+      ...prev,
+      lesson_source_mode: 'catalog',
+      textbook_series: TEXTBOOK_SERIES_KNTT,
+      textbook_catalog_version: activeCatalogVersion,
+      textbook_lesson_id: lesson.id,
+      textbook_lesson_code: lesson.lessonCode,
+      textbook_topic_id: lesson.topicId,
+      curriculum_program: CURRICULUM_PROGRAM,
+      curriculum_version: CURRICULUM_VERSION,
+      curriculum_requirement_ids: [...lesson.requirementIds],
+      curriculum_override_confirmed: false,
+      lesson_number: lesson.lessonNumber,
+      lesson_name: lesson.title,
+      tieu_de: buildTextbookLessonTitle(lesson),
+    }));
+    if (values.lesson_json) setContentNeedsRegeneration(true);
+  };
+
+  const selectCatalogTopic = (topicId: string) => {
+    const current = getTextbookLessonById(values.textbook_lesson_id);
+    const keepCurrent = current && current.topicId === topicId;
+    setValues((prev) => ({
+      ...prev,
+      textbook_topic_id: topicId,
+      ...(keepCurrent ? {} : {
+        textbook_lesson_id: '',
+        textbook_lesson_code: '',
+        curriculum_requirement_ids: [],
+        curriculum_override_confirmed: false,
+        lesson_number: undefined,
+        lesson_name: '',
+        tieu_de: '',
+      }),
+    }));
+    if (!keepCurrent && values.lesson_json) setContentNeedsRegeneration(true);
+  };
+
+  const setLessonSourceMode = (mode: 'catalog' | 'custom') => {
+    if (mode === 'catalog' && curriculumCatalogAvailable) {
+      setValues((prev) => ({
+        ...prev,
+        lesson_source_mode: 'catalog',
+        textbook_series: TEXTBOOK_SERIES_KNTT,
+        textbook_catalog_version: activeCatalogVersion,
+        curriculum_program: CURRICULUM_PROGRAM,
+        curriculum_version: CURRICULUM_VERSION,
+        curriculum_override_confirmed: false,
+      }));
+    } else {
+      setValues((prev) => ({
+        ...prev,
+        lesson_source_mode: 'custom',
+        textbook_lesson_id: '',
+        textbook_lesson_code: '',
+        textbook_topic_id: '',
+        curriculum_requirement_ids: [],
+        curriculum_override_confirmed: false,
+        lesson_number: prev.lesson_source_mode === 'custom' ? prev.lesson_number : undefined,
+        lesson_name: prev.lesson_source_mode === 'custom' ? prev.lesson_name : '',
+        tieu_de: prev.lesson_source_mode === 'custom' ? prev.tieu_de : '',
+      }));
+    }
+    if (values.lesson_json) setContentNeedsRegeneration(true);
+  };
+
   const setGlobalTeacherPermission = (permission: LessonTeacherPermissionKey, enabled: boolean) => {
     setValues((prev) => {
       const current = new Set(normalizeLessonTeacherPermissionList(prev.teacher_global_permissions));
@@ -492,18 +607,33 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
     teacher_permissions: {},
   }));
 
-  const withStructuredIdentity = (content: LessonContent): LessonContent => ({
-    ...content,
-    title: values.tieu_de,
-    metadata: {
-      ...content.metadata,
-      tieu_de: values.tieu_de,
-      lesson_number: normalizeLessonNumber(values.lesson_number),
-      lesson_name: normalizeLessonName(values.lesson_name),
-      khoi: values.khoi,
-      mon_hoc: selectedSubject || content.metadata?.mon_hoc,
-    },
-  });
+  const withStructuredIdentity = (content: LessonContent): LessonContent => {
+    const requirements = selectedRequirements;
+    const aligned = completeCurriculumReferences(normalizeCurriculumAlignment(content, requirements.map((item) => item.id)), requirements.map((item) => item.id));
+    return {
+      ...aligned,
+      title: values.tieu_de,
+      metadata: {
+        ...aligned.metadata,
+        tieu_de: values.tieu_de,
+        lesson_number: normalizeLessonNumber(values.lesson_number),
+        lesson_name: normalizeLessonName(values.lesson_name),
+        khoi: values.khoi,
+        mon_hoc: selectedSubject || aligned.metadata?.mon_hoc,
+        curriculum_program: requirements.length ? (values.curriculum_program || CURRICULUM_PROGRAM) : aligned.metadata?.curriculum_program,
+        curriculum_version: requirements.length ? (values.curriculum_version || CURRICULUM_VERSION) : aligned.metadata?.curriculum_version,
+        textbook_series: values.textbook_lesson_id ? (values.textbook_series || TEXTBOOK_SERIES_KNTT) : aligned.metadata?.textbook_series,
+        textbook_catalog_version: values.textbook_lesson_id ? (values.textbook_catalog_version || activeCatalogVersion) : aligned.metadata?.textbook_catalog_version,
+        textbook_lesson_id: values.textbook_lesson_id || aligned.metadata?.textbook_lesson_id,
+        textbook_lesson_code: values.textbook_lesson_code || aligned.metadata?.textbook_lesson_code,
+        textbook_topic_id: values.textbook_topic_id || aligned.metadata?.textbook_topic_id,
+        curriculum_requirement_ids: requirements.map((item) => item.id),
+        curriculum_requirements: requirements.map((item) => ({ id: item.id, text: item.text, competency: item.competency, source_kind: item.sourceKind, source_url: item.sourceUrl || CURRICULUM_REFERENCE_URL })),
+        curriculum_source_url: requirements.length ? CURRICULUM_REFERENCE_URL : aligned.metadata?.curriculum_source_url,
+        textbook_source_url: values.textbook_lesson_id ? activeTextbookReferenceUrl : aligned.metadata?.textbook_source_url,
+      },
+    };
+  };
 
   useEffect(() => {
     if (values.mon_id && !availableSubjects.some((item) => item.mon_id === values.mon_id)) setValues((prev) => ({ ...prev, mon_id: '' }));
@@ -521,7 +651,43 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
     if (values.lop_id && !classes.some((item) => item.lop_id === values.lop_id && item.khoi === values.khoi)) setValues((prev) => ({ ...prev, lop_id: '' }));
   }, [classes, values.khoi, values.lop_id]);
 
-  const canAnalyze = Boolean(normalizeLessonNumber(values.lesson_number) && normalizeLessonName(values.lesson_name) && values.mon_id && values.khoi && (values.source_file || values.source_text.trim()));
+  useEffect(() => {
+    if (!curriculumCatalogAvailable) {
+      if (values.lesson_source_mode === 'catalog' || values.textbook_lesson_id) {
+        setValues((prev) => ({
+          ...prev,
+          lesson_source_mode: 'custom',
+          textbook_lesson_id: '',
+          textbook_lesson_code: '',
+          textbook_topic_id: '',
+          curriculum_requirement_ids: [],
+          curriculum_override_confirmed: false,
+        }));
+      }
+      return;
+    }
+    if (effectiveLessonSourceMode !== 'catalog') return;
+    const current = getTextbookLessonById(values.textbook_lesson_id);
+    const currentBelongsToActiveCatalog = Boolean(current && current.grade === String(values.khoi) && curriculumLessons.some((lesson) => lesson.id === current.id));
+    if (currentBelongsToActiveCatalog) return;
+    if (values.textbook_lesson_id || values.textbook_topic_id || values.curriculum_requirement_ids?.length) {
+      setValues((prev) => ({
+        ...prev,
+        textbook_lesson_id: '',
+        textbook_lesson_code: '',
+        textbook_topic_id: '',
+        curriculum_requirement_ids: [],
+        curriculum_override_confirmed: false,
+        lesson_number: undefined,
+        lesson_name: '',
+        tieu_de: '',
+      }));
+      if (values.lesson_json) setContentNeedsRegeneration(true);
+    }
+  }, [curriculumCatalogAvailable, curriculumLessons, effectiveLessonSourceMode, selectedSubject, values.khoi]);
+
+  const catalogIdentityReady = effectiveLessonSourceMode !== 'catalog' || Boolean(selectedCatalogLesson && selectedRequirements.length);
+  const canAnalyze = Boolean(catalogIdentityReady && normalizeLessonNumber(values.lesson_number) && normalizeLessonName(values.lesson_name) && values.mon_id && values.khoi && (values.source_file || values.source_text.trim()));
   const introVideoEmbedUrl = getYoutubeEmbedUrl(values.intro_video_url);
   const introVideoInvalid = Boolean(values.intro_video_url?.trim() && !introVideoEmbedUrl);
   const isLessonV3 = values.lesson_json?.schema_version === 'lesson_v3' || Boolean(values.lesson_json?.activities?.length);
@@ -655,7 +821,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
       return;
     }
     if (!canAnalyze) {
-      setErrorMessage('Hãy chọn môn, khối, nhập bài số, tên bài và tải file hoặc dán nội dung nguồn trước khi phân tích.');
+      setErrorMessage(effectiveLessonSourceMode === 'catalog' ? 'Hãy chọn đúng bài học trong danh mục Kết nối tri thức và tải file hoặc dán học liệu nguồn trước khi phân tích.' : 'Hãy chọn môn, khối, nhập bài số, tên bài và tải file hoặc dán nội dung nguồn trước khi phân tích.');
       return;
     }
     if (!configurationConfirmed && !isEditMode) {
@@ -668,6 +834,9 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
       return;
     }
     setErrorMessage('');
+    analyzeAbortRef.current?.abort();
+    const controller = new AbortController();
+    analyzeAbortRef.current = controller;
     setIsAnalyzing(true);
     try {
       const lessonJson = await analyzeLessonMaterial(aiConfig.apiKey, aiConfig.model, {
@@ -675,7 +844,15 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
         mon_id: values.mon_id,
         khoi: values.khoi,
         source_text: values.source_text,
-      }, values.source_file, selectedSubject, settings);
+        textbook_series: values.textbook_series,
+        textbook_catalog_version: values.textbook_catalog_version,
+        textbook_lesson_id: values.textbook_lesson_id,
+        textbook_lesson_code: values.textbook_lesson_code,
+        textbook_topic_id: values.textbook_topic_id,
+        curriculum_program: values.curriculum_program,
+        curriculum_version: values.curriculum_version,
+        curriculum_requirement_ids: selectedRequirements.map((item) => item.id),
+      }, values.source_file, selectedSubject, settings, { signal: controller.signal });
       const withVideos = withStructuredIdentity(mergeVideoLinks(lessonJson, values.section_video_links || '', values.intro_video_url || ''));
       setValues((prev) => ({
         ...prev,
@@ -688,13 +865,21 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
     } catch (error) {
       const raw = String((error as any)?.message || error || '');
       const quotaError = /429|quota|resource_exhausted|rate|limit|hạn mức|han muc/i.test(raw);
+      const alreadyFriendly = /dịch vụ AI|hạn mức sử dụng AI|cấu hình AI|kết nối tới dịch vụ AI|đã dừng tạo bài|chưa thể hoàn tất nội dung bài học/i.test(raw);
       setErrorMessage(quotaError
         ? 'Hạn mức sử dụng AI của tài khoản hiện đã đạt giới hạn. Hãy thử lại sau hoặc chọn API Key khác.'
-        : professionalUserMessage(raw, 'Chưa thể tạo bài học lúc này. Vui lòng thử lại sau ít phút.', 'staff'));
+        : alreadyFriendly
+          ? raw
+          : professionalUserMessage(raw, 'Chưa thể tạo bài học lúc này. Học liệu và cấu hình vẫn được giữ nguyên; vui lòng bấm tạo lại sau ít phút.', 'staff'));
       if (quotaError) onOpenConfig('quota');
     } finally {
+      if (analyzeAbortRef.current === controller) analyzeAbortRef.current = null;
       setIsAnalyzing(false);
     }
+  };
+
+  const handleCancelAnalyze = () => {
+    analyzeAbortRef.current?.abort();
   };
 
   const handleRevise = async () => {
@@ -717,8 +902,8 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
   };
 
   const handleSave = async (saveMode: 'draft' | 'publish' = 'publish') => {
-    if (!normalizeLessonNumber(values.lesson_number) || !normalizeLessonName(values.lesson_name) || !values.mon_id || !values.khoi) {
-      setErrorMessage('Thiếu môn học, khối, bài số hoặc tên bài.');
+    if (!normalizeLessonNumber(values.lesson_number) || !normalizeLessonName(values.lesson_name) || !values.mon_id || !values.khoi || !catalogIdentityReady) {
+      setErrorMessage(effectiveLessonSourceMode === 'catalog' ? 'Hãy chọn đầy đủ bài học Kết nối tri thức trước khi lưu.' : 'Thiếu môn học, khối, bài số hoặc tên bài.');
       return;
     }
     if (!values.lesson_json) {
@@ -743,6 +928,11 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
     if (duplicateLesson) {
       setErrorMessage(`${buildLessonTitle(values.lesson_number, values.lesson_name)} đã tồn tại trong phạm vi khối/lớp đã chọn. Hãy chọn bài số khác hoặc chỉnh sửa bài hiện có.`);
       setActiveStep('info');
+      return;
+    }
+    if (saveMode === 'publish' && effectiveLessonSourceMode === 'catalog' && selectedRequirements.length && !curriculumCoverage.ok && !values.curriculum_override_confirmed) {
+      setErrorMessage(`Bài học mới phủ đầy đủ ${curriculumCoverage.full}/${curriculumCoverage.total} yêu cầu cần đạt. Hãy rà soát ma trận CTGDPT 2018 ở bước Biên tập hoặc xác nhận ngoại lệ trước khi xuất bản.`);
+      setActiveStep('content');
       return;
     }
     const lessonSettings = values.lesson_json.settings || values.builder_settings || settings;
@@ -776,7 +966,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
     try {
       const savedValues: LessonComposerValues = {
         ...values,
-        tieu_de: buildLessonTitle(values.lesson_number, values.lesson_name),
+        tieu_de: selectedCatalogLesson ? buildTextbookLessonTitle(selectedCatalogLesson) : buildLessonTitle(values.lesson_number, values.lesson_name),
         lesson_number: normalizeLessonNumber(values.lesson_number),
         lesson_name: normalizeLessonName(values.lesson_name),
         nam_hoc: effectiveSchoolYear,
@@ -853,7 +1043,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
   };
 
   const activeStepIndex = COMPOSER_STEPS.findIndex((step) => step.id === activeStep);
-  const infoReady = Boolean(normalizeLessonNumber(values.lesson_number) && normalizeLessonName(values.lesson_name) && values.mon_id && values.khoi && !duplicateLesson);
+  const infoReady = Boolean(catalogIdentityReady && normalizeLessonNumber(values.lesson_number) && normalizeLessonName(values.lesson_name) && values.mon_id && values.khoi && !duplicateLesson);
   const materialReady = Boolean((values.source_file || values.source_text.trim() || values.lesson_json) && !introVideoInvalid);
   const contentReady = Boolean(values.lesson_json && !contentNeedsRegeneration && invalidSectionVideoCount === 0);
 
@@ -871,7 +1061,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
     }
     if (step !== 'info' && !infoReady) {
       setActiveStep('info');
-      setErrorMessage(duplicateLesson ? 'Bài số đã trùng trong phạm vi đã chọn. Hãy đổi bài số hoặc chỉnh sửa bài hiện có.' : 'Hãy hoàn thành môn học, khối, bài số và tên bài trước.');
+      setErrorMessage(duplicateLesson ? 'Bài học này đã tồn tại trong phạm vi đã chọn. Hãy chỉnh sửa bài hiện có hoặc chọn bài khác.' : effectiveLessonSourceMode === 'catalog' ? 'Hãy chọn bài học trong danh mục Kết nối tri thức trước.' : 'Hãy hoàn thành môn học, khối, bài số và tên bài trước.');
       return;
     }
     if (['material', 'content', 'publish'].includes(step) && !configurationConfirmed) {
@@ -895,7 +1085,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
 
   const goToNextStep = () => {
     if (activeStep === 'info' && !infoReady) {
-      setErrorMessage(duplicateLesson ? 'Bài số đã trùng trong phạm vi đã chọn. Hãy đổi bài số hoặc chỉnh sửa bài hiện có.' : 'Hãy hoàn thành môn học, khối, bài số và tên bài trước khi tiếp tục.');
+      setErrorMessage(duplicateLesson ? 'Bài học này đã tồn tại trong phạm vi đã chọn. Hãy chỉnh sửa bài hiện có hoặc chọn bài khác.' : effectiveLessonSourceMode === 'catalog' ? 'Hãy chọn bài học trong danh mục Kết nối tri thức trước khi tiếp tục.' : 'Hãy hoàn thành môn học, khối, bài số và tên bài trước khi tiếp tục.');
       return;
     }
     if (activeStep === 'settings') {
@@ -910,6 +1100,10 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
     }
     if (activeStep === 'content' && !contentReady) {
       setErrorMessage('Hãy tạo hoặc tạo lại nội dung trước khi giao bài.');
+      return;
+    }
+    if (activeStep === 'content' && effectiveLessonSourceMode === 'catalog' && selectedRequirements.length && !curriculumCoverage.ok && !values.curriculum_override_confirmed) {
+      setErrorMessage(`Ma trận CTGDPT 2018 mới đạt ${curriculumCoverage.full}/${curriculumCoverage.total} yêu cầu cần đạt. Hãy rà soát các mục còn thiếu hoặc xác nhận ngoại lệ trước khi giao bài.`);
       return;
     }
     setErrorMessage('');
@@ -1032,9 +1226,51 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
                       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
                         <div><label className="mb-2 block text-sm font-semibold text-slate-700">Môn học <span className="text-rose-500">*</span></label><select value={values.mon_id} onChange={(e) => updateGenerationField('mon_id', e.target.value)} className={fieldClass}><option value="">Chọn môn học</option>{availableSubjects.map((subject) => <option key={subject.mon_id} value={subject.mon_id}>{subject.ten_mon}</option>)}</select><p className="mt-1.5 text-xs text-slate-400">Hệ thống ưu tiên chọn mặc định môn Tin học khi môn này đang hoạt động.</p></div>
                         <div><label className="mb-2 block text-sm font-semibold text-slate-700">Khối <span className="text-rose-500">*</span></label><select value={values.khoi} onChange={(e) => updateGenerationField('khoi', e.target.value)} className={fieldClass}>{gradeOptions.map((grade) => <option key={grade} value={grade}>Khối {grade}</option>)}</select></div>
-                        <div><label className="mb-2 block text-sm font-semibold text-slate-700">Bài số <span className="text-rose-500">*</span></label><input type="number" min="1" max="999" step="1" value={values.lesson_number ?? ''} onChange={(e) => updateLessonNumber(e.target.value)} className={fieldClass} placeholder="Ví dụ: 1" /><p className="mt-1.5 text-xs text-slate-400">Chỉ nhập số. Nhập 1 được hiểu là Bài 1.</p></div>
-                        <div><label className="mb-2 block text-sm font-semibold text-slate-700">Tên bài <span className="text-rose-500">*</span></label><input value={values.lesson_name || ''} onChange={(e) => updateLessonName(e.target.value)} className={fieldClass} placeholder="Ví dụ: Thông tin và dữ liệu" /></div>
-                        <div className={`md:col-span-2 rounded-2xl border px-4 py-3 ${duplicateLesson ? 'border-rose-200 bg-rose-50' : 'border-indigo-100 bg-indigo-50/70'}`}><p className="text-xs font-bold uppercase tracking-[0.14em] text-indigo-600">Tên bài hoàn chỉnh</p><p className="mt-1 text-base font-extrabold text-slate-900">{values.tieu_de || 'Nhập bài số và tên bài để tạo tiêu đề'}</p>{duplicateLesson ? <p className="mt-2 flex items-start gap-2 text-sm font-semibold text-rose-700"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /> Bài số này đã tồn tại trong phạm vi đang chọn: {duplicateLesson.tieu_de}. Hãy chọn số bài khác hoặc chỉnh sửa bài hiện có.</p> : null}</div>
+                        {curriculumCatalogAvailable ? (
+                          <div className="md:col-span-2 rounded-3xl border border-indigo-100 bg-gradient-to-br from-indigo-50 via-white to-violet-50 p-4">
+                            <div className="flex flex-wrap items-center justify-between gap-3">
+                              <div>
+                                <p className="text-sm font-black text-slate-900">Nguồn thông tin bài học</p>
+                                <p className="mt-1 text-xs leading-5 text-slate-500">Chọn bài trong SGK để hệ thống tự liên kết tên bài và yêu cầu cần đạt/đích học tập chuẩn hóa theo CTGDPT 2018.</p>
+                              </div>
+                              <div className="flex rounded-2xl bg-white p-1 ring-1 ring-indigo-100">
+                                <button type="button" onClick={() => setLessonSourceMode('catalog')} className={`rounded-xl px-3 py-2 text-xs font-black ${effectiveLessonSourceMode === 'catalog' ? 'bg-indigo-600 text-white' : 'text-slate-600'}`}>Theo SGK Kết nối tri thức</button>
+                                <button type="button" onClick={() => setLessonSourceMode('custom')} className={`rounded-xl px-3 py-2 text-xs font-black ${effectiveLessonSourceMode === 'custom' ? 'bg-slate-700 text-white' : 'text-slate-600'}`}>Bài học tùy chỉnh</button>
+                              </div>
+                            </div>
+                          </div>
+                        ) : null}
+
+                        {effectiveLessonSourceMode === 'catalog' ? (
+                          <>
+                            <div><label className="mb-2 block text-sm font-semibold text-slate-700">Bộ sách</label><select value={TEXTBOOK_SERIES_KNTT} disabled className={`${fieldClass} bg-slate-50 font-semibold text-slate-700`}><option value={TEXTBOOK_SERIES_KNTT}>Kết nối tri thức với cuộc sống</option></select></div>
+                            <div><label className="mb-2 block text-sm font-semibold text-slate-700">Chủ đề <span className="text-rose-500">*</span></label><select value={values.textbook_topic_id || ''} onChange={(e) => selectCatalogTopic(e.target.value)} className={fieldClass}><option value="">Chọn chủ đề</option>{curriculumTopics.map((topic) => <option key={topic.id} value={topic.id}>{topic.title}</option>)}</select></div>
+                            <div className="md:col-span-2"><label className="mb-2 block text-sm font-semibold text-slate-700">Bài học <span className="text-rose-500">*</span></label><select value={values.textbook_lesson_id || ''} onChange={(e) => selectCatalogLesson(e.target.value)} className={fieldClass}><option value="">Chọn bài học</option>{curriculumLessons.filter((lesson) => !values.textbook_topic_id || lesson.topicId === values.textbook_topic_id).map((lesson) => <option key={lesson.id} value={lesson.id}>{textbookLessonOptionLabel(lesson)}</option>)}</select></div>
+                            {selectedCatalogLesson ? (
+                              <div className={`md:col-span-2 rounded-3xl border p-4 ${duplicateLesson ? 'border-rose-200 bg-rose-50' : 'border-emerald-200 bg-emerald-50/70'}`}>
+                                <div className="flex flex-wrap items-start justify-between gap-3">
+                                  <div>
+                                    <p className="text-xs font-black uppercase tracking-[0.14em] text-emerald-700">Tên bài tự động</p>
+                                    <p className="mt-1 text-base font-extrabold text-slate-900">{values.tieu_de}</p>
+                                  </div>
+                                  <span className="inline-flex items-center gap-1.5 rounded-full bg-white px-3 py-1.5 text-xs font-black text-emerald-700 ring-1 ring-emerald-200"><BookOpenCheck className="h-4 w-4" /> Đã liên kết CTGDPT 2018</span>
+                                </div>
+                                <div className="mt-4 rounded-2xl bg-white/80 p-3 ring-1 ring-emerald-100">
+                                  <div className="flex items-center justify-between gap-3"><p className="text-sm font-black text-slate-800">Yêu cầu cần đạt / đích học tập chuẩn hóa ({selectedRequirements.length})</p><span className="text-[11px] font-bold text-slate-400">{CURRICULUM_VERSION} · {activeCatalogVersion}</span></div>
+                                  <div className="mt-2 space-y-2">{selectedRequirements.map((requirement) => <div key={requirement.id} className="flex gap-2 text-xs leading-5 text-slate-700"><span className="mt-0.5 shrink-0 rounded-md bg-indigo-50 px-1.5 py-0.5 font-black text-indigo-600">{requirement.id}</span><span>{requirement.text}</span></div>)}</div>
+                                  {selectedRequirements.some((requirement) => requirement.sourceKind === 'normalized_profile') ? <p className="mt-3 rounded-2xl bg-amber-50 px-3 py-2 text-[11px] leading-5 text-amber-800">Các đích học tập ở môn này được chuẩn hóa để hỗ trợ thiết kế bài và đánh giá. Khi cần đối chiếu pháp lý, giáo viên sử dụng văn bản CTGDPT 2018 chính thức được liên kết trong hệ thống.</p> : null}
+                                </div>
+                                {duplicateLesson ? <p className="mt-3 flex items-start gap-2 text-sm font-semibold text-rose-700"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /> Bài học này đã tồn tại trong phạm vi đang chọn: {duplicateLesson.tieu_de}. Hãy chỉnh sửa bài hiện có hoặc chọn bài khác.</p> : null}
+                              </div>
+                            ) : null}
+                          </>
+                        ) : (
+                          <>
+                            <div><label className="mb-2 block text-sm font-semibold text-slate-700">Bài số <span className="text-rose-500">*</span></label><input type="number" min="1" max="999" step="1" value={values.lesson_number ?? ''} onChange={(e) => updateLessonNumber(e.target.value)} className={fieldClass} placeholder="Ví dụ: 1" /><p className="mt-1.5 text-xs text-slate-400">Dùng cho tiết ôn tập, chuyên đề hoặc bài không thuộc danh mục SGK.</p></div>
+                            <div><label className="mb-2 block text-sm font-semibold text-slate-700">Tên bài <span className="text-rose-500">*</span></label><input value={values.lesson_name || ''} onChange={(e) => updateLessonName(e.target.value)} className={fieldClass} placeholder="Ví dụ: Ôn tập chủ đề 1" /></div>
+                            <div className={`md:col-span-2 rounded-2xl border px-4 py-3 ${duplicateLesson ? 'border-rose-200 bg-rose-50' : 'border-indigo-100 bg-indigo-50/70'}`}><p className="text-xs font-bold uppercase tracking-[0.14em] text-indigo-600">Tên bài hoàn chỉnh</p><p className="mt-1 text-base font-extrabold text-slate-900">{values.tieu_de || 'Nhập bài số và tên bài để tạo tiêu đề'}</p>{duplicateLesson ? <p className="mt-2 flex items-start gap-2 text-sm font-semibold text-rose-700"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /> Bài số này đã tồn tại trong phạm vi đang chọn: {duplicateLesson.tieu_de}. Hãy chọn số bài khác hoặc chỉnh sửa bài hiện có.</p> : null}</div>
+                          </>
+                        )}
                       </div>
                       {contentNeedsRegeneration ? <div className="flex items-start gap-3 rounded-3xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" /><div><p className="font-bold">Thông tin tạo bài đã thay đổi</p><p className="mt-1">{isEditMode ? 'Bạn có thể lưu thay đổi ngay. Nội dung hiện tại sẽ được giữ nguyên cho đến khi bạn chủ động tạo lại bằng AI.' : 'Sau khi xác nhận lại thiết kế và học liệu, bạn cần tạo lại nội dung để các thay đổi được áp dụng.'}</p></div></div> : null}
                     </div>
@@ -1093,6 +1329,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
                   {activeStep === 'material' ? (
                     <div className="space-y-6">
                       <div><p className="text-xs font-bold uppercase tracking-[0.18em] text-indigo-600">Bước 3</p><h3 className="mt-1 text-xl font-black text-slate-900">Học liệu và nhiệm vụ xem trước</h3><p className="mt-1 text-sm text-slate-500">AI sẽ phân tích học liệu thành các hoạt động dạy học. Có thể giao video chuẩn bị trước bài ngay cả khi bài học đang khóa.</p></div>
+                      {effectiveLessonSourceMode === 'catalog' && selectedCatalogLesson ? <div className="rounded-3xl border border-emerald-200 bg-emerald-50/70 p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-black uppercase tracking-[0.14em] text-emerald-700">Căn cứ tạo bài</p><p className="mt-1 font-black text-slate-900">{values.tieu_de}</p><p className="mt-1 text-xs text-slate-600">CTGDPT 2018 • {selectedRequirements.length} yêu cầu cần đạt • Kết nối tri thức với cuộc sống</p></div><span className="rounded-full bg-white px-3 py-1.5 text-xs font-black text-emerald-700 ring-1 ring-emerald-200">Bám chương trình</span></div><p className="mt-3 text-xs leading-5 text-slate-600">AI ưu tiên YCCD làm chuẩn đích và học liệu giáo viên tải lên làm nguồn nội dung cụ thể. Mỗi hoạt động và câu hỏi sẽ được liên kết với YCCD tương ứng.</p></div> : null}
                       <div className="grid gap-4 md:grid-cols-2">
                         <div><label className="mb-2 block text-sm font-semibold text-slate-700">Tải file bài học</label><label className={`flex min-h-28 flex-col items-center justify-center rounded-3xl border border-dashed border-indigo-300 bg-indigo-50/40 px-5 py-4 text-center text-sm text-slate-600 ${isAnalyzing ? 'cursor-not-allowed opacity-60' : 'cursor-pointer hover:border-indigo-500'}`}><Upload className="mb-2 h-6 w-6 text-indigo-600" /><p className="font-bold text-slate-800">PDF, DOCX, TXT hoặc Markdown</p><p className="mt-1 text-xs text-slate-500">Bấm để chọn tệp học liệu</p><input type="file" disabled={isAnalyzing} className="hidden" accept=".pdf,.doc,.docx,.txt,.md" onChange={(e) => void handleFileChange(e.target.files?.[0] || null)} /></label>{values.source_file && <p className="mt-2 rounded-xl bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-700">{values.source_file.name} • {Math.round((values.source_file.size || 0) / 1024)} KB</p>}</div>
                         <div><label className="mb-2 block text-sm font-semibold text-slate-700">Nguồn văn bản bổ sung</label><textarea value={values.source_text} disabled={isAnalyzing} onChange={(e) => updateGenerationField('source_text', e.target.value)} rows={7} className="w-full rounded-3xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 disabled:cursor-not-allowed disabled:opacity-60" placeholder="Dán nội dung bài học, yêu cầu chuyên môn hoặc ghi chú sư phạm..." /></div>
@@ -1110,7 +1347,7 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
                       </div>
 
                       {contentNeedsRegeneration ? <div className="flex items-start gap-3 rounded-3xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" /><div><p className="font-bold">Đầu vào sinh nội dung đã thay đổi</p><p className="mt-1">{isEditMode ? 'Bạn vẫn có thể lưu cấu hình/học liệu hiện tại. Chỉ bấm “Tạo lại nội dung” khi muốn AI áp dụng các thay đổi này vào nội dung bài.' : 'Bấm nút tạo ở cuối cửa sổ để đồng bộ nội dung với thông tin và cấu hình mới.'}</p></div></div> : null}
-                      {isAnalyzing ? <div className="flex min-h-32 flex-col items-center justify-center rounded-3xl border border-indigo-200 bg-indigo-50 px-6 text-center"><Loader2 className="h-8 w-8 animate-spin text-indigo-600" /><p className="mt-3 font-bold text-indigo-900">AI đang đọc học liệu và tạo cấu trúc bài học…</p><p className="mt-1 text-sm text-indigo-700">Vui lòng giữ nguyên cửa sổ; cấu hình và học liệu đang được khóa tạm thời.</p></div> : null}
+                      {isAnalyzing ? <div className="flex min-h-36 flex-col items-center justify-center rounded-3xl border border-indigo-200 bg-indigo-50 px-6 py-5 text-center"><Loader2 className="h-8 w-8 animate-spin text-indigo-600" /><p className="mt-3 font-bold text-indigo-900">Đang phân tích học liệu và xây dựng bài học…</p><p className="mt-1 max-w-2xl text-sm leading-6 text-indigo-700">Hệ thống đang tạo phần nội dung cốt lõi trước, sau đó tự hoàn thiện câu hỏi theo cấu hình. Nếu dịch vụ phản hồi chậm, hệ thống sẽ tự chuyển phương án xử lý và vẫn giữ nguyên học liệu.</p><button type="button" onClick={handleCancelAnalyze} className="mt-4 rounded-xl border border-indigo-200 bg-white px-4 py-2 text-sm font-bold text-indigo-700 hover:bg-indigo-100">Dừng tạo bài</button></div> : null}
                     </div>
                   ) : null}
 
@@ -1120,6 +1357,27 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
                       {values.lesson_json ? <>
                         {contentNeedsRegeneration ? <div className="flex items-start justify-between gap-4 rounded-3xl border border-amber-200 bg-amber-50 p-5 text-sm text-amber-900"><div className="flex items-start gap-3"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" /><div><p className="font-black">Nội dung hiện tại không còn khớp</p><p className="mt-1">{isEditMode ? 'Cấu hình sinh nội dung đã thay đổi. Bạn có thể lưu cấu hình ngay và giữ nguyên nội dung hiện tại, hoặc tạo lại nội dung khi cần.' : 'Thông tin, thiết kế hoặc học liệu đã thay đổi sau lần tạo gần nhất. Không thể giao bài cho đến khi tạo lại.'}</p></div></div><button type="button" onClick={() => setActiveStep('material')} className="shrink-0 rounded-xl bg-amber-600 px-3 py-2 text-xs font-bold text-white">Tạo lại</button></div> : null}
                         {questionQuotaStatus ? <div className={`rounded-3xl border p-4 ${questionQuotaStatus.ok ? 'border-emerald-200 bg-emerald-50' : 'border-rose-200 bg-rose-50'}`}><div className="flex flex-wrap items-center justify-between gap-2"><p className={`text-sm font-black ${questionQuotaStatus.ok ? 'text-emerald-800' : 'text-rose-800'}`}>Kiểm tra đủ số câu theo cấu hình</p><span className={`rounded-full px-3 py-1 text-xs font-black ${questionQuotaStatus.ok ? 'bg-white text-emerald-700' : 'bg-white text-rose-700'}`}>{questionQuotaStatus.ok ? 'Đạt yêu cầu' : 'Chưa đủ'}</span></div><div className="mt-3 flex flex-wrap gap-2 text-xs font-bold">{questionQuotaStatus.activities.map((item) => <span key={item.activity_id} className={`rounded-xl px-3 py-2 ${item.ok ? 'bg-white text-emerald-700' : 'bg-white text-rose-700'}`}>{item.title}: {item.actual}/{item.target}</span>)}<span className={`rounded-xl px-3 py-2 ${questionQuotaStatus.final.ok ? 'bg-white text-emerald-700' : 'bg-white text-rose-700'}`}>Cuối bài: {questionQuotaStatus.final.actual}/{questionQuotaStatus.final.target}</span></div></div> : null}
+                        {effectiveLessonSourceMode === 'catalog' && selectedRequirements.length ? (
+                          <div className={`rounded-3xl border p-5 ${curriculumCoverage.ok ? 'border-emerald-200 bg-emerald-50/70' : 'border-amber-200 bg-amber-50/80'}`}>
+                            <div className="flex flex-wrap items-start justify-between gap-3">
+                              <div className="flex items-start gap-3">
+                                <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl ${curriculumCoverage.ok ? 'bg-emerald-600 text-white' : 'bg-amber-500 text-white'}`}><BookOpenCheck className="h-5 w-5" /></span>
+                                <div><h4 className="font-black text-slate-900">Ma trận bám Chương trình GDPT 2018</h4><p className="mt-1 text-sm text-slate-600">Đối chiếu YCCD với hoạt động học và câu hỏi đánh giá trước khi giao bài.</p></div>
+                              </div>
+                              <div className="text-right"><p className={`text-2xl font-black ${curriculumCoverage.ok ? 'text-emerald-700' : 'text-amber-700'}`}>{curriculumCoverage.percent}%</p><p className="text-[11px] font-bold uppercase tracking-wide text-slate-500">{curriculumCoverage.full}/{curriculumCoverage.total} YCCD đầy đủ</p></div>
+                            </div>
+                            <div className="mt-4 space-y-2">{curriculumCoverage.rows.map((row) => (
+                              <div key={row.requirement.id} className="grid gap-2 rounded-2xl bg-white px-3 py-3 ring-1 ring-black/5 md:grid-cols-[110px_minmax(0,1fr)_180px]">
+                                <span className="self-start rounded-lg bg-indigo-50 px-2 py-1 text-center text-[11px] font-black text-indigo-700">{row.requirement.id}</span>
+                                <p className="text-xs leading-5 text-slate-700">{row.requirement.text}</p>
+                                <div className="flex flex-wrap items-center justify-end gap-1.5 text-[11px] font-bold"><span className={`rounded-full px-2 py-1 ${row.coveredByActivity ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'}`}>Hoạt động {row.activityCount || 0}</span><span className={`rounded-full px-2 py-1 ${row.coveredByAssessment ? 'bg-cyan-50 text-cyan-700' : 'bg-rose-50 text-rose-700'}`}>Câu hỏi {row.questionCount || 0}</span></div>
+                              </div>
+                            ))}</div>
+                            {!curriculumCoverage.ok ? (
+                              <label className="mt-4 flex items-start gap-3 rounded-2xl border border-amber-200 bg-white px-4 py-3 text-xs font-semibold leading-5 text-amber-900"><input type="checkbox" className="mt-1" checked={Boolean(values.curriculum_override_confirmed)} onChange={(e) => setValues((prev) => ({ ...prev, curriculum_override_confirmed: e.target.checked }))} /><span><b>Xác nhận ngoại lệ sau khi đã rà soát.</b> Chỉ dùng khi giáo viên chủ động không đánh giá một YCCD trong bài này. Hệ thống vẫn lưu trạng thái ngoại lệ để phân biệt với bài phủ đầy đủ.</span></label>
+                            ) : <p className="mt-4 flex items-center gap-2 text-xs font-bold text-emerald-700"><CheckCircle2 className="h-4 w-4" /> Tất cả YCCD đã có hoạt động và bằng chứng đánh giá.</p>}
+                          </div>
+                        ) : null}
                         <div className="grid gap-4 md:grid-cols-2"><div className="md:col-span-2"><label className="mb-2 block text-sm font-semibold text-slate-700">Tóm tắt bài học</label><textarea value={values.tom_tat} onChange={(e) => setValues((prev) => ({ ...prev, tom_tat: e.target.value }))} rows={3} className="w-full rounded-3xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100" /></div><div className="md:col-span-2"><label className="mb-2 block text-sm font-semibold text-slate-700">Từ khóa</label><input value={values.tu_khoa} onChange={(e) => setValues((prev) => ({ ...prev, tu_khoa: e.target.value }))} className={fieldClass} placeholder="Ví dụ: bộ xử lí, máy tính, công nghệ thông tin" /></div></div>
                         <AIRevisionPanel value={values.ai_revision_request || ''} onChange={(next) => setValues((prev) => ({ ...prev, ai_revision_request: next }))} onRevise={() => void handleRevise()} disabled={!values.lesson_json || contentNeedsRegeneration} loading={isRevising} />
                         {!isLessonV3 ? <div className="flex flex-wrap items-center justify-between gap-3 rounded-3xl border border-cyan-200 bg-cyan-50 p-5"><div><h4 className="font-black text-slate-900">Nâng cấp bài cũ sang Hoạt động dạy học</h4><p className="mt-1 text-sm text-slate-600">Chuyển section hiện tại thành lesson_v3, giữ câu hỏi và kiểm tra cuối bài. Có thể dùng AI chỉnh sửa tiếp sau khi chuyển.</p></div><button type="button" onClick={upgradeExistingLessonToActivities} className="inline-flex items-center gap-2 rounded-2xl bg-cyan-600 px-4 py-3 text-sm font-bold text-white hover:bg-cyan-700"><Sparkles className="h-4 w-4" /> Nâng cấp sang lesson_v3</button></div> : null}
@@ -1222,27 +1480,17 @@ export default function LessonComposer({ isOpen, user, aiConfig, subjects, class
               aiConfig={aiConfig}
               onOpenConfig={onOpenConfig}
               onClose={() => setContentEditorOpen(false)}
-              onSave={(nextContent) => setValues((prev) => {
-                const structuredContent: LessonContent = {
-                  ...nextContent,
-                  title: prev.tieu_de,
-                  metadata: {
-                    ...nextContent.metadata,
-                    tieu_de: prev.tieu_de,
-                    lesson_number: normalizeLessonNumber(prev.lesson_number),
-                    lesson_name: normalizeLessonName(prev.lesson_name),
-                    khoi: prev.khoi,
-                  },
-                };
-                return {
+              onSave={(nextContent) => {
+                const structuredContent = withStructuredIdentity(nextContent);
+                setValues((prev) => ({
                   ...prev,
                   lesson_json: structuredContent,
                   tom_tat: structuredContent.metadata?.tom_tat || prev.tom_tat,
                   tu_khoa: structuredContent.metadata?.tu_khoa?.join(', ') || prev.tu_khoa,
                   intro_video_url: structuredContent.intro_video_url || structuredContent.intro_video_embed_url || '',
                   section_video_links: (structuredContent.sections || []).map((section) => section.youtube_url || section.youtube_embed_url || '').join('\n'),
-                };
-              })}
+                }));
+              }}
             />
           ) : null}
           <GoogleSlidesPromptModal

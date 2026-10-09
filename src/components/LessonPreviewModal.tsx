@@ -44,7 +44,7 @@ export default function LessonPreviewModal({
       aiConfig={aiConfig}
       onOpenConfig={onOpenConfig}
       onClose={onClose}
-      initialMode="preview"
+      currentUserRole="teacher"
     />
   );
 }

@@ -358,7 +358,7 @@ export default function AIAssistant({
         lessonContext?.stage,
         lessonContext?.title,
       );
-      const nextMessages = [...history, { role: 'model', text: reply }];
+      const nextMessages = [...history, { role: 'model' as const, text: reply }];
       appendMessages(contextKey, nextMessages);
       setAssistantState('idle');
       if (autoSpeak) {

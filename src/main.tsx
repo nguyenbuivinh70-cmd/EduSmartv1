@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import App from './App';
 import './index.css';
 
-const APP_VERSION = 'EduSmart V6.98.6';
+const APP_VERSION = 'EduSmart V6.99.2';
 const rootElement = document.getElementById('root');
 
 declare global {

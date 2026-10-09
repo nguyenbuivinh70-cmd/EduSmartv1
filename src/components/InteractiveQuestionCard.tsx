@@ -15,6 +15,8 @@ interface InteractiveQuestionCardProps {
   disableReset?: boolean;
   hideFeedback?: boolean;
   examMode?: boolean;
+  readOnly?: boolean;
+  teachingMode?: boolean;
 }
 
 function normalizeText(value: string) {
@@ -87,7 +89,7 @@ function hasEnoughShortAnswer(text: string) {
   return normalized.length >= 1;
 }
 
-export default function InteractiveQuestionCard({ question, index, onAskAI, initialAnswer, onAnswerStateChange, disableAI = false, disableReset = false, hideFeedback = false, examMode = false }: InteractiveQuestionCardProps) {
+export default function InteractiveQuestionCard({ question, index, onAskAI, initialAnswer, onAnswerStateChange, disableAI = false, disableReset = false, hideFeedback = false, examMode = false, readOnly = false, teachingMode = false }: InteractiveQuestionCardProps) {
   const type: QuizQuestionType = question.type === 'short_answer' ? 'fill_in_blank' : (question.type || 'single_choice');
   const questionStateId = getQuestionStateId(question, index);
   const [selectedOption, setSelectedOption] = useState<string | null>(initialAnswer?.selectedOption ?? null);
@@ -100,6 +102,9 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
     return (question.correctAnswers?.length ? question.correctAnswers : ['']).map(() => '');
   });
   const [activeBlankIndex, setActiveBlankIndex] = useState(0);
+
+  const inputLocked = readOnly || (teachingMode && submitted);
+  const canConfirm = type === 'fill_in_blank' ? fillSelections.every((value) => value.trim()) : Boolean(selectedOption);
 
   const levelLabel = useMemo(() => getVietnameseLevelLabel(question.level), [question.level]);
   const scoringOptions = useMemo(() => {
@@ -115,11 +120,12 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
   const lastReportedStateRef = useRef('');
 
   const emitAnswerState = useCallback((payload: LessonQuestionAnswerState) => {
+    if (readOnly) return;
     const serialized = JSON.stringify(payload);
     if (serialized === lastReportedStateRef.current) return;
     lastReportedStateRef.current = serialized;
     onAnswerStateChange?.(payload);
-  }, [onAnswerStateChange]);
+  }, [onAnswerStateChange, readOnly]);
 
   useEffect(() => () => {
     if (draftSyncTimerRef.current) window.clearTimeout(draftSyncTimerRef.current);
@@ -164,11 +170,13 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
   }, [submitted, isCorrect, selectedOption, JSON.stringify(fillSelections), textAnswer, questionStateId, type, emitAnswerState]);
 
   const handleSelect = (option: string) => {
+    if (inputLocked) return;
     setSelectedOption(option);
-    setSubmitted(true);
+    setSubmitted(!teachingMode);
   };
 
   const handleChoiceClick = (choice: string) => {
+    if (inputLocked) return;
     const nextBlankIndex = fillSelections.findIndex((item) => !item.trim());
     const targetIndex = fillSelections[activeBlankIndex]?.trim()
       ? (nextBlankIndex >= 0 ? nextBlankIndex : activeBlankIndex)
@@ -178,7 +186,7 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
     setFillSelections(nextSelections);
     // V6.84.5: chọn đủ từ/cụm từ là đã trả lời. Không cần nút "Kiểm tra đáp án".
     // Trong chế độ thi, feedback vẫn bị ẩn cho tới khi học sinh nộp toàn bài.
-    setSubmitted(nextSelections.every((item) => item.trim()));
+    setSubmitted(!teachingMode && nextSelections.every((item) => item.trim()));
     const nextIndex = nextSelections.findIndex((item, idx) => idx > safeTargetIndex && !item.trim());
     if (nextIndex >= 0) setActiveBlankIndex(nextIndex);
   };
@@ -189,6 +197,7 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
   };
 
   const handleReset = () => {
+    if (readOnly) return;
     setSelectedOption(null);
     setSubmitted(false);
     setTextAnswer('');
@@ -239,7 +248,7 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
 
   const renderFeedback = () => {
     if (hideFeedback) return null;
-    if (!submitted) return null;
+    if (!submitted && !readOnly) return null;
 
     const correctAnswerText = type === 'fill_in_blank'
       ? (question.correctAnswers || []).join(', ')
@@ -255,7 +264,7 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
             {isCorrect ? <CheckCircle2 className="mt-0.5 h-5 w-5" /> : <AlertCircle className="mt-0.5 h-5 w-5" />}
           </div>
           <div>
-            <p className="font-semibold">{isCorrect ? 'Chính xác rồi!' : 'Chưa đúng, thử xem lại nhé.'}</p>
+            <p className="font-semibold">{!submitted ? 'Câu này chưa được trả lời.' : isCorrect ? 'Chính xác rồi!' : 'Đáp án đã chọn chưa đúng.'}</p>
             {correctAnswerText ? (
               <p className="mt-1">
                 <span className="font-semibold">Đáp án đúng:</span> {correctAnswerText}
@@ -266,6 +275,7 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
                 <span className="font-semibold">Giải thích:</span> {question.explanation}
               </p>
             ) : null}
+            {teachingMode && !question.explanation ? <p className="mt-1">Câu hỏi chưa có giải thích.</p> : null}
             {!isCorrect && question.wrongAnswerExplanations && selectedOption ? (
               <p className="mt-1">
                 <span className="font-semibold">Em dễ nhầm ở chỗ:</span>{' '}
@@ -291,6 +301,7 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
           <button
             key={`${option}-${optionIndex}`}
             type="button"
+            disabled={inputLocked}
             onClick={() => handleSelect(option)}
             className={[
               'rounded-2xl border px-4 py-3 text-left text-sm transition',
@@ -327,11 +338,13 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
   const renderShortAnswer = () => (
     <div className="mt-4">
       <textarea
+        disabled={inputLocked}
         value={textAnswer}
         onMouseDown={(event) => event.stopPropagation()}
         onClick={(event) => event.stopPropagation()}
         onKeyDown={(event) => event.stopPropagation()}
         onChange={(event) => {
+          if (inputLocked) return;
           setTextAnswer(event.target.value);
           if (submitted) setSubmitted(false);
         }}
@@ -356,7 +369,8 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
               {partIndex < blanks.length ? (
                 <button
                   type="button"
-                  onClick={() => setActiveBlankIndex(partIndex)}
+                  disabled={inputLocked}
+                  onClick={() => !inputLocked && setActiveBlankIndex(partIndex)}
                   className={[
                     'mx-2 inline-flex min-w-[160px] items-center justify-center rounded-2xl border px-4 py-2 text-sm font-semibold transition',
                     fillSelections[partIndex]
@@ -383,6 +397,7 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
                 <button
                   key={`${choice}-${choiceIndex}`}
                   type="button"
+                  disabled={inputLocked}
                   onClick={() => handleChoiceClick(choice)}
                   className={[
                     'rounded-full border px-4 py-2 text-sm font-medium transition',
@@ -408,6 +423,13 @@ export default function InteractiveQuestionCard({ question, index, onAskAI, init
   };
 
   const renderActionToolbar = () => {
+    if (readOnly) return <p className="mt-3 text-xs font-semibold text-slate-500">Bài đã chốt • Chỉ xem</p>;
+    if (teachingMode) return (
+      <div className="mt-4 flex flex-wrap gap-2 border-t border-slate-100 pt-3">
+        {submitted ? <button type="button" onClick={handleReset} className="rounded-xl border px-4 py-2 text-sm font-bold text-slate-700">Làm lại minh họa</button>
+          : <button type="button" disabled={!canConfirm} onClick={() => canConfirm && setSubmitted(true)} className="rounded-xl bg-indigo-600 px-4 py-2 text-sm font-bold text-white disabled:opacity-40">Chốt đáp án</button>}
+      </div>
+    );
     const needsChoiceHint = !examMode && !submitted && type !== 'fill_in_blank';
     const needsFillHint = !examMode && !submitted && type === 'fill_in_blank';
     const hasToolbarActions = !disableReset || !disableAI || needsChoiceHint || needsFillHint;

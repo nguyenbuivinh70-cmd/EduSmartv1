@@ -343,7 +343,7 @@ export default function ImportDataModal({
                                   </span>
                                 </td>
                                 {preview.headers.slice(0, 6).map((header) => (
-                                  <td key={header} className="px-4 py-3">{String((row as Record<string, unknown>)[header] ?? '-')}</td>
+                                  <td key={header} className="px-4 py-3">{String((row as unknown as Record<string, unknown>)[header] ?? '-')}</td>
                                 ))}
                               </tr>
                             ))}
